@@ -9,43 +9,61 @@ from agents.base_agent import BaseAgent, E, Event, EventBus
 from config import settings
 from core.telegram_bot import TelegramBot
 from data.models import WatchItem
+from data.stock_master import StockMaster
 
 
 class PortfolioAgent(BaseAgent):
-    def __init__(self, bus: EventBus, tg: TelegramBot) -> None:
+    def __init__(self, bus: EventBus, tg: TelegramBot, master: StockMaster | None = None) -> None:
         super().__init__("PortfolioAgent", bus)
         self.tg = tg
+        self.master = master or StockMaster()
         self.watchlist: dict[str, WatchItem] = {}
         self.total_seed: int = settings.TOTAL_SEED
         self._lock = asyncio.Lock()
 
         tg.register("add", self._cmd_add)
-        tg.register("remove", self._cmd_remove)
+        tg.register("del", self._cmd_remove)
         tg.register("seed", self._cmd_seed)
         tg.register("weight", self._cmd_weight)
         tg.register("list", self._cmd_list)
         tg.register("status", self._cmd_status)
+        tg.register("search", self._cmd_search)
 
     # ----- 명령 핸들러 -----
     async def _cmd_add(self, args: list[str]) -> str:
         if len(args) < 1:
-            return "사용법: /add <종목코드> [비중(0~1)] [이름]"
-        code = args[0]
+            return "사용법: /add <종목코드|종목명> [비중(0~1)]"
+        resolved = await self.master.resolve(args[0])
+        if not resolved:
+            return f"❌ 종목을 찾을 수 없음: {args[0]}"
+        code, name = resolved
         weight = float(args[1]) if len(args) > 1 else 0.0
-        name = " ".join(args[2:]) if len(args) > 2 else ""
         async with self._lock:
             self.watchlist[code] = WatchItem(code=code, name=name, weight=weight)
         await self._publish()
-        return f"✅ 추가됨: {code} (비중 {weight:.0%})"
+        label = f"{code} {name}".strip()
+        return f"✅ 추가됨: {label} (비중 {weight:.0%})"
 
     async def _cmd_remove(self, args: list[str]) -> str:
         if not args:
-            return "사용법: /remove <종목코드>"
-        code = args[0]
+            return "사용법: /del <종목코드|종목명>"
+        resolved = await self.master.resolve(args[0])
+        code = resolved[0] if resolved else args[0]
         async with self._lock:
-            self.watchlist.pop(code, None)
+            removed = self.watchlist.pop(code, None)
         await self._publish()
-        return f"🗑 제거됨: {code}"
+        if not removed:
+            return f"❌ 미등록 종목: {args[0]}"
+        label = f"{code} {removed.name}".strip()
+        return f"🗑️ 제거됨: {label} (비중 {removed.weight:.0%})"
+
+    async def _cmd_search(self, args: list[str]) -> str:
+        if not args:
+            return "사용법: /search <종목명>"
+        results = await self.master.search(" ".join(args))
+        if not results:
+            return "🔍 결과 없음"
+        return "🔍 검색 결과\n" + "\n".join(f"{c} {n}" for c, n in results)
 
     async def _cmd_seed(self, args: list[str]) -> str:
         if not args:
@@ -55,10 +73,12 @@ class PortfolioAgent(BaseAgent):
 
     async def _cmd_weight(self, args: list[str]) -> str:
         if len(args) < 2:
-            return "사용법: /weight <종목코드> <비중(0~1)>"
-        code, w = args[0], float(args[1])
+            return "사용법: /weight <종목코드|종목명> <비중(0~1)>"
+        resolved = await self.master.resolve(args[0])
+        code = resolved[0] if resolved else args[0]
+        w = float(args[1])
         if code not in self.watchlist:
-            return f"❌ 미등록 종목: {code}"
+            return f"❌ 미등록 종목: {args[0]}"
         self.watchlist[code].weight = w
         return f"⚖ {code} 비중 → {w:.0%}"
 

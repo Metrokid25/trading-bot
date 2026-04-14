@@ -11,7 +11,11 @@
       "Bash(git remote:*)",
       "Bash(git branch:*)",
       "Bash(git push:*)",
-      "Bash(git config:*)"
+      "Bash(git config:*)",
+      "Bash(find:*)",
+      "Bash(xargs grep:*)",
+      "Bash(taskkill //F //FI \"WINDOWTITLE eq *\" //IM python.exe)",
+      "Bash(taskkill //F //IM python.exe)"
     ]
   }
 }
