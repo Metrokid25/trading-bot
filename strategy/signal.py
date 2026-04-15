@@ -1,56 +1,106 @@
-"""매수 시그널 판정 로직.
+"""멀티 타임프레임 매수 시그널.
 
-조건 (모두 충족 시 BUY):
- - RSI(14) < 30 (과매도) 이후 반등 (이전봉 대비 상승)
- - 현재가가 볼린저밴드 하단 근접 또는 터치
- - MA5 가 MA20 을 상향 돌파 (골든크로스) 또는 MA5 상승 전환
+[상위 TF 필터 - 15분봉]
+ - close > VWAP15
+ - MACD15 히스토그램 > 0
+
+[진입 시그널 - 3분봉 (3개 모두 충족)]
+ 1. VWAP 지지 반등 양봉: low ≤ VWAP3 ≤ close, close > open
+ 2. 거래량 급증: vol[-1] ≥ avg(vol[-21:-1]) × 1.5
+ 3. MACD 히스토그램 양전환: hist[-2] < 0 ≤ hist[-1]
+
+[가점 - 선택적]
+ - close > EMA9 → score +1
 """
 from __future__ import annotations
 
 from datetime import datetime
 
 from config.constants import (
-    BB_PERIOD,
-    BB_STD,
-    MA_LONG,
-    MA_MID,
-    MA_SHORT,
-    RSI_BUY_THRESHOLD,
-    RSI_PERIOD,
+    ATR_PERIOD,
+    EMA_SHORT,
+    HTF_MULTIPLIER,
+    MACD_FAST,
+    MACD_SIGNAL,
+    MACD_SLOW,
     SignalType,
+    VOLUME_LOOKBACK,
+    VOLUME_SURGE_MULT,
 )
+from data.candle_store import CandleBuffer
 from data.models import Signal
-from strategy.indicators import bollinger, ma, rsi
+from strategy.indicators import atr_wilder, ema, macd_hist_series, vwap
 
 
-def evaluate_buy(code: str, closes: list[float], ts: datetime) -> Signal | None:
-    if len(closes) < max(RSI_PERIOD + 1, BB_PERIOD, MA_MID) + 2:
+def evaluate_buy(code: str, buf: CandleBuffer, ts: datetime) -> Signal | None:
+    candles = buf.candles()
+    if len(candles) < max(MACD_SLOW + MACD_SIGNAL, VOLUME_LOOKBACK + 2, ATR_PERIOD + 2):
         return None
 
+    opens = [c.open for c in candles]
+    highs = [c.high for c in candles]
+    lows = [c.low for c in candles]
+    closes = [c.close for c in candles]
+    vols = [c.volume for c in candles]
+
     price = closes[-1]
-    prev = closes[-2]
 
-    cur_rsi = rsi(closes, RSI_PERIOD)
-    prev_rsi = rsi(closes[:-1], RSI_PERIOD)
-    _, _, bb_low = bollinger(closes, BB_PERIOD, BB_STD)
+    # --- 3분봉 지표 ---
+    vwap3 = vwap(highs, lows, closes, vols)
+    hist_series = macd_hist_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if len(hist_series) < 2:
+        return None
+    hist_now = hist_series[-1]
+    hist_prev = hist_series[-2]
+    atr_val = atr_wilder(highs, lows, closes, ATR_PERIOD)
+    ema9 = ema(closes, EMA_SHORT)
 
-    ma5 = ma(closes, MA_SHORT)
-    ma20 = ma(closes, MA_MID)
-    ma5_prev = ma(closes[:-1], MA_SHORT)
-    ma20_prev = ma(closes[:-1], MA_MID)
+    # --- 진입 3조건 ---
+    cond_vwap = (lows[-1] <= vwap3 <= closes[-1]) and (closes[-1] > opens[-1])
 
-    cond_rsi = prev_rsi < RSI_BUY_THRESHOLD and cur_rsi > prev_rsi
-    cond_bb = price <= bb_low * 1.005  # 하단 0.5% 이내 터치
-    cond_ma_cross = ma5_prev <= ma20_prev and ma5 > ma20
-    cond_ma_up = ma5 > ma5_prev
+    vol_window = vols[-(VOLUME_LOOKBACK + 1):-1]
+    avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
+    cond_volume = avg_vol > 0 and vols[-1] >= avg_vol * VOLUME_SURGE_MULT
 
-    if cond_rsi and cond_bb and (cond_ma_cross or cond_ma_up):
-        return Signal(
-            code=code,
-            type=SignalType.BUY,
-            price=price,
-            ts=ts,
-            reason=f"RSI {prev_rsi:.1f}→{cur_rsi:.1f}, BBlow={bb_low:.0f}, MA5={ma5:.0f}/MA20={ma20:.0f}",
-            meta={"rsi": cur_rsi, "bb_low": bb_low, "ma5": ma5, "ma20": ma20},
-        )
-    return None
+    cond_macd = hist_prev < 0 <= hist_now
+
+    if not (cond_vwap and cond_volume and cond_macd):
+        return None
+
+    # --- 상위 TF(15분) 필터 ---
+    htf = buf.resample(HTF_MULTIPLIER)
+    if len(htf) < MACD_SLOW + MACD_SIGNAL:
+        return None
+    h_h = [c.high for c in htf]
+    h_l = [c.low for c in htf]
+    h_c = [c.close for c in htf]
+    h_v = [c.volume for c in htf]
+    vwap15 = vwap(h_h, h_l, h_c, h_v)
+    h_hist = macd_hist_series(h_c, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    if not h_hist:
+        return None
+    if not (h_c[-1] > vwap15 and h_hist[-1] > 0):
+        return None
+
+    score = 0
+    if ema9 == ema9 and price > ema9:  # NaN 체크
+        score += 1
+
+    return Signal(
+        code=code,
+        type=SignalType.BUY,
+        price=price,
+        ts=ts,
+        reason=(
+            f"VWAP3={vwap3:.0f} vol×{vols[-1]/max(avg_vol,1):.2f} "
+            f"hist {hist_prev:+.3f}→{hist_now:+.3f} ATR={atr_val:.1f} score={score}"
+        ),
+        meta={
+            "atr": atr_val,
+            "vwap3": vwap3,
+            "vwap15": vwap15,
+            "ema9": ema9,
+            "hist": hist_now,
+            "score": score,
+        },
+    )

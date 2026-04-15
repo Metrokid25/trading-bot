@@ -12,7 +12,7 @@ from config.constants import ExitReason, SignalType
 class WatchItem:
     code: str
     name: str = ""
-    weight: float = 0.0  # 시드 대비 비중 (0~1)
+    weight: float = 0.0
     enabled: bool = True
 
 
@@ -44,7 +44,13 @@ class Position:
     qty: int
     opened_at: datetime
     realized_pnl: float = 0.0
-    tp_hit: set[int] = field(default_factory=set)  # 청산한 TP 레벨 인덱스
+    tp_hit: set[int] = field(default_factory=set)
+
+    # ATR 기반 신규 필드
+    atr: float = 0.0
+    stop_price: float = 0.0
+    tp_prices: list[float] = field(default_factory=list)
+    trailing_activated: bool = False
 
     def pnl_ratio(self, price: float) -> float:
         if self.entry_price <= 0:
@@ -65,3 +71,6 @@ class Trade:
     reason: str = ""
     pnl: float = 0.0
     exit_reason: ExitReason | None = None
+    atr: float = 0.0
+    stop_price: float = 0.0
+    tp_prices: tuple[float, ...] = ()

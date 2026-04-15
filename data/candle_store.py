@@ -56,6 +56,42 @@ class CandleBuffer:
     def lows(self) -> list[float]:
         return [c.low for c in self.closed] + ([self._cur.low] if self._cur else [])
 
+    def opens(self) -> list[float]:
+        return [c.open for c in self.closed] + ([self._cur.open] if self._cur else [])
+
+    def volumes(self) -> list[int]:
+        return [c.volume for c in self.closed] + ([self._cur.volume] if self._cur else [])
+
+    def candles(self) -> list[Candle]:
+        arr = list(self.closed)
+        if self._cur:
+            arr.append(self._cur)
+        return arr
+
+    def resample(self, factor: int) -> list[Candle]:
+        """3분봉을 `factor` 개씩 묶어 상위 타임프레임 봉으로 리샘플."""
+        src = self.candles()
+        if factor <= 1 or not src:
+            return src
+        # factor 개씩 묶되, 마지막 미완 그룹은 부분봉으로 포함
+        out: list[Candle] = []
+        for i in range(0, len(src), factor):
+            chunk = src[i : i + factor]
+            if not chunk:
+                continue
+            out.append(
+                Candle(
+                    code=self.code,
+                    ts=chunk[0].ts,
+                    open=chunk[0].open,
+                    high=max(c.high for c in chunk),
+                    low=min(c.low for c in chunk),
+                    close=chunk[-1].close,
+                    volume=sum(c.volume for c in chunk),
+                )
+            )
+        return out
+
 
 class CandleStore:
     """SQLite 저장. 백테스트/분석용."""

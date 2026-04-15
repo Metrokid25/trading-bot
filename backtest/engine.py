@@ -1,6 +1,6 @@
 """이벤트 기반 백테스트 엔진.
 
-실전과 동일한 Signal/Exit 로직을 히스토리컬 3분봉에 적용한다.
+새 전략: 3분봉 멀티TF 시그널 + ATR 기반 손절/분할익절/트레일링 + VWAP/MACD 청산.
 """
 from __future__ import annotations
 
@@ -8,19 +8,34 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from config import settings
-from config.constants import TAKE_PROFIT_LEVELS, ExitReason
+from config.constants import (
+    ATR_STOP_MULT,
+    ATR_TP_MULTS,
+    ATR_TP_RATIOS,
+    ATR_TRAILING_TRIGGER,
+    MACD_FAST,
+    MACD_SIGNAL,
+    MACD_SLOW,
+    MAX_POSITION_PCT,
+    RISK_PER_TRADE_PCT,
+    VOLUME_LOOKBACK,
+    VOLUME_SURGE_MULT,
+    ExitReason,
+)
+from data.candle_store import CandleBuffer
 from data.models import Candle, Position, Trade
+from strategy.indicators import macd_hist_series, vwap
 from strategy.signal import evaluate_buy
 
 
 @dataclass
 class BacktestConfig:
     seed: int = 10_000_000
-    weight_per_stock: float = 0.33
-    stop_loss_pct: float = -5.0
     max_concurrent: int = 3
     fee_rate: float = 0.00015
     tax_rate: float = 0.0018  # 매도 시
+    risk_per_trade: float = RISK_PER_TRADE_PCT
+    max_position_pct: float = MAX_POSITION_PCT
 
 
 @dataclass
@@ -38,18 +53,25 @@ class BacktestEngine:
     def __init__(self, cfg: BacktestConfig | None = None) -> None:
         self.cfg = cfg or BacktestConfig()
 
+    def _size(self, price: float, atr_val: float) -> int:
+        if price <= 0 or atr_val <= 0:
+            return 0
+        risk = self.cfg.seed * self.cfg.risk_per_trade
+        stop_dist = atr_val * ATR_STOP_MULT
+        qty_risk = int(risk // stop_dist)
+        qty_cap = int((self.cfg.seed * self.cfg.max_position_pct) // price)
+        return max(0, min(qty_risk, qty_cap))
+
     def run(self, data: dict[str, list[Candle]]) -> BacktestResult:
-        """data: {code: [Candle, ...]} — 이미 시간 정렬된 3분봉."""
         cfg = self.cfg
         positions: dict[str, Position] = {}
-        closes_by_code: dict[str, list[float]] = {c: [] for c in data}
+        buffers: dict[str, CandleBuffer] = {c: CandleBuffer(c) for c in data}
         cash = float(cfg.seed)
         realized = 0.0
         trades: list[Trade] = []
         equity_curve: list[tuple[datetime, float]] = []
         wins = losses = 0
 
-        # 시간축 병합
         all_events: list[tuple[datetime, str, Candle]] = []
         for code, cs in data.items():
             for c in cs:
@@ -57,69 +79,113 @@ class BacktestEngine:
         all_events.sort(key=lambda x: x[0])
 
         for ts, code, candle in all_events:
-            closes_by_code[code].append(candle.close)
+            buf = buffers[code]
+            # 봉을 직접 append (틱 재생 생략, 종가 기준)
+            buf.closed.append(candle)
             price = candle.close
-
-            # 기존 포지션 관리
             pos = positions.get(code)
+
+            # --- 포지션 관리 ---
             if pos:
-                pnl_ratio = pos.pnl_ratio(price)
                 # 손절
-                if pnl_ratio * 100 <= cfg.stop_loss_pct:
-                    pnl = self._close(pos, price, cfg)
-                    realized += pnl
+                if price <= pos.stop_price:
+                    reason = ExitReason.TRAIL_STOP if pos.trailing_activated else ExitReason.STOP_LOSS
+                    pnl = self._close_pnl(pos, price, cfg)
                     cash += price * pos.qty * (1 - cfg.fee_rate - cfg.tax_rate)
-                    trades.append(Trade(code, "SELL", price, pos.qty, ts,
-                                        reason="SL", pnl=pnl, exit_reason=ExitReason.STOP_LOSS))
+                    realized += pnl
+                    trades.append(Trade(
+                        code, "SELL", price, pos.qty, ts,
+                        reason=reason.value, pnl=pnl, exit_reason=reason,
+                        atr=pos.atr, stop_price=pos.stop_price, tp_prices=tuple(pos.tp_prices),
+                    ))
                     (wins if pnl > 0 else losses).__add__(1)
                     if pnl > 0: wins += 1
                     else: losses += 1
                     del positions[code]
-                else:
+                    pos = None
+
+                if pos:
+                    # 트레일링 본절
+                    if not pos.trailing_activated and pos.atr > 0:
+                        if price >= pos.entry_price + pos.atr * ATR_TRAILING_TRIGGER:
+                            pos.trailing_activated = True
+                            if pos.entry_price > pos.stop_price:
+                                pos.stop_price = pos.entry_price
+
                     # 분할 익절
-                    for idx, (target, ratio) in enumerate(TAKE_PROFIT_LEVELS):
-                        if idx in pos.tp_hit:
+                    for idx, (tp_price, ratio) in enumerate(zip(pos.tp_prices, ATR_TP_RATIOS)):
+                        if idx in pos.tp_hit or pos is None:
                             continue
-                        if pnl_ratio >= target:
-                            qty = max(1, int(pos.qty * ratio))
-                            if qty >= pos.qty:
-                                pnl = self._close(pos, price, cfg)
-                                realized += pnl
+                        if price >= tp_price:
+                            if ratio >= 1.0 or int(pos.qty * ratio) >= pos.qty:
+                                pnl = (price - pos.entry_price) * pos.qty
                                 cash += price * pos.qty * (1 - cfg.fee_rate - cfg.tax_rate)
-                                trades.append(Trade(code, "SELL", price, pos.qty, ts,
-                                                    reason=f"TP{idx+1}", pnl=pnl,
-                                                    exit_reason=ExitReason.TAKE_PROFIT))
+                                realized += pnl
+                                trades.append(Trade(
+                                    code, "SELL", price, pos.qty, ts,
+                                    reason=f"TP{idx+1}", pnl=pnl,
+                                    exit_reason=ExitReason.TAKE_PROFIT,
+                                    atr=pos.atr, stop_price=pos.stop_price,
+                                    tp_prices=tuple(pos.tp_prices),
+                                ))
                                 if pnl > 0: wins += 1
                                 else: losses += 1
                                 del positions[code]
+                                pos = None
                                 break
                             else:
+                                qty = max(1, int(pos.qty * ratio))
                                 pnl = (price - pos.entry_price) * qty
-                                realized += pnl
                                 cash += price * qty * (1 - cfg.fee_rate - cfg.tax_rate)
+                                realized += pnl
                                 pos.qty -= qty
                                 pos.realized_pnl += pnl
                                 pos.tp_hit.add(idx)
-                                trades.append(Trade(code, "SELL", price, qty, ts,
-                                                    reason=f"TP{idx+1}", pnl=pnl,
-                                                    exit_reason=ExitReason.TAKE_PROFIT))
+                                if tp_price > pos.stop_price:
+                                    pos.stop_price = tp_price
+                                trades.append(Trade(
+                                    code, "SELL", price, qty, ts,
+                                    reason=f"TP{idx+1}", pnl=pnl,
+                                    exit_reason=ExitReason.TAKE_PROFIT,
+                                    atr=pos.atr, stop_price=pos.stop_price,
+                                    tp_prices=tuple(pos.tp_prices),
+                                ))
                                 if pnl > 0: wins += 1
 
-            # 신규 진입
-            if code not in positions and len(positions) < cfg.max_concurrent:
-                sig = evaluate_buy(code, closes_by_code[code], ts)
-                if sig:
-                    budget = cfg.seed * cfg.weight_per_stock
-                    qty = int(budget // price)
-                    cost = price * qty * (1 + cfg.fee_rate)
-                    if qty > 0 and cost <= cash:
-                        cash -= cost
-                        positions[code] = Position(code=code, entry_price=price, qty=qty, opened_at=ts)
-                        trades.append(Trade(code, "BUY", price, qty, ts, reason=sig.reason))
+                # VWAP/MACD 청산시그널 (봉 마감 시)
+                if pos:
+                    pos = self._check_exit_signal(code, buf, ts, pos, positions, trades, cfg)
+                    if pos is None:
+                        # close_pnl 는 이미 trade 에 기록됨
+                        pass
 
-            # equity 기록
-            mv = sum(positions[c].qty * closes_by_code[c][-1] for c in positions if closes_by_code[c])
-            equity_curve.append((ts, cash + mv + realized))
+            # --- 신규 진입 ---
+            if code not in positions and len(positions) < cfg.max_concurrent:
+                sig = evaluate_buy(code, buf, ts)
+                if sig:
+                    atr_val = float(sig.meta.get("atr", 0.0) or 0.0)
+                    qty = self._size(price, atr_val)
+                    cost = price * qty * (1 + cfg.fee_rate)
+                    if qty > 0 and cost <= cash and atr_val > 0:
+                        cash -= cost
+                        stop_price = price - atr_val * ATR_STOP_MULT
+                        tp_prices = [price + atr_val * m for m in ATR_TP_MULTS]
+                        positions[code] = Position(
+                            code=code, entry_price=price, qty=qty, opened_at=ts,
+                            atr=atr_val, stop_price=stop_price, tp_prices=tp_prices,
+                        )
+                        trades.append(Trade(
+                            code, "BUY", price, qty, ts,
+                            reason=sig.reason, atr=atr_val,
+                            stop_price=stop_price, tp_prices=tuple(tp_prices),
+                        ))
+
+            # equity 기록 (미실현 + cash)
+            mv = 0.0
+            for c, p in positions.items():
+                last = buffers[c].closed[-1].close if buffers[c].closed else p.entry_price
+                mv += last * p.qty
+            equity_curve.append((ts, cash + mv))
 
         final_equity = equity_curve[-1][1] if equity_curve else cfg.seed
         return BacktestResult(
@@ -132,11 +198,42 @@ class BacktestEngine:
             num_trades=sum(1 for t in trades if t.side == "SELL"),
         )
 
+    def _check_exit_signal(self, code, buf, ts, pos, positions, trades, cfg):
+        candles = buf.candles()
+        if len(candles) < max(MACD_SLOW + MACD_SIGNAL, VOLUME_LOOKBACK + 2):
+            return pos
+        highs = [c.high for c in candles]
+        lows = [c.low for c in candles]
+        closes = [c.close for c in candles]
+        vols = [c.volume for c in candles]
+        vwap3 = vwap(highs, lows, closes, vols)
+        hist = macd_hist_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+        price = closes[-1]
+        vol_window = vols[-(VOLUME_LOOKBACK + 1):-1]
+        avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
+
+        exit_reason: ExitReason | None = None
+        if closes[-1] < vwap3 and avg_vol > 0 and vols[-1] >= avg_vol * VOLUME_SURGE_MULT:
+            exit_reason = ExitReason.VWAP_BREAK
+        elif len(hist) >= 2 and hist[-2] > 0 >= hist[-1]:
+            exit_reason = ExitReason.MACD_FLIP
+
+        if exit_reason:
+            pnl = (price - pos.entry_price) * pos.qty + pos.realized_pnl
+            trades.append(Trade(
+                code, "SELL", price, pos.qty, ts,
+                reason=exit_reason.value, pnl=pnl, exit_reason=exit_reason,
+                atr=pos.atr, stop_price=pos.stop_price, tp_prices=tuple(pos.tp_prices),
+            ))
+            del positions[code]
+            return None
+        return pos
+
     @staticmethod
-    def _close(pos: Position, price: float, cfg: BacktestConfig) -> float:
+    def _close_pnl(pos: Position, price: float, cfg: BacktestConfig) -> float:
         gross = (price - pos.entry_price) * pos.qty
         fee = price * pos.qty * (cfg.fee_rate + cfg.tax_rate)
-        return gross - fee
+        return gross - fee + pos.realized_pnl
 
     @staticmethod
     def _mdd(curve: list[tuple[datetime, float]]) -> float:

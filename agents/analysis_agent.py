@@ -52,8 +52,8 @@ class AnalysisAgent(BaseAgent):
 
         closed = buf.on_tick(float(price), now)
         if closed:
-            await self.bus.publish(Event(E.CANDLE_CLOSED, closed))
-            sig = evaluate_buy(code, buf.closes(), now)
+            await self.bus.publish(Event(E.CANDLE_CLOSED, {"code": code, "candle": closed, "buf": buf}))
+            sig = evaluate_buy(code, buf, now)
             if sig:
                 logger.info(f"[BUY SIGNAL] {code} @ {sig.price} — {sig.reason}")
                 await self.bus.publish(Event(E.BUY_SIGNAL, sig))
