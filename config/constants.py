@@ -11,8 +11,8 @@ MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 30)
 
 # --- 매매 금지 / 특수 구간 ---
-NO_TRADE_START = time(9, 0)       # 9:00 ~ 9:15 변동성 구간 매매 금지
-NO_TRADE_END = time(9, 15)
+NO_TRADE_START = time(9, 0)       # 9:00 ~ 9:30 변동성 구간 매매 금지
+NO_TRADE_END = time(9, 30)
 
 NO_NEW_BUY_AFTER = time(14, 30)   # 14:30 이후 신규 매수 금지
 
@@ -29,6 +29,7 @@ ATR_STOP_MULT = 2.0
 ATR_TP_MULTS = (1.5, 2.5, 4.0)
 ATR_TP_RATIOS = (0.40, 0.40, 1.00)    # 3차는 잔여 전량
 ATR_TRAILING_TRIGGER = 1.0            # +1 ATR 도달 시 본절 이동
+TP_STOP_BUFFER_ATR = 0.5              # 익절 후 손절선 = 직전 익절가 - 0.5 ATR
 
 MACD_FAST = 12
 MACD_SLOW = 26

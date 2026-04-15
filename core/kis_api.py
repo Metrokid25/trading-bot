@@ -99,6 +99,54 @@ class KISClient:
         r.raise_for_status()
         return r.json().get("output2", [])
 
+    async def get_minute_candles_at(
+        self, code: str, hhmmss: str, past_data: bool = True
+    ) -> list[dict[str, Any]]:
+        """특정 시각 기준 과거 방향으로 분봉 30개 반환 (당일 내).
+
+        KIS 주식당일분봉조회는 `FID_INPUT_HOUR_1` 에 HHMMSS(6자리)를 주면
+        그 시각 기준 이전 30개 분봉을 돌려준다. 페이지네이션에 사용.
+        """
+        headers = await self._headers("FHKST03010200")
+        params = {
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_HOUR_1": hhmmss,
+            "FID_PW_DATA_INCU_YN": "Y" if past_data else "N",
+        }
+        r = await self._client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        return r.json().get("output2", [])
+
+    async def get_daily_candles(
+        self, code: str, start: str, end: str, period: str = "D"
+    ) -> list[dict[str, Any]]:
+        """일봉(또는 주/월) 조회. 영업일 판별용.
+
+        start/end: YYYYMMDD, period: D/W/M/Y
+        """
+        headers = await self._headers("FHKST03010100")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": end,
+            "FID_PERIOD_DIV_CODE": period,
+            "FID_ORG_ADJ_PRC": "0",
+        }
+        r = await self._client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        return r.json().get("output2", [])
+
     # ----- 주문 -----
     async def order_cash(self, code: str, qty: int, price: int = 0, side: str = "BUY") -> dict:
         """현금 매수/매도. price=0 이면 시장가."""

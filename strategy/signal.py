@@ -23,6 +23,10 @@ from config.constants import (
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
+    NO_NEW_BUY_AFTER,
+    NO_TRADE_END,
+    NO_TRADE_START,
+    FORCE_CLOSE_START,
     SignalType,
     VOLUME_LOOKBACK,
     VOLUME_SURGE_MULT,
@@ -33,6 +37,13 @@ from strategy.indicators import atr_wilder, ema, macd_hist_series, vwap
 
 
 def evaluate_buy(code: str, buf: CandleBuffer, ts: datetime) -> Signal | None:
+    # 시간대 필터 (9:00~9:30 금지, 14:30 이후 신규매수 금지, 15:10 이후 금지)
+    t = ts.time()
+    if NO_TRADE_START <= t < NO_TRADE_END:
+        return None
+    if t >= NO_NEW_BUY_AFTER:
+        return None
+
     candles = buf.candles()
     if len(candles) < max(MACD_SLOW + MACD_SIGNAL, VOLUME_LOOKBACK + 2, ATR_PERIOD + 2):
         return None
@@ -45,8 +56,10 @@ def evaluate_buy(code: str, buf: CandleBuffer, ts: datetime) -> Signal | None:
 
     price = closes[-1]
 
-    # --- 3분봉 지표 ---
-    vwap3 = vwap(highs, lows, closes, vols)
+    # --- 3분봉 지표 (VWAP 은 당일 세션만) ---
+    today = candles[-1].ts.date()
+    sess_idx = next((i for i, c in enumerate(candles) if c.ts.date() == today), len(candles) - 1)
+    vwap3 = vwap(highs[sess_idx:], lows[sess_idx:], closes[sess_idx:], vols[sess_idx:])
     hist_series = macd_hist_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     if len(hist_series) < 2:
         return None
@@ -56,13 +69,17 @@ def evaluate_buy(code: str, buf: CandleBuffer, ts: datetime) -> Signal | None:
     ema9 = ema(closes, EMA_SHORT)
 
     # --- 진입 3조건 ---
-    cond_vwap = (lows[-1] <= vwap3 <= closes[-1]) and (closes[-1] > opens[-1])
+    cond_vwap = (lows[-1] <= vwap3 * 1.002) and (closes[-1] >= vwap3) and (closes[-1] > opens[-1])
 
     vol_window = vols[-(VOLUME_LOOKBACK + 1):-1]
     avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
     cond_volume = avg_vol > 0 and vols[-1] >= avg_vol * VOLUME_SURGE_MULT
 
-    cond_macd = hist_prev < 0 <= hist_now
+    recent_flip = any(
+        hist_series[i - 1] < 0 <= hist_series[i]
+        for i in range(max(1, len(hist_series) - 5), len(hist_series))
+    )
+    cond_macd = hist_now > 0 and recent_flip
 
     if not (cond_vwap and cond_volume and cond_macd):
         return None
@@ -75,7 +92,8 @@ def evaluate_buy(code: str, buf: CandleBuffer, ts: datetime) -> Signal | None:
     h_l = [c.low for c in htf]
     h_c = [c.close for c in htf]
     h_v = [c.volume for c in htf]
-    vwap15 = vwap(h_h, h_l, h_c, h_v)
+    h_sess = next((i for i, c in enumerate(htf) if c.ts.date() == today), len(htf) - 1)
+    vwap15 = vwap(h_h[h_sess:], h_l[h_sess:], h_c[h_sess:], h_v[h_sess:])
     h_hist = macd_hist_series(h_c, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     if not h_hist:
         return None

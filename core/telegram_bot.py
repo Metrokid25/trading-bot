@@ -26,18 +26,21 @@ class TelegramBot:
         self._handlers[cmd] = fn
 
     async def start(self) -> None:
-        if not settings.TELEGRAM_BOT_TOKEN:
-            logger.warning("TELEGRAM_BOT_TOKEN 비어있음 — 텔레그램 비활성화")
+        token = settings.TELEGRAM_BOT_TOKEN
+        if not token or "your_bot_token" in token.lower() or ":" not in token:
+            logger.warning("TELEGRAM_BOT_TOKEN 미설정/placeholder — 텔레그램 비활성화")
             return
-        self._app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
-
-        for cmd in self._handlers:
-            self._app.add_handler(CommandHandler(cmd, self._wrap(cmd)))
-
-        await self._app.initialize()
-        await self._app.start()
-        await self._app.updater.start_polling()
-        logger.info("텔레그램 봇 시작")
+        try:
+            self._app = Application.builder().token(token).build()
+            for cmd in self._handlers:
+                self._app.add_handler(CommandHandler(cmd, self._wrap(cmd)))
+            await self._app.initialize()
+            await self._app.start()
+            await self._app.updater.start_polling()
+            logger.info("텔레그램 봇 시작")
+        except Exception as e:
+            logger.error(f"텔레그램 시작 실패({type(e).__name__}): {e} — 비활성화로 진행")
+            self._app = None
 
     async def stop(self) -> None:
         if not self._app:

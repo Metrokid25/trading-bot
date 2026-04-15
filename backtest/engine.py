@@ -13,6 +13,7 @@ from config.constants import (
     ATR_TP_MULTS,
     ATR_TP_RATIOS,
     ATR_TRAILING_TRIGGER,
+    TP_STOP_BUFFER_ATR,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
@@ -141,8 +142,9 @@ class BacktestEngine:
                                 pos.qty -= qty
                                 pos.realized_pnl += pnl
                                 pos.tp_hit.add(idx)
-                                if tp_price > pos.stop_price:
-                                    pos.stop_price = tp_price
+                                new_stop = tp_price - pos.atr * TP_STOP_BUFFER_ATR
+                                if new_stop > pos.stop_price:
+                                    pos.stop_price = new_stop
                                 trades.append(Trade(
                                     code, "SELL", price, qty, ts,
                                     reason=f"TP{idx+1}", pnl=pnl,
@@ -154,10 +156,10 @@ class BacktestEngine:
 
                 # VWAP/MACD 청산시그널 (봉 마감 시)
                 if pos:
+                    prev_qty = pos.qty
                     pos = self._check_exit_signal(code, buf, ts, pos, positions, trades, cfg)
                     if pos is None:
-                        # close_pnl 는 이미 trade 에 기록됨
-                        pass
+                        cash += price * prev_qty * (1 - cfg.fee_rate - cfg.tax_rate)
 
             # --- 신규 진입 ---
             if code not in positions and len(positions) < cfg.max_concurrent:
@@ -206,14 +208,17 @@ class BacktestEngine:
         lows = [c.low for c in candles]
         closes = [c.close for c in candles]
         vols = [c.volume for c in candles]
-        vwap3 = vwap(highs, lows, closes, vols)
+        today = candles[-1].ts.date()
+        sess = next((i for i, c in enumerate(candles) if c.ts.date() == today), len(candles) - 1)
+        vwap3 = vwap(highs[sess:], lows[sess:], closes[sess:], vols[sess:])
         hist = macd_hist_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
         price = closes[-1]
         vol_window = vols[-(VOLUME_LOOKBACK + 1):-1]
         avg_vol = sum(vol_window) / len(vol_window) if vol_window else 0.0
 
         exit_reason: ExitReason | None = None
-        if closes[-1] < vwap3 and avg_vol > 0 and vols[-1] >= avg_vol * VOLUME_SURGE_MULT:
+        two_bar_break = len(closes) >= 2 and closes[-1] < vwap3 and closes[-2] < vwap3
+        if two_bar_break and avg_vol > 0 and vols[-1] >= avg_vol * VOLUME_SURGE_MULT:
             exit_reason = ExitReason.VWAP_BREAK
         elif len(hist) >= 2 and hist[-2] > 0 >= hist[-1]:
             exit_reason = ExitReason.MACD_FLIP
