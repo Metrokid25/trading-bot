@@ -36,6 +36,22 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 EMA_SHORT = 9
+EMA_MID = 20
+EMA_LONG = 60
+
+# --- v3 전략: 일봉 필터 + 수급 필터 ---
+DAILY_MA_SHORT = 20
+DAILY_MA_LONG = 60
+FLOW_LOOKBACK_DAYS = 5
+FLOW_THRESHOLD_MWON = 500              # 5일 누적 순매수 ≥ 500백만원(=5억) 이면 PASS
+
+# VWAP 터치 허용 오차 (close가 VWAP 아래로 얼마까지 찍었다가 반등했는가)
+VWAP_TOUCH_TOLERANCE = 0.002           # 0.2%
+
+# --- v5: BREAKOUT 시그널 채널 ---
+BREAKOUT_VOLUME_MULT = 3.0             # 5일 평균(per-bar) 대비 현재 봉 거래량 배수
+BREAKOUT_VOL_LOOKBACK_BARS = 650       # 약 5거래일 (코스닥 3분봉 ~130/일 × 5)
+BREAKOUT_HIGH_LOOKBACK = 60            # 60봉(3시간) 신고가 돌파
 
 VOLUME_SURGE_MULT = 1.5
 VOLUME_LOOKBACK = 20

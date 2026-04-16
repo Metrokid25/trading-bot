@@ -37,6 +37,8 @@ class BacktestConfig:
     tax_rate: float = 0.0018  # 매도 시
     risk_per_trade: float = RISK_PER_TRADE_PCT
     max_position_pct: float = MAX_POSITION_PCT
+    eligible_codes: set[str] | None = None  # None = 전체 허용, 아니면 이 집합만 진입
+    allow_breakout: bool = False              # v5: BREAKOUT 시그널 채널 추가
 
 
 @dataclass
@@ -161,11 +163,14 @@ class BacktestEngine:
                     if pos is None:
                         cash += price * prev_qty * (1 - cfg.fee_rate - cfg.tax_rate)
 
-            # --- 신규 진입 ---
+            # --- 신규 진입 (eligible_codes 게이트 적용) ---
             if code not in positions and len(positions) < cfg.max_concurrent:
-                sig = evaluate_buy(code, buf, ts)
+                eligible = cfg.eligible_codes is None or code in cfg.eligible_codes
+                sig = (evaluate_buy(code, buf, ts, allow_breakout=cfg.allow_breakout)
+                       if eligible else None)
                 if sig:
                     atr_val = float(sig.meta.get("atr", 0.0) or 0.0)
+                    kind = sig.meta.get("kind", "PULLBACK")
                     qty = self._size(price, atr_val)
                     cost = price * qty * (1 + cfg.fee_rate)
                     if qty > 0 and cost <= cash and atr_val > 0:
@@ -178,7 +183,7 @@ class BacktestEngine:
                         )
                         trades.append(Trade(
                             code, "BUY", price, qty, ts,
-                            reason=sig.reason, atr=atr_val,
+                            reason=f"[{kind}] {sig.reason}", atr=atr_val,
                             stop_price=stop_price, tp_prices=tuple(tp_prices),
                         ))
 
