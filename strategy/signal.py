@@ -32,7 +32,7 @@ from config.constants import (
 )
 from data.candle_store import CandleBuffer
 from data.models import Signal
-from strategy.indicators import atr_wilder, ema, macd_hist_series, vwap
+from strategy.indicators import atr_wilder, atr_wilder_series, ema, macd_hist_series, vwap
 
 MACD_FLIP_LOOKBACK = 5
 
@@ -99,6 +99,24 @@ def _evaluate_pullback(code: str, buf: CandleBuffer, ts: datetime) -> Signal | N
     if ema9 == ema9 and price > ema9:
         score += 1
 
+    # v6 step1: 동적 사이징용 — 최근 20개 봉의 ATR 평균. 데이터 부족 시 None.
+    atr_series = atr_wilder_series(highs, lows, closes, ATR_PERIOD)
+    atr_avg20: float | None = float(np.mean(atr_series[-20:])) if atr_series else None
+
+    # v6 step2: 시그널 품질 점수 (각 0~1, 평균 → signal_quality).
+    # 임계 튜닝(0.530→분산 확대): vol 2.0~4.0배, macd hist ≥ price×0.05%.
+    try:
+        vwap_score = max(0.0, min(1.0, (price - vwap3) / vwap3 / 0.005))
+        vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 0.0
+        vol_score = max(0.0, min(1.0, (vol_ratio - 2.0) / 2.0))
+        macd_score = (
+            max(0.0, min(1.0, hist_now / (price * 0.001))) if price > 0 else 0.0
+        )
+        signal_quality: float | None = (vwap_score + vol_score + macd_score) / 3.0
+    except Exception:
+        vwap_score = vol_score = macd_score = 0.0
+        signal_quality = None
+
     return Signal(
         code=code,
         type=SignalType.BUY,
@@ -110,6 +128,11 @@ def _evaluate_pullback(code: str, buf: CandleBuffer, ts: datetime) -> Signal | N
         ),
         meta={
             "atr": atr_val,
+            "atr_avg20": atr_avg20,
+            "signal_quality": signal_quality,
+            "vwap_score": vwap_score,
+            "vol_score": vol_score,
+            "macd_score": macd_score,
             "vwap3": vwap3,
             "vwap15": vwap15,
             "ema9": ema9,

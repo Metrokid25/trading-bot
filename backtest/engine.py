@@ -39,6 +39,8 @@ class BacktestConfig:
     max_position_pct: float = MAX_POSITION_PCT
     eligible_codes: set[str] | None = None  # None = 전체 허용, 아니면 이 집합만 진입
     allow_breakout: bool = False              # v5: BREAKOUT 시그널 채널 추가
+    atr_sizing_mode: str = "fixed"            # v6 step1: "fixed" | "dynamic"
+    quality_sizing_mode: str = "off"          # v6 step2: "off" | "on"
 
 
 @dataclass
@@ -56,14 +58,38 @@ class BacktestEngine:
     def __init__(self, cfg: BacktestConfig | None = None) -> None:
         self.cfg = cfg or BacktestConfig()
 
-    def _size(self, price: float, atr_val: float) -> int:
+    def _size(
+        self,
+        price: float,
+        atr_val: float,
+        atr_avg20: float | None = None,
+        signal_quality: float | None = None,
+    ) -> int:
         if price <= 0 or atr_val <= 0:
             return 0
         risk = self.cfg.seed * self.cfg.risk_per_trade
         stop_dist = atr_val * ATR_STOP_MULT
         qty_risk = int(risk // stop_dist)
         qty_cap = int((self.cfg.seed * self.cfg.max_position_pct) // price)
-        return max(0, min(qty_risk, qty_cap))
+        qty = max(0, min(qty_risk, qty_cap))
+        # v6 step1: 동적 ATR 사이징 — atr_avg20 / current_atr 비율로 승수 적용.
+        if (
+            self.cfg.atr_sizing_mode == "dynamic"
+            and atr_avg20 is not None
+            and atr_avg20 > 0
+        ):
+            atr_mult = max(0.5, min(2.0, atr_avg20 / atr_val))
+            qty = int(qty * atr_mult)
+            qty = min(qty, qty_cap)
+        # v6 step2: 시그널 품질 사이징 — 0.5 ~ 1.5 승수 곱.
+        if (
+            self.cfg.quality_sizing_mode == "on"
+            and signal_quality is not None
+        ):
+            quality_mult = 0.5 + float(signal_quality)
+            qty = int(qty * quality_mult)
+            qty = min(qty, qty_cap)
+        return max(0, qty)
 
     def run(self, data: dict[str, list[Candle]]) -> BacktestResult:
         cfg = self.cfg
@@ -171,7 +197,9 @@ class BacktestEngine:
                 if sig:
                     atr_val = float(sig.meta.get("atr", 0.0) or 0.0)
                     kind = sig.meta.get("kind", "PULLBACK")
-                    qty = self._size(price, atr_val)
+                    atr_avg20 = sig.meta.get("atr_avg20")
+                    signal_quality = sig.meta.get("signal_quality")
+                    qty = self._size(price, atr_val, atr_avg20, signal_quality)
                     cost = price * qty * (1 + cfg.fee_rate)
                     if qty > 0 and cost <= cash and atr_val > 0:
                         cash -= cost

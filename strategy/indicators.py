@@ -157,3 +157,30 @@ def atr_wilder(
     for v in tr[period:]:
         a = (a * (period - 1) + float(v)) / period
     return a
+
+
+def atr_wilder_series(
+    highs: list[float], lows: list[float], closes: list[float],
+    period: int = 14, min_avg_window: int = 20,
+) -> list[float]:
+    """Wilder ATR 시계열 — 평균 윈도우(기본 20봉) 계산용.
+
+    정책: 데이터가 `period + min_avg_window` 봉 미만이면 빈 리스트 반환.
+    호출자는 빈 리스트 = "최근 N봉 ATR 평균을 신뢰할 수 없음" 으로 해석한다.
+    """
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + min_avg_window:
+        return []
+    h = np.asarray(highs[:n], dtype=float)
+    l = np.asarray(lows[:n], dtype=float)
+    c = np.asarray(closes[:n], dtype=float)
+    tr = np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])])
+    if len(tr) < period:
+        return []
+    out: list[float] = []
+    a = float(tr[:period].mean())
+    out.append(a)
+    for v in tr[period:]:
+        a = (a * (period - 1) + float(v)) / period
+        out.append(a)
+    return out
