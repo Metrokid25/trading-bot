@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, computed_field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, computed_field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     TELEGRAM_ALERT_CHAT_ID: str = ""
+    # 허용된 사용자 ID (CSV: "12345,67890"). 빈 리스트면 모든 사용자 거부(안전 기본값).
+    ALLOWED_TELEGRAM_USERS: Annotated[list[int], NoDecode] = []
+
+    @field_validator("ALLOWED_TELEGRAM_USERS", mode="before")
+    @classmethod
+    def _parse_allowed_users(cls, v):
+        if isinstance(v, str):
+            return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if isinstance(v, int):
+            return [v]
+        return v
 
     # --- Trading params ---
     TOTAL_SEED: int = 10_000_000

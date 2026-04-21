@@ -1,6 +1,7 @@
 """텔레그램 공용 클라이언트.
 
-- 명령 핸들러: /add /remove /seed /weight /status /halt /resume
+- 명령 핸들러(텍스트): /add /remove /seed /weight /status /halt /resume
+- Raw 핸들러(Update 직접 접근): /p /picks /extend /archive 등
 - 알림 헬퍼: notify(), alert()(비상)
 """
 from __future__ import annotations
@@ -15,15 +16,24 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from config import settings
 
 CommandFn = Callable[[list[str]], Awaitable[str]]
+RawHandlerFn = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 
 
 class TelegramBot:
     def __init__(self) -> None:
         self._app: Application | None = None
         self._handlers: dict[str, CommandFn] = {}
+        self._raw_handlers: dict[str, RawHandlerFn] = {}
 
     def register(self, cmd: str, fn: CommandFn) -> None:
         self._handlers[cmd] = fn
+
+    def register_raw(self, cmd: str, fn: RawHandlerFn) -> None:
+        """Update/Context 객체를 직접 받는 핸들러 등록.
+
+        인증, 멀티라인 파싱, 분할 전송이 필요한 명령어에 사용.
+        """
+        self._raw_handlers[cmd] = fn
 
     async def start(self) -> None:
         token = settings.TELEGRAM_BOT_TOKEN
@@ -34,6 +44,8 @@ class TelegramBot:
             self._app = Application.builder().token(token).build()
             for cmd in self._handlers:
                 self._app.add_handler(CommandHandler(cmd, self._wrap(cmd)))
+            for cmd, fn in self._raw_handlers.items():
+                self._app.add_handler(CommandHandler(cmd, fn))
             await self._app.initialize()
             await self._app.start()
             await self._app.updater.start_polling()

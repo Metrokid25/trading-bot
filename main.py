@@ -22,8 +22,11 @@ from agents.execution_agent import ExecutionAgent
 from agents.portfolio_agent import PortfolioAgent
 from config import settings
 from core.kis_api import KISClient
+from core.pick_handlers import register_pick_handlers
 from core.telegram_bot import TelegramBot
 from data.candle_store import CandleStore
+from data.sector_store import SectorStore
+from data.stock_master import StockMaster
 from risk.risk_manager import RiskManager
 
 
@@ -55,11 +58,15 @@ async def run() -> None:
     risk = RiskManager()
     store = CandleStore()
     await store.open()
+    sector_store = SectorStore()
+    await sector_store.open()
+    stock_master = StockMaster()
 
     portfolio = PortfolioAgent(bus, tg)
     analysis = AnalysisAgent(bus, kis, store=store)
     execution = ExecutionAgent(bus, kis, tg, risk, portfolio)
 
+    register_pick_handlers(tg, sector_store, stock_master)
     await tg.start()
     await tg.notify(f"🤖 Trading Bot 시작 (ENV={settings.KIS_ENV})")
 
@@ -95,6 +102,7 @@ async def run() -> None:
             pass
         await tg.stop()
         await store.close()
+        await sector_store.close()
         await kis.close()
         logger.info("=== 종료 완료 ===")
 
