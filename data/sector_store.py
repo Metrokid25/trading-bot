@@ -1,7 +1,9 @@
 """섹터 픽(스승님 워치리스트) SQLite 영속화."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
+from typing import Any
 
 import aiosqlite
 from loguru import logger
@@ -62,6 +64,21 @@ class SectorStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_stocks_code "
             "ON sector_stocks (stock_code)"
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS alert_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sector_name TEXT NOT NULL,
+                stage INTEGER NOT NULL,
+                triggered_at TEXT NOT NULL,
+                passed_stocks TEXT NOT NULL,
+                metrics TEXT NOT NULL,
+                threshold_used TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_sector_time "
+            "ON alert_history (sector_name, triggered_at)"
         )
 
     async def insert_pick(
@@ -215,3 +232,56 @@ class SectorStore:
             "UPDATE sector_picks SET status = ? WHERE id = ?",
             (PickStatus.ARCHIVED.value, pick_id),
         )
+
+    # --- Phase 2: 알림 이력 ---
+    async def insert_alert(
+        self,
+        sector_name: str,
+        stage: int,
+        triggered_at: datetime,
+        passed_stocks: list[dict[str, Any]] | dict[str, Any],
+        metrics: dict[str, Any],
+        threshold_used: dict[str, Any],
+    ) -> int:
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        cur = await self._db.execute(
+            "INSERT INTO alert_history "
+            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                sector_name,
+                stage,
+                triggered_at.isoformat(),
+                json.dumps(passed_stocks, ensure_ascii=False),
+                json.dumps(metrics, ensure_ascii=False),
+                json.dumps(threshold_used, ensure_ascii=False),
+            ),
+        )
+        alert_id = cur.lastrowid
+        if alert_id is None:
+            raise RuntimeError("lastrowid missing after alert_history insert")
+        return alert_id
+
+    async def should_alert(
+        self,
+        sector_name: str,
+        stage: int,
+        cooldown_min: int,
+    ) -> bool:
+        """동일 (sector_name, stage) 최근 알림이 cooldown 내면 False.
+
+        Stage별 독립 쿨다운: Stage 1 알림이 있어도 Stage 2/3은 별개 판정.
+        봇 재시작 후에도 DB 이력 기준으로 일관되게 동작.
+        """
+        if not self._db:
+            return True
+        threshold_iso = (datetime.now() - timedelta(minutes=cooldown_min)).isoformat()
+        cur = await self._db.execute(
+            "SELECT 1 FROM alert_history "
+            "WHERE sector_name = ? AND stage = ? AND triggered_at > ? "
+            "LIMIT 1",
+            (sector_name, stage, threshold_iso),
+        )
+        row = await cur.fetchone()
+        return row is None

@@ -14,12 +14,16 @@ import asyncio
 import signal
 import sys
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
 from agents.analysis_agent import AnalysisAgent
 from agents.base_agent import EventBus
 from agents.execution_agent import ExecutionAgent
 from agents.portfolio_agent import PortfolioAgent
+from agents.sector_detector import SectorDetector
+from config import constants as C
 from config import settings
 from core.kis_api import KISClient
 from core.pick_handlers import register_pick_handlers
@@ -70,6 +74,24 @@ async def run() -> None:
     await tg.start()
     await tg.notify(f"🤖 Trading Bot 시작 (ENV={settings.KIS_ENV})")
 
+    # 섹터 쏠림 감지기 (Phase 2 Stage 1) — 매 분 10초에 발화.
+    # 10초 오프셋 이유: KIS 분봉은 해당 분 마감 후 반영 → 정각 폴링 시
+    # "방금 닫힌 분봉"이 미확정 상태로 돌아올 가능성. 10초 여유로 회피.
+    detector = SectorDetector(kis, sector_store, tg)
+    scheduler = AsyncIOScheduler(timezone=C.KST)
+    scheduler.add_job(
+        detector.scan_once,
+        CronTrigger(
+            second=10, minute="*", hour="9-15",
+            day_of_week="mon-fri", timezone=C.KST,
+        ),
+        id="sector_scan",
+        max_instances=1,  # 이전 scan_once 진행 중이면 새 트리거 스킵
+        coalesce=True,    # 밀린 트리거는 병합 1회만
+    )
+    scheduler.start()
+    logger.info("[sector] APScheduler 시작 — 매 분 10초 scan_once (평일 9~15시)")
+
     agents = [portfolio, analysis, execution]
     for a in agents:
         await a.start()
@@ -91,6 +113,12 @@ async def run() -> None:
         pass
     finally:
         logger.info("정리 중...")
+        # 스케줄러 먼저 정지 — 진행 중인 scan_once() 완료 대기 후 새 트리거 차단
+        try:
+            scheduler.shutdown(wait=True)
+            logger.info("[sector] 스케줄러 종료 완료")
+        except Exception as e:
+            logger.warning(f"scheduler shutdown 실패: {e}")
         for a in reversed(agents):
             try:
                 await a.stop()

@@ -56,6 +56,27 @@ BREAKOUT_HIGH_LOOKBACK = 60            # 60봉(3시간) 신고가 돌파
 VOLUME_SURGE_MULT = 1.5
 VOLUME_LOOKBACK = 20
 
+# --- Phase 2: 섹터 쏠림 감지 (Stage 1 = 조건 A + B) ---
+# 조건 A: 개별 종목 필터 (거래량/상승률/양봉)
+SECTOR_A_VOL_MULT_DEFAULT = 3.0        # 정규 구간: 최근 VOLUME_LOOKBACK분 평균 × 3배
+SECTOR_A_VOL_MULT_EARLY = 4.0          # 09:00~09:30 장 초반 강화
+SECTOR_A_VOL_MULT_LATE = 3.5           # 14:30 이후 강화
+SECTOR_A_RETURN_DEFAULT = 0.02         # 당일 시가 대비 +2%
+SECTOR_A_RETURN_EARLY = 0.03           # 장 초반 +3%
+
+# 조건 B: 같은 섹터 내 A 통과 종목 수 임계
+SECTOR_B_MIN_PASSED = 3
+
+# 시간대 경계 (EARLY < SECTOR_EARLY_END, LATE ≥ SECTOR_LATE_START)
+SECTOR_EARLY_END = time(9, 30)
+SECTOR_LATE_START = time(14, 30)
+# 동시호가 구간 - 신호 발생 차단
+SECTOR_BLOCK_START = time(15, 20)
+SECTOR_BLOCK_END = time(15, 30)
+
+# 동일 (pick, sector) 중복 알림 쿨다운 (분)
+SECTOR_ALERT_COOLDOWN_MIN = 5
+
 # --- 레거시 지표 (테스트/백테스트 호환) ---
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 30.0
