@@ -55,6 +55,3 @@ htmlcov/
 # Backtest outputs
 backtest/results/
 *.csv.bak
-
-# Claude Code 개인 설정 (팀 공유는 .claude/settings.json 사용)
-.claude/settings.local.json
