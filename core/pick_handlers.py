@@ -117,6 +117,43 @@ def _format_merge_result(results: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_archive_sector_preview(sector_name: str, picks_info: list[dict]) -> str:
+    lines = [f"⚠️ [{sector_name}] 섹터 제거 대상", ""]
+    for info in picks_info:
+        pid = info["pick_id"]
+        s_cnt = info["sector_stock_count"]
+        o_cnt = info["other_stock_count"]
+        suffix = "→ 빈 Pick, archive" if o_cnt == 0 else f"→ 다른 섹터 {o_cnt}종목 유지"
+        lines.append(f"· Pick {pid} ({s_cnt}종목) {suffix}")
+    lines.append("")
+    lines.append(f"실행: /archive_sector {sector_name} confirm")
+    return "\n".join(lines)
+
+
+def _format_archive_sector_result(sector_name: str, result: dict) -> str:
+    lines = [f"✅ [{sector_name}] 섹터 제거 완료"]
+    auto_archived = result["auto_archived_picks"]
+    kept = [p for p in result["affected_picks"] if p not in auto_archived]
+    if auto_archived:
+        lines.append(f"archive된 Pick: {', '.join(str(i) for i in auto_archived)}")
+    if kept:
+        lines.append(f"종목만 제거 (Pick 유지): {', '.join(str(i) for i in kept)}")
+    return "\n".join(lines)
+
+
+def _format_remove_stock_result(
+    sector_name: str, stock_name: str, stock_code: str, result: dict
+) -> str:
+    lines = [f"✅ [{sector_name}] {stock_name} ({stock_code}) 제거됨"]
+    auto_archived = result["auto_archived_picks"]
+    for pick_id in result["removed_from_picks"]:
+        if pick_id in auto_archived:
+            lines.append(f"  · Pick {pick_id}에서 제거 → 종목 없어 자동 archive")
+        else:
+            lines.append(f"  · Pick {pick_id}에서 제거")
+    return "\n".join(lines)
+
+
 def _format_picks_list(
     picks: list[SectorPick],
     sector_counts: dict[int, dict[str, int]],
@@ -308,15 +345,76 @@ def _build_handlers(store: SectorStore, master: StockMaster):
 
         await _reply(update, _format_merge_result(results))
 
-    return cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates
+    @require_authorized_user
+    async def cmd_archive_sector(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = context.args or []
+        if not args:
+            await _reply(update, "형식: /archive_sector <섹터명> [confirm]")
+            return
+
+        sector_name = args[0]
+        is_confirm = len(args) > 1 and args[1].lower() == "confirm"
+
+        picks_info = await store.get_sector_picks_info(sector_name)
+
+        if not picks_info:
+            await _reply(update, f"📋 [{sector_name}] 활성 픽 없음")
+            return
+
+        if not is_confirm:
+            await _reply(update, _format_archive_sector_preview(sector_name, picks_info))
+            return
+
+        try:
+            result = await store.archive_sector(sector_name)
+        except Exception:
+            logger.exception("archive_sector 실패 sector=%s", sector_name)
+            await _reply(update, f"❌ [{sector_name}] 섹터 제거 실패: DB 오류")
+            return
+
+        await _reply(update, _format_archive_sector_result(sector_name, result))
+
+    @require_authorized_user
+    async def cmd_remove_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = context.args or []
+        if len(args) < 2:
+            await _reply(update, "형식: /remove_stock <섹터명> <종목명>")
+            return
+
+        sector_name = args[0]
+        stock_query = " ".join(args[1:])
+
+        resolved = await master.resolve(stock_query)
+        if not resolved:
+            await _reply(update, f"❌ 종목을 찾을 수 없음: {stock_query}")
+            return
+
+        stock_code, stock_name = resolved
+
+        try:
+            result = await store.remove_stock_from_sector(sector_name, stock_code)
+        except Exception:
+            logger.exception("remove_stock_from_sector 실패 sector=%s code=%s", sector_name, stock_code)
+            await _reply(update, "❌ 종목 제거 실패: DB 오류")
+            return
+
+        if not result["removed_from_picks"]:
+            await _reply(update, f"📋 [{sector_name}]에 {stock_name} ({stock_code}) 없음")
+            return
+
+        await _reply(update, _format_remove_stock_result(sector_name, stock_name, stock_code, result))
+
+    return cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates, cmd_archive_sector, cmd_remove_stock
 
 
 def register_pick_handlers(
     bot: TelegramBot, store: SectorStore, master: StockMaster
 ) -> None:
-    cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates = _build_handlers(store, master)
+    cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates, cmd_archive_sector, cmd_remove_stock = _build_handlers(store, master)
     bot.register_raw("p", cmd_p)
     bot.register_raw("picks", cmd_picks)
     bot.register_raw("extend", cmd_extend)
     bot.register_raw("archive", cmd_archive)
     bot.register_raw("merge_duplicates", cmd_merge_duplicates)
+    bot.register_raw("archive_sector", cmd_archive_sector)
+    bot.register_raw("remove_stock", cmd_remove_stock)

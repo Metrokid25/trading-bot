@@ -149,3 +149,134 @@ async def test_find_duplicate_sectors(store: SectorStore):
     assert "반도체" in result
     assert result["반도체"]["pick_ids"] == [id1, id2]  # ASC 순
     assert result["반도체"]["stock_counts"] == [1, 1]
+
+
+# ---------- archive_sector / remove_stock ----------
+
+@pytest.mark.asyncio
+async def test_archive_sector(store: SectorStore):
+    """archive_sector: 여러 Pick에 분산된 섹터 제거. 빈 Pick만 auto-archive."""
+    # Pick A: [중동재건] 3종목 + [다른섹터] 2종목
+    pick_a = _pick()
+    stocks_a = [
+        SectorStock(0, "중동재건", "001000", "종목A1", 1),
+        SectorStock(0, "중동재건", "001001", "종목A2", 2),
+        SectorStock(0, "중동재건", "001002", "종목A3", 3),
+        SectorStock(0, "다른섹터", "002000", "종목B1", 4),
+        SectorStock(0, "다른섹터", "002001", "종목B2", 5),
+    ]
+    id_a = await store.insert_pick(pick_a, stocks_a)
+
+    # Pick B: [중동재건] 2종목만 (다른 섹터 없음)
+    pick_b = _pick()
+    stocks_b = [
+        SectorStock(0, "중동재건", "001010", "종목C1", 1),
+        SectorStock(0, "중동재건", "001011", "종목C2", 2),
+    ]
+    id_b = await store.insert_pick(pick_b, stocks_b)
+
+    result = await store.archive_sector("중동재건")
+
+    assert set(result["affected_picks"]) == {id_a, id_b}
+    assert result["auto_archived_picks"] == [id_b]  # Pick B만 빈 Pick
+
+    # Pick A: active 유지 (다른섹터 2종목 남음)
+    active = await store.get_active_picks()
+    active_ids = [p.id for p in active]
+    assert id_a in active_ids
+    assert id_b not in active_ids
+
+    # 중동재건 종목 전부 삭제됨
+    assert await store.get_stocks_by_sector(id_a, "중동재건") == []
+    assert await store.get_stocks_by_sector(id_b, "중동재건") == []
+
+    # 다른섹터 종목 보존됨
+    other = await store.get_stocks_by_sector(id_a, "다른섹터")
+    assert len(other) == 2
+
+
+@pytest.mark.asyncio
+async def test_archive_sector_preserves_other_sectors(store: SectorStore):
+    """archive_sector: 같은 Pick의 다른 섹터 종목은 보존."""
+    pick = _pick()
+    stocks = [
+        SectorStock(0, "A섹터", "003000", "A종목1", 1),
+        SectorStock(0, "A섹터", "003001", "A종목2", 2),
+        SectorStock(0, "B섹터", "004000", "B종목1", 3),
+    ]
+    pick_id = await store.insert_pick(pick, stocks)
+
+    result = await store.archive_sector("A섹터")
+
+    assert result["affected_picks"] == [pick_id]
+    assert result["auto_archived_picks"] == []  # B섹터 남아서 Pick 유지
+
+    # Pick active 상태 유지
+    active = await store.get_active_picks()
+    assert any(p.id == pick_id for p in active)
+
+    # A섹터 종목 0개
+    assert await store.get_stocks_by_sector(pick_id, "A섹터") == []
+
+    # B섹터 종목 1개 유지
+    b_stocks = await store.get_stocks_by_sector(pick_id, "B섹터")
+    assert len(b_stocks) == 1
+    assert b_stocks[0].stock_code == "004000"
+
+
+@pytest.mark.asyncio
+async def test_remove_stock_from_single_pick(store: SectorStore):
+    """remove_stock_from_sector: 단일 Pick에서 종목 제거, Pick은 유지."""
+    pick_id = await store.insert_pick(_pick(), [
+        SectorStock(0, "반도체", "005930", "삼성전자", 1),
+        SectorStock(0, "반도체", "000660", "SK하이닉스", 2),
+    ])
+
+    result = await store.remove_stock_from_sector("반도체", "005930")
+
+    assert result["removed_from_picks"] == [pick_id]
+    assert result["auto_archived_picks"] == []
+
+    # Pick active 유지
+    active = await store.get_active_picks()
+    assert any(p.id == pick_id for p in active)
+
+    # SK하이닉스만 남음
+    remaining = await store.get_stocks_by_sector(pick_id, "반도체")
+    assert len(remaining) == 1
+    assert remaining[0].stock_code == "000660"
+
+
+@pytest.mark.asyncio
+async def test_remove_stock_auto_archives_empty_pick(store: SectorStore):
+    """remove_stock_from_sector: 마지막 종목 제거 시 Pick 자동 archive."""
+    pick_id = await store.insert_pick(_pick(), [
+        SectorStock(0, "반도체", "005930", "삼성전자", 1),
+    ])
+
+    result = await store.remove_stock_from_sector("반도체", "005930")
+
+    assert result["removed_from_picks"] == [pick_id]
+    assert result["auto_archived_picks"] == [pick_id]
+
+    # Pick archived 상태
+    active = await store.get_active_picks()
+    assert not any(p.id == pick_id for p in active)
+
+
+@pytest.mark.asyncio
+async def test_remove_stock_nonexistent(store: SectorStore):
+    """remove_stock_from_sector: 없는 종목코드는 에러 없이 빈 결과 반환."""
+    pick_id = await store.insert_pick(_pick(), [
+        SectorStock(0, "반도체", "005930", "삼성전자", 1),
+    ])
+
+    result = await store.remove_stock_from_sector("반도체", "999999")
+
+    assert result["removed_from_picks"] == []
+    assert result["auto_archived_picks"] == []
+
+    # 기존 데이터 그대로 유지
+    remaining = await store.get_stocks_by_sector(pick_id, "반도체")
+    assert len(remaining) == 1
+    assert remaining[0].stock_code == "005930"

@@ -346,6 +346,127 @@ class SectorStore:
             (PickStatus.ARCHIVED.value, pick_id),
         )
 
+    async def get_sector_picks_info(self, sector_name: str) -> list[dict]:
+        """해당 섹터명이 있는 active Pick들의 종목 수 반환 (미리보기 전용).
+
+        Returns: [{"pick_id": 13, "sector_stock_count": 2, "other_stock_count": 3}, ...]
+        created_at ASC 순.
+        """
+        if not self._db:
+            return []
+        now_iso = datetime.now().isoformat()
+        cur = await self._db.execute(
+            "SELECT ss.pick_id, COUNT(ss.id) "
+            "FROM sector_stocks ss "
+            "JOIN sector_picks sp ON sp.id = ss.pick_id "
+            "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ? "
+            "GROUP BY ss.pick_id "
+            "ORDER BY sp.created_at ASC",
+            (sector_name, PickStatus.ACTIVE.value, now_iso),
+        )
+        rows = await cur.fetchall()
+        result = []
+        for pick_id, sector_cnt in rows:
+            cur2 = await self._db.execute(
+                "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ? AND sector_name != ?",
+                (pick_id, sector_name),
+            )
+            other_cnt = (await cur2.fetchone())[0]
+            result.append({
+                "pick_id": pick_id,
+                "sector_stock_count": sector_cnt,
+                "other_stock_count": other_cnt,
+            })
+        return result
+
+    async def archive_sector(self, sector_name: str) -> dict:
+        """해당 섹터의 종목만 DELETE → 빈 Pick은 자동 archive. 다른 섹터 종목 보존.
+
+        Returns: {"affected_picks": [3, 5], "auto_archived_picks": [5]}
+        """
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        now_iso = datetime.now().isoformat()
+
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await self._db.execute(
+                "SELECT DISTINCT ss.pick_id FROM sector_stocks ss "
+                "JOIN sector_picks sp ON sp.id = ss.pick_id "
+                "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ?",
+                (sector_name, PickStatus.ACTIVE.value, now_iso),
+            )
+            affected_picks = [r[0] for r in await cur.fetchall()]
+
+            auto_archived: list[int] = []
+            for pick_id in affected_picks:
+                await self._db.execute(
+                    "DELETE FROM sector_stocks WHERE pick_id = ? AND sector_name = ?",
+                    (pick_id, sector_name),
+                )
+                cur2 = await self._db.execute(
+                    "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ?",
+                    (pick_id,),
+                )
+                if (await cur2.fetchone())[0] == 0:
+                    await self._db.execute(
+                        "UPDATE sector_picks SET status = ? WHERE id = ?",
+                        (PickStatus.ARCHIVED.value, pick_id),
+                    )
+                    auto_archived.append(pick_id)
+
+            await self._db.execute("COMMIT")
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            logger.exception("archive_sector failed for sector=%s", sector_name)
+            raise
+
+        return {"affected_picks": affected_picks, "auto_archived_picks": auto_archived}
+
+    async def remove_stock_from_sector(self, sector_name: str, stock_code: str) -> dict:
+        """해당 섹터의 특정 종목 DELETE → 빈 Pick은 자동 archive.
+
+        Returns: {"removed_from_picks": [3], "auto_archived_picks": []}
+        """
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        now_iso = datetime.now().isoformat()
+
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await self._db.execute(
+                "SELECT DISTINCT ss.pick_id FROM sector_stocks ss "
+                "JOIN sector_picks sp ON sp.id = ss.pick_id "
+                "WHERE ss.sector_name = ? AND ss.stock_code = ? AND sp.status = ? AND sp.expires_at > ?",
+                (sector_name, stock_code, PickStatus.ACTIVE.value, now_iso),
+            )
+            affected_picks = [r[0] for r in await cur.fetchall()]
+
+            auto_archived: list[int] = []
+            for pick_id in affected_picks:
+                await self._db.execute(
+                    "DELETE FROM sector_stocks WHERE pick_id = ? AND sector_name = ? AND stock_code = ?",
+                    (pick_id, sector_name, stock_code),
+                )
+                cur2 = await self._db.execute(
+                    "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ?",
+                    (pick_id,),
+                )
+                if (await cur2.fetchone())[0] == 0:
+                    await self._db.execute(
+                        "UPDATE sector_picks SET status = ? WHERE id = ?",
+                        (PickStatus.ARCHIVED.value, pick_id),
+                    )
+                    auto_archived.append(pick_id)
+
+            await self._db.execute("COMMIT")
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            logger.exception("remove_stock_from_sector failed sector=%s code=%s", sector_name, stock_code)
+            raise
+
+        return {"removed_from_picks": affected_picks, "auto_archived_picks": auto_archived}
+
     async def find_duplicate_sectors(self) -> dict[str, dict]:
         """중복 sector_name 탐색 (읽기 전용, 실제 병합 없음).
 
