@@ -9,7 +9,7 @@ import aiosqlite
 from loguru import logger
 
 from config import settings
-from data.sector_models import PickStatus, SectorPick, SectorStock
+from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
 
 
 class SectorStore:
@@ -64,6 +64,10 @@ class SectorStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_stocks_code "
             "ON sector_stocks (stock_code)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stocks_dup_check "
+            "ON sector_stocks (pick_id, sector_name, stock_code)"
         )
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS alert_history (
@@ -125,6 +129,115 @@ class SectorStore:
 
         pick.id = pick_id
         return pick_id
+
+    async def upsert_sector(
+        self,
+        sector_name: str,
+        stocks: list[SectorStock],
+        pick_template: SectorPick,
+    ) -> UpsertResult:
+        """섹터 단위 UPSERT: 동일 sector_name의 활성 픽이 있으면 종목만 추가, 없으면 새 픽 생성."""
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+
+        now_iso = datetime.now().isoformat()
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await self._db.execute(
+                "SELECT ss.pick_id FROM sector_stocks ss "
+                "JOIN sector_picks sp ON sp.id = ss.pick_id "
+                "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ? "
+                "ORDER BY sp.created_at DESC LIMIT 1",
+                (sector_name, PickStatus.ACTIVE.value, now_iso),
+            )
+            row = await cur.fetchone()
+
+            if row:
+                pick_id: int = row[0]
+                is_new_pick = False
+
+                cur2 = await self._db.execute(
+                    "SELECT stock_code FROM sector_stocks WHERE pick_id = ? AND sector_name = ?",
+                    (pick_id, sector_name),
+                )
+                existing_codes = {r[0] for r in await cur2.fetchall()}
+
+                cur3 = await self._db.execute(
+                    "SELECT COALESCE(MAX(added_order), 0) FROM sector_stocks WHERE pick_id = ?",
+                    (pick_id,),
+                )
+                max_order = (await cur3.fetchone())[0]
+
+                added: list[SectorStock] = []
+                skipped: list[SectorStock] = []
+                for s in stocks:
+                    if s.stock_code in existing_codes:
+                        skipped.append(s)
+                    else:
+                        max_order += 1
+                        s.added_order = max_order
+                        added.append(s)
+
+                if added:
+                    await self._db.executemany(
+                        "INSERT INTO sector_stocks "
+                        "(pick_id, sector_name, stock_code, stock_name, added_order) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order)
+                         for s in added],
+                    )
+
+                total = len(existing_codes) + len(added)
+
+            else:
+                is_new_pick = True
+                skipped = []
+
+                cur4 = await self._db.execute(
+                    "INSERT INTO sector_picks "
+                    "(pick_date, created_at, expires_at, status, raw_input) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        pick_template.pick_date,
+                        pick_template.created_at.isoformat(),
+                        pick_template.expires_at.isoformat(),
+                        pick_template.status.value,
+                        pick_template.raw_input,
+                    ),
+                )
+                pick_id = cur4.lastrowid
+                if pick_id is None:
+                    raise RuntimeError("lastrowid missing after sector_picks insert")
+
+                for i, s in enumerate(stocks, start=1):
+                    s.added_order = i
+
+                if stocks:
+                    await self._db.executemany(
+                        "INSERT INTO sector_stocks "
+                        "(pick_id, sector_name, stock_code, stock_name, added_order) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order)
+                         for s in stocks],
+                    )
+
+                added = list(stocks)
+                total = len(stocks)
+
+            await self._db.execute("COMMIT")
+
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            logger.exception("upsert_sector failed, rolled back (sector=%s)", sector_name)
+            raise
+
+        return UpsertResult(
+            pick_id=pick_id,
+            is_new_pick=is_new_pick,
+            added_count=len(added),
+            skipped_stocks=skipped,
+            total_count=total,
+        )
 
     async def get_active_picks(self) -> list[SectorPick]:
         if not self._db:
@@ -232,6 +345,124 @@ class SectorStore:
             "UPDATE sector_picks SET status = ? WHERE id = ?",
             (PickStatus.ARCHIVED.value, pick_id),
         )
+
+    async def find_duplicate_sectors(self) -> dict[str, dict]:
+        """중복 sector_name 탐색 (읽기 전용, 실제 병합 없음).
+
+        Returns: {
+            sector_name: {"pick_ids": [3, 4, 5], "stock_counts": [3, 1, 1]}
+        }
+        pick_ids/stock_counts는 created_at ASC 순 (oldest first).
+        pick이 1개뿐인 섹터는 제외.
+        """
+        if not self._db:
+            return {}
+
+        now_iso = datetime.now().isoformat()
+        cur = await self._db.execute(
+            "SELECT ss.sector_name, sp.id, sp.created_at, COUNT(ss.id) "
+            "FROM sector_stocks ss "
+            "JOIN sector_picks sp ON sp.id = ss.pick_id "
+            "WHERE sp.status = ? AND sp.expires_at > ? "
+            "GROUP BY ss.sector_name, sp.id "
+            "ORDER BY ss.sector_name, sp.created_at ASC",
+            (PickStatus.ACTIVE.value, now_iso),
+        )
+        rows = await cur.fetchall()
+
+        sector_data: dict[str, dict] = {}
+        for sector_name, pick_id, _, cnt in rows:
+            entry = sector_data.setdefault(sector_name, {"pick_ids": [], "stock_counts": []})
+            entry["pick_ids"].append(pick_id)
+            entry["stock_counts"].append(cnt)
+
+        return {k: v for k, v in sector_data.items() if len(v["pick_ids"]) >= 2}
+
+    async def merge_duplicate_sectors(self) -> dict[str, dict]:
+        """같은 sector_name을 가진 여러 active 픽을 가장 오래된 pick_id로 병합.
+
+        Returns: {sector_name: {target_id, merged_ids, total_stocks}}
+        병합된 픽은 archived 처리 (삭제 X).
+        """
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+
+        now_iso = datetime.now().isoformat()
+
+        cur = await self._db.execute(
+            "SELECT ss.sector_name, sp.id as pick_id, sp.created_at "
+            "FROM sector_stocks ss "
+            "JOIN sector_picks sp ON sp.id = ss.pick_id "
+            "WHERE sp.status = ? AND sp.expires_at > ? "
+            "GROUP BY ss.sector_name, sp.id "
+            "ORDER BY ss.sector_name, sp.created_at ASC",
+            (PickStatus.ACTIVE.value, now_iso),
+        )
+        rows = await cur.fetchall()
+
+        sector_picks: dict[str, list[int]] = {}
+        for sector_name, pick_id, _ in rows:
+            sector_picks.setdefault(sector_name, []).append(pick_id)
+
+        results: dict[str, dict] = {}
+        for sector_name, pick_ids in sector_picks.items():
+            if len(pick_ids) < 2:
+                continue
+
+            target_id = pick_ids[0]
+            dup_ids = pick_ids[1:]
+
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cur2 = await self._db.execute(
+                    "SELECT stock_code FROM sector_stocks "
+                    "WHERE pick_id = ? AND sector_name = ?",
+                    (target_id, sector_name),
+                )
+                existing_codes = {r[0] for r in await cur2.fetchall()}
+
+                # 섹터 스코프 max — 다른 섹터 번호와 점프 방지
+                cur3 = await self._db.execute(
+                    "SELECT COALESCE(MAX(added_order), 0) FROM sector_stocks "
+                    "WHERE pick_id = ? AND sector_name = ?",
+                    (target_id, sector_name),
+                )
+                next_order = (await cur3.fetchone())[0]
+
+                for dup_id in dup_ids:
+                    cur4 = await self._db.execute(
+                        "SELECT stock_code, stock_name FROM sector_stocks "
+                        "WHERE pick_id = ? AND sector_name = ?",
+                        (dup_id, sector_name),
+                    )
+                    for code, name in await cur4.fetchall():
+                        if code not in existing_codes:
+                            next_order += 1
+                            await self._db.execute(
+                                "INSERT INTO sector_stocks "
+                                "(pick_id, sector_name, stock_code, stock_name, added_order) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (target_id, sector_name, code, name, next_order),
+                            )
+                            existing_codes.add(code)
+
+                await self._db.executemany(
+                    "UPDATE sector_picks SET status = ? WHERE id = ?",
+                    [(PickStatus.ARCHIVED.value, did) for did in dup_ids],
+                )
+                await self._db.execute("COMMIT")
+            except Exception:
+                await self._db.execute("ROLLBACK")
+                logger.exception("merge_duplicate_sectors failed for sector=%s", sector_name)
+                raise
+
+            results[sector_name] = {
+                "target_id": target_id,
+                "merged_ids": dup_ids,
+                "total_stocks": len(existing_codes),
+            }
+
+        return results
 
     # --- Phase 2: 알림 이력 ---
     async def insert_alert(

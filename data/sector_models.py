@@ -46,3 +46,12 @@ class SectorStock:
     stock_name: str
     added_order: int
     id: int | None = None
+
+
+@dataclass
+class UpsertResult:
+    pick_id: int
+    is_new_pick: bool
+    added_count: int
+    skipped_stocks: list[SectorStock]
+    total_count: int

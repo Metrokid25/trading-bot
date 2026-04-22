@@ -17,7 +17,7 @@ from telegram.ext import ContextTypes
 from config import settings
 from core.pick_parser import ParseError, parse_pick_input
 from core.telegram_bot import TelegramBot
-from data.sector_models import SectorPick, SectorStock
+from data.sector_models import SectorPick, SectorStock, UpsertResult
 from data.sector_store import SectorStore
 from data.stock_master import StockMaster
 
@@ -67,28 +67,53 @@ def _d_days(now: datetime, expires: datetime) -> int:
     return max(0, (expires.date() - now.date()).days)
 
 
-def _format_pick_success(
-    pick: SectorPick,
-    sectors: dict[str, list[SectorStock]],
-    failed: list[str],
+def _format_upsert_sector(
+    sector_name: str, result: UpsertResult, pick_template: SectorPick
 ) -> str:
     lines: list[str] = []
-    if failed:
-        lines.append(f"⚠️ 변환 실패 ({len(failed)}종목)")
-        lines.append("```")
-        lines.extend(failed)
-        lines.append("```")
-        lines.append("위 종목명을 수정 후 다시 /p 명령하십시오.")
+    if result.is_new_pick:
+        lines.append(
+            f"✅ 픽 저장 완료 (ID: {result.pick_id}) [{sector_name}] {result.added_count}종목"
+        )
+        lines.append(
+            f"📅 {pick_template.pick_date} 입력 | 만료: {pick_template.expires_at.strftime('%Y-%m-%d')}"
+        )
+    else:
+        lines.append(
+            f"✅ [{sector_name}] Pick {result.pick_id}에 {result.added_count}종목 추가 "
+            f"(총 {result.total_count}종목)"
+        )
+    if result.skipped_stocks:
+        names = ", ".join(s.stock_name for s in result.skipped_stocks)
+        lines.append(
+            f"⚠️ 이미 등록된 종목 {len(result.skipped_stocks)}개 스킵: {names}"
+        )
+    return "\n".join(lines)
+
+
+def _format_merge_preview(dupes: dict[str, dict]) -> str:
+    lines = ["⚠️ 병합 대상 확인"]
+    for sector_name, info in dupes.items():
+        pick_ids = info["pick_ids"]
+        counts = info["stock_counts"]
+        target_id = pick_ids[0]
         lines.append("")
-    lines.append(f"✅ 픽 저장 완료 (ID: {pick.id})")
-    lines.append(
-        f"📅 {pick.pick_date} 입력 | 만료: {pick.expires_at.strftime('%Y-%m-%d')}"
-    )
-    for sector_name, stocks in sectors.items():
+        lines.append(f"[{sector_name}] Pick {len(pick_ids)}개 → Pick {target_id}으로 병합 예정")
+        for i, (pid, cnt) in enumerate(zip(pick_ids, counts)):
+            suffix = " → archive" if i > 0 else ""
+            lines.append(f"  · Pick {pid} ({cnt}종목){suffix}")
+    lines.append("")
+    lines.append("실행하려면: /merge_duplicates confirm")
+    return "\n".join(lines)
+
+
+def _format_merge_result(results: dict[str, dict]) -> str:
+    lines = ["✅ 병합 완료"]
+    for sector_name, info in results.items():
+        archived = ", ".join(str(i) for i in info["merged_ids"])
         lines.append("")
-        lines.append(f"[{sector_name}] {len(stocks)}종목")
-        for s in stocks:
-            lines.append(f"{s.stock_name} ({s.stock_code})")
+        lines.append(f"[{sector_name}] Pick {info['target_id']}으로 통합 (총 {info['total_stocks']}종목)")
+        lines.append(f"archive된 Pick: {archived}")
     return "\n".join(lines)
 
 
@@ -177,19 +202,23 @@ def _build_handlers(store: SectorStore, master: StockMaster):
             )
             return
 
-        pick = SectorPick.create(pick_date, raw_input=text, expires_days=7)
-        stocks_flat: list[SectorStock] = []
-        for lst in resolved.values():
-            stocks_flat.extend(lst)
+        pick_template = SectorPick.create(pick_date, raw_input=text, expires_days=7)
+        msg_lines: list[str] = []
 
-        try:
-            await store.insert_pick(pick, stocks_flat)
-        except Exception:
-            logger.exception("pick 저장 실패")
-            await _reply(update, "❌ 저장 실패 (DB 오류)")
-            return
+        if failed:
+            msg_lines.append(f"⚠️ 변환 실패 ({len(failed)}종목): {', '.join(failed)}")
+            msg_lines.append("위 종목명을 수정 후 다시 /p 명령하십시오.")
+            msg_lines.append("")
 
-        await _reply(update, _format_pick_success(pick, resolved, failed))
+        for sector_name, stocks in resolved.items():
+            try:
+                result = await store.upsert_sector(sector_name, stocks, pick_template)
+                msg_lines.append(_format_upsert_sector(sector_name, result, pick_template))
+            except Exception:
+                logger.exception("upsert_sector 실패 sector=%s", sector_name)
+                msg_lines.append(f"❌ [{sector_name}] 저장 실패: DB 오류")
+
+        await _reply(update, "\n".join(msg_lines))
 
     @require_authorized_user
     async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -254,14 +283,40 @@ def _build_handlers(store: SectorStore, master: StockMaster):
         await store.archive_pick(pick_id)
         await _reply(update, f"✅ 픽 {pick_id} 아카이브")
 
-    return cmd_p, cmd_picks, cmd_extend, cmd_archive
+    @require_authorized_user
+    async def cmd_merge_duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = context.args or []
+        is_confirm = len(args) > 0 and args[0].lower() == "confirm"
+
+        dupes = await store.find_duplicate_sectors()
+
+        if not dupes:
+            msg = "📋 중복 섹터 없음 (이미 정리됨)" if is_confirm else "📋 중복 섹터 없음"
+            await _reply(update, msg)
+            return
+
+        if not is_confirm:
+            await _reply(update, _format_merge_preview(dupes))
+            return
+
+        try:
+            results = await store.merge_duplicate_sectors()
+        except Exception:
+            logger.exception("merge_duplicate_sectors 실패")
+            await _reply(update, "❌ 병합 실패: DB 오류")
+            return
+
+        await _reply(update, _format_merge_result(results))
+
+    return cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates
 
 
 def register_pick_handlers(
     bot: TelegramBot, store: SectorStore, master: StockMaster
 ) -> None:
-    cmd_p, cmd_picks, cmd_extend, cmd_archive = _build_handlers(store, master)
+    cmd_p, cmd_picks, cmd_extend, cmd_archive, cmd_merge_duplicates = _build_handlers(store, master)
     bot.register_raw("p", cmd_p)
     bot.register_raw("picks", cmd_picks)
     bot.register_raw("extend", cmd_extend)
     bot.register_raw("archive", cmd_archive)
+    bot.register_raw("merge_duplicates", cmd_merge_duplicates)
