@@ -102,8 +102,8 @@ class SectorStore:
                 "VALUES (?, ?, ?, ?, ?)",
                 (
                     pick.pick_date,
-                    pick.created_at.isoformat(),
-                    pick.expires_at.isoformat(),
+                    to_db_iso(pick.created_at),
+                    to_db_iso(pick.expires_at),
                     pick.status.value,
                     pick.raw_input,
                 ),
@@ -200,8 +200,8 @@ class SectorStore:
                     "VALUES (?, ?, ?, ?, ?)",
                     (
                         pick_template.pick_date,
-                        pick_template.created_at.isoformat(),
-                        pick_template.expires_at.isoformat(),
+                        to_db_iso(pick_template.created_at),
+                        to_db_iso(pick_template.expires_at),
                         pick_template.status.value,
                         pick_template.raw_input,
                     ),
@@ -605,7 +605,7 @@ class SectorStore:
             (
                 sector_name,
                 stage,
-                triggered_at.isoformat(),
+                to_db_iso(triggered_at),
                 json.dumps(passed_stocks, ensure_ascii=False),
                 json.dumps(metrics, ensure_ascii=False),
                 json.dumps(threshold_used, ensure_ascii=False),
