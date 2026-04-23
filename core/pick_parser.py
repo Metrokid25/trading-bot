@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from core.time_utils import now_kst
+
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TOKEN_SPLIT_RE = re.compile(r"[\s,]+")
 
@@ -19,8 +21,8 @@ class ParseError(ValueError):
 
 
 def today_kst() -> str:
-    """시스템 시간(KST 가정) 기준 YYYY-MM-DD."""
-    return datetime.now().strftime("%Y-%m-%d")
+    """KST 기준 오늘 날짜 YYYY-MM-DD."""
+    return now_kst().strftime("%Y-%m-%d")
 
 
 def parse_pick_input(text: str) -> tuple[str, dict[str, list[str]]]:

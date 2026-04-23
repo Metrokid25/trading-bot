@@ -26,6 +26,7 @@ from loguru import logger
 from config import constants as C
 from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
+from core.time_utils import now_kst
 from data.sector_models import SectorStock
 from data.sector_store import SectorStore
 
@@ -68,7 +69,7 @@ class SectorDetector:
 
     # ---------- 당일 시가 (캐시) ----------
     async def _fetch_day_open(self, code: str) -> float | None:
-        today = datetime.now().strftime("%Y%m%d")
+        today = now_kst().strftime("%Y%m%d")
         cached = self._day_open_cache.get(code)
         if cached and cached[0] == today and cached[1] > 0:
             return cached[1]
@@ -162,7 +163,7 @@ class SectorDetector:
 
     # ---------- 1회 스캔 ----------
     async def scan_once(self) -> None:
-        now = datetime.now()
+        now = now_kst()
         if self.is_blocked_window(now):
             logger.debug(f"[sector] blocked window: {now.time()}")
             return

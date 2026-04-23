@@ -27,6 +27,7 @@ from config.constants import (
 )
 from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
+from core.time_utils import now_kst
 from data.candle_store import CandleBuffer
 from data.models import Position, Signal, Trade
 from risk.risk_manager import RiskManager
@@ -48,7 +49,7 @@ class ExecutionAgent(BaseAgent):
         self.risk = risk
         self.portfolio = portfolio
         self.positions: dict[str, Position] = {}
-        self._trade_log = Path(settings.LOG_DIR) / f"trades_{datetime.now():%Y%m%d}.csv"
+        self._trade_log = Path(settings.LOG_DIR) / f"trades_{now_kst():%Y%m%d}.csv"
         self._last_prices: dict[str, float] = {}
 
         bus.subscribe(E.BUY_SIGNAL, self._on_signal)
@@ -88,7 +89,7 @@ class ExecutionAgent(BaseAgent):
             code=sig.code,
             entry_price=sig.price,
             qty=qty,
-            opened_at=datetime.now(),
+            opened_at=now_kst(),
             atr=atr_val,
             stop_price=stop_price,
             tp_prices=tp_prices,
@@ -97,7 +98,7 @@ class ExecutionAgent(BaseAgent):
 
         await self._log_trade(
             Trade(
-                sig.code, "BUY", sig.price, qty, datetime.now(),
+                sig.code, "BUY", sig.price, qty, now_kst(),
                 reason=sig.reason, atr=atr_val, stop_price=stop_price,
                 tp_prices=tuple(tp_prices),
             )
@@ -203,7 +204,7 @@ class ExecutionAgent(BaseAgent):
         pnl = (price - pos.entry_price) * pos.qty + pos.realized_pnl
         await self._log_trade(
             Trade(
-                code, "SELL", price, pos.qty, datetime.now(),
+                code, "SELL", price, pos.qty, now_kst(),
                 reason=reason.value, pnl=pnl, exit_reason=reason,
                 atr=pos.atr, stop_price=pos.stop_price, tp_prices=tuple(pos.tp_prices),
             )
@@ -239,7 +240,7 @@ class ExecutionAgent(BaseAgent):
             pos.stop_price = new_stop
         await self._log_trade(
             Trade(
-                code, "SELL", price, qty, datetime.now(),
+                code, "SELL", price, qty, now_kst(),
                 reason=f"TP{tp_idx+1}", pnl=pnl, exit_reason=ExitReason.TAKE_PROFIT,
                 atr=pos.atr, stop_price=pos.stop_price, tp_prices=tuple(pos.tp_prices),
             )

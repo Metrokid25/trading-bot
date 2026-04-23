@@ -9,6 +9,7 @@ import aiosqlite
 from loguru import logger
 
 from config import settings
+from core.time_utils import now_kst, to_db_iso
 from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
 
 
@@ -140,7 +141,7 @@ class SectorStore:
         if not self._db:
             raise RuntimeError("SectorStore not open")
 
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
         await self._db.execute("BEGIN IMMEDIATE")
         try:
             cur = await self._db.execute(
@@ -244,7 +245,7 @@ class SectorStore:
             return []
         # 조회 전 자동 만료 처리
         await self.expire_old_picks()
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
         cur = await self._db.execute(
             "SELECT id, pick_date, created_at, expires_at, status, raw_input "
             "FROM sector_picks "
@@ -314,7 +315,7 @@ class SectorStore:
     async def expire_old_picks(self) -> int:
         if not self._db:
             return 0
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
         cur = await self._db.execute(
             "UPDATE sector_picks SET status = ? "
             "WHERE status = ? AND expires_at <= ?",
@@ -354,7 +355,7 @@ class SectorStore:
         """
         if not self._db:
             return []
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
         cur = await self._db.execute(
             "SELECT ss.pick_id, COUNT(ss.id) "
             "FROM sector_stocks ss "
@@ -386,7 +387,7 @@ class SectorStore:
         """
         if not self._db:
             raise RuntimeError("SectorStore not open")
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
 
         await self._db.execute("BEGIN IMMEDIATE")
         try:
@@ -430,7 +431,7 @@ class SectorStore:
         """
         if not self._db:
             raise RuntimeError("SectorStore not open")
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
 
         await self._db.execute("BEGIN IMMEDIATE")
         try:
@@ -479,7 +480,7 @@ class SectorStore:
         if not self._db:
             return {}
 
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
         cur = await self._db.execute(
             "SELECT ss.sector_name, sp.id, sp.created_at, COUNT(ss.id) "
             "FROM sector_stocks ss "
@@ -508,7 +509,7 @@ class SectorStore:
         if not self._db:
             raise RuntimeError("SectorStore not open")
 
-        now_iso = datetime.now().isoformat()
+        now_iso = to_db_iso(now_kst())
 
         cur = await self._db.execute(
             "SELECT ss.sector_name, sp.id as pick_id, sp.created_at "
@@ -628,7 +629,7 @@ class SectorStore:
         """
         if not self._db:
             return True
-        threshold_iso = (datetime.now() - timedelta(minutes=cooldown_min)).isoformat()
+        threshold_iso = to_db_iso(now_kst() - timedelta(minutes=cooldown_min))
         cur = await self._db.execute(
             "SELECT 1 FROM alert_history "
             "WHERE sector_name = ? AND stage = ? AND triggered_at > ? "

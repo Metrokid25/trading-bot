@@ -19,6 +19,7 @@ from config.constants import (
     RISK_PER_TRADE_PCT,
     TradeWindow,
 )
+from core.time_utils import now_kst
 
 
 class RiskManager:
@@ -37,7 +38,7 @@ class RiskManager:
 
     # --- 시간대 ---
     def classify_window(self, now: datetime | None = None) -> TradeWindow:
-        t: time = (now or datetime.now()).time()
+        t: time = (now or now_kst()).time()
         if t < MARKET_OPEN or t >= MARKET_CLOSE:
             return TradeWindow.CLOSED
         if NO_TRADE_START <= t < NO_TRADE_END:

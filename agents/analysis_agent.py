@@ -9,6 +9,7 @@ from loguru import logger
 from agents.base_agent import BaseAgent, E, Event, EventBus
 from config.constants import MARKET_CLOSE
 from core.kis_api import KISClient
+from core.time_utils import now_kst
 from core.websocket_client import KISWebSocket
 from data.candle_store import CandleBuffer, CandleStore
 from data.models import Candle, WatchItem
@@ -52,7 +53,7 @@ class AnalysisAgent(BaseAgent):
         if not self.store:
             return
         from datetime import timedelta
-        end = datetime.now()
+        end = now_kst()
         start = end - timedelta(days=10)
         try:
             rows = await self.store.load(code, start, end)
@@ -71,11 +72,11 @@ class AnalysisAgent(BaseAgent):
         if not buf:
             return
         try:
-            now = datetime.now().replace(
+            now = now_kst().replace(
                 hour=int(ts_str[:2]), minute=int(ts_str[2:4]), second=int(ts_str[4:6]), microsecond=0
             )
         except Exception:
-            now = datetime.now()
+            now = now_kst()
         await self.bus.publish(Event(E.TICK, {"code": code, "price": price, "ts": now}))
 
         closed = buf.on_tick(float(price), now)
@@ -105,7 +106,7 @@ class AnalysisAgent(BaseAgent):
             except asyncio.TimeoutError:
                 pass
 
-            now = datetime.now()
+            now = now_kst()
             if now.time() < MARKET_CLOSE:
                 continue
             today = now.strftime("%Y%m%d")

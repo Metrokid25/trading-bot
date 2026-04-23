@@ -11,11 +11,12 @@ from loguru import logger
 
 from config.constants import DAILY_MA_LONG, DAILY_MA_SHORT
 from core.kis_api import KISClient
+from core.time_utils import now_kst
 
 
 async def get_daily_closes(kis: KISClient, code: str, n_days: int = 100) -> list[tuple[datetime, float]]:
     """최근 n_days 영업일 일봉 종가 (오래된 → 최신 순)."""
-    end_dt = datetime.now()
+    end_dt = now_kst()
     start_dt = end_dt - timedelta(days=n_days * 2)  # 주말/휴일 여유
     rows = await kis.get_daily_candles(
         code, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"), "D"

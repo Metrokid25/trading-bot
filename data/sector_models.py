@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 
+from core.time_utils import now_kst
+
 
 class PickStatus(str, Enum):
     ACTIVE = "active"
@@ -29,7 +31,7 @@ class SectorPick:
         expires_days: int = 7,
     ) -> "SectorPick":
         """현재 시각 기준으로 created_at/expires_at을 자동 채우는 팩토리."""
-        now = datetime.now()
+        now = now_kst()
         return cls(
             pick_date=pick_date,
             created_at=now,

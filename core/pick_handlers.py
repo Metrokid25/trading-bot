@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 from config import settings
 from core.pick_parser import ParseError, parse_pick_input
 from core.telegram_bot import TelegramBot
+from core.time_utils import now_kst
 from data.sector_models import SectorPick, SectorStock, UpsertResult
 from data.sector_store import SectorStore
 from data.stock_master import StockMaster
@@ -160,7 +161,7 @@ def _format_picks_list(
 ) -> str:
     if not picks:
         return "활성 픽 없음."
-    now = datetime.now()
+    now = now_kst()
     lines = [f"📋 활성 픽 ({len(picks)}건)"]
     for p in picks:
         d = _d_days(now, p.expires_at)
@@ -174,7 +175,7 @@ def _format_picks_list(
 
 
 def _format_pick_detail(pick: SectorPick, stocks: list[SectorStock]) -> str:
-    now = datetime.now()
+    now = now_kst()
     d = _d_days(now, pick.expires_at)
     lines = [
         f"📋 픽 {pick.id} 상세",
