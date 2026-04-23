@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 import pytest
 import pytest_asyncio
 
+import asyncio
+
 from data.sector_models import PickStatus, SectorPick, SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import AlertResult, SectorStore
 
 
 # ---------- fixture ----------
@@ -280,3 +282,59 @@ async def test_remove_stock_nonexistent(store: SectorStore):
     remaining = await store.get_stocks_by_sector(pick_id, "반도체")
     assert len(remaining) == 1
     assert remaining[0].stock_code == "005930"
+
+
+# ---------- try_insert_alert_with_cooldown: 원자 쿨다운 ----------
+_ALERT_KWARGS = dict(
+    sector_name="AI",
+    stage=1,
+    cooldown_min=5,
+    passed_stocks=[],
+    metrics={},
+    threshold_used={},
+)
+
+
+@pytest.mark.asyncio
+async def test_try_insert_first_call_returns_inserted(store: SectorStore):
+    """이력 없을 때 첫 호출은 INSERTED."""
+    now = datetime.now()
+    result = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert result is AlertResult.INSERTED
+
+
+@pytest.mark.asyncio
+async def test_try_insert_second_call_within_cooldown_returns_skip(store: SectorStore):
+    """쿨다운 기간 내 두 번째 호출은 COOLDOWN_SKIP."""
+    now = datetime.now()
+    first = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    second = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert first is AlertResult.INSERTED
+    assert second is AlertResult.COOLDOWN_SKIP
+
+
+@pytest.mark.asyncio
+async def test_try_insert_after_cooldown_returns_inserted(store: SectorStore):
+    """쿨다운 기간이 지난 triggered_at으로 호출하면 다시 INSERTED."""
+    past = datetime.now() - timedelta(minutes=10)
+    recent = datetime.now()
+    # 10분 전 기록 삽입 (cooldown=5분이므로 만료)
+    first = await store.try_insert_alert_with_cooldown(triggered_at=past, **_ALERT_KWARGS)
+    # 현재 시각 기준으로는 쿨다운 경과 → INSERTED
+    second = await store.try_insert_alert_with_cooldown(triggered_at=recent, **_ALERT_KWARGS)
+    assert first is AlertResult.INSERTED
+    assert second is AlertResult.INSERTED
+
+
+@pytest.mark.asyncio
+async def test_try_insert_concurrent_calls_only_one_inserts(store: SectorStore):
+    """asyncio.gather로 동일 sector/stage 동시 호출 → 1건 INSERTED, 1건 COOLDOWN_SKIP."""
+    now = datetime.now()
+    results = await asyncio.gather(
+        store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS),
+        store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS),
+    )
+    inserted = [r for r in results if r is AlertResult.INSERTED]
+    skipped = [r for r in results if r is AlertResult.COOLDOWN_SKIP]
+    assert len(inserted) == 1
+    assert len(skipped) == 1

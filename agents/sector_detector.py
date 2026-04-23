@@ -29,7 +29,7 @@ from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
 from core.time_utils import now_kst
 from data.sector_models import SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import AlertResult, SectorStore
 
 _KIS_CONCURRENCY = 8
 
@@ -236,13 +236,6 @@ class SectorDetector:
         thresholds: dict[str, float],
         now: datetime,
     ) -> None:
-        # DB 기반 쿨다운 — 재시작에도 일관
-        if not await self.sector_store.should_alert(
-            sector_name, stage=1, cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
-        ):
-            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
-            return
-
         passed_summary = [
             {
                 "code": p["code"],
@@ -257,9 +250,10 @@ class SectorDetector:
             f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
         )
         try:
-            await self.sector_store.insert_alert(
+            result = await self.sector_store.try_insert_alert_with_cooldown(
                 sector_name=sector_name,
                 stage=1,
+                cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
                 triggered_at=now,
                 passed_stocks=passed_summary,
                 metrics={"passed_count": len(passed_stocks)},
@@ -271,6 +265,10 @@ class SectorDetector:
                 f"sector={sector_name} 종목수={len(passed_stocks)} "
                 f"기여종목=[{contrib_log}] err={e}"
             )
+            return
+
+        if result is AlertResult.COOLDOWN_SKIP:
+            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
             return
 
         logger.info(

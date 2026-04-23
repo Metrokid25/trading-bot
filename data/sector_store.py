@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
 import aiosqlite
@@ -11,6 +12,11 @@ from loguru import logger
 from config import settings
 from core.time_utils import now_kst, to_db_iso
 from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
+
+
+class AlertResult(Enum):
+    INSERTED = "inserted"
+    COOLDOWN_SKIP = "cooldown_skip"
 
 
 class SectorStore:
@@ -615,6 +621,49 @@ class SectorStore:
         if alert_id is None:
             raise RuntimeError("lastrowid missing after alert_history insert")
         return alert_id
+
+    async def try_insert_alert_with_cooldown(
+        self,
+        sector_name: str,
+        stage: int,
+        cooldown_min: int,
+        triggered_at: datetime,
+        passed_stocks: list[dict[str, Any]] | dict[str, Any],
+        metrics: dict[str, Any],
+        threshold_used: dict[str, Any],
+    ) -> AlertResult:
+        """쿨다운 체크와 INSERT를 단일 SQL 문으로 원자 실행.
+
+        쿨다운 기간 내 동일 (sector_name, stage) 기록이 있으면
+        INSERT 없이 COOLDOWN_SKIP 반환. 없으면 INSERT 후 INSERTED 반환.
+        """
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        threshold_iso = to_db_iso(triggered_at - timedelta(minutes=cooldown_min))
+        now_iso = to_db_iso(triggered_at)
+        cur = await self._db.execute(
+            "INSERT INTO alert_history "
+            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
+            "SELECT ?, ?, ?, ?, ?, ? "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM alert_history "
+            "  WHERE sector_name = ? AND stage = ? AND triggered_at > ?"
+            ")",
+            (
+                sector_name,
+                stage,
+                now_iso,
+                json.dumps(passed_stocks, ensure_ascii=False),
+                json.dumps(metrics, ensure_ascii=False),
+                json.dumps(threshold_used, ensure_ascii=False),
+                sector_name,
+                stage,
+                threshold_iso,
+            ),
+        )
+        if cur.rowcount > 0:
+            return AlertResult.INSERTED
+        return AlertResult.COOLDOWN_SKIP
 
     async def should_alert(
         self,

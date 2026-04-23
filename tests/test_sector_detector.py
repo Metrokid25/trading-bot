@@ -17,7 +17,7 @@ import pytest_asyncio
 from agents.sector_detector import SectorDetector
 from config import constants as C
 from data.sector_models import SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import AlertResult, SectorStore
 
 
 # ---------- 헬퍼 ----------
@@ -39,8 +39,8 @@ def _detector():
     kis.get_minute_candles = AsyncMock()
     kis.get_daily_candles = AsyncMock()
     store = MagicMock()
-    store.should_alert = AsyncMock(return_value=True)
-    store.insert_alert = AsyncMock(return_value=1)
+    store.get_active_picks = AsyncMock(return_value=[])
+    store.try_insert_alert_with_cooldown = AsyncMock(return_value=AlertResult.INSERTED)
     tg = MagicMock()
     tg.notify = AsyncMock()
     return SectorDetector(kis, store, tg), kis, store, tg
@@ -189,7 +189,7 @@ async def test_scan_sector_triggers_alert():
     ]
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
     tg.notify.assert_awaited_once()
 
 
@@ -208,16 +208,18 @@ async def test_scan_sector_below_threshold():
     ]
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_not_awaited()
+    store.try_insert_alert_with_cooldown.assert_not_awaited()
     tg.notify.assert_not_awaited()
 
 
-# ---------- _emit_alert: insert_alert 실패 시 notify 차단 ----------
+# ---------- _emit_alert: DB 실패/쿨다운 시 notify 차단 ----------
 @pytest.mark.asyncio
 async def test_emit_alert_sqlite_error_skips_notify():
-    """insert_alert가 sqlite3.Error를 던지면 notify는 호출되지 않아야 함."""
+    """try_insert_alert_with_cooldown이 sqlite3.Error를 던지면 notify는 호출되지 않아야 함."""
     d, kis, store, tg = _detector()
-    store.insert_alert = AsyncMock(side_effect=sqlite3.Error("disk I/O error"))
+    store.try_insert_alert_with_cooldown = AsyncMock(
+        side_effect=sqlite3.Error("disk I/O error")
+    )
     kis.get_minute_candles.return_value = _make_1m_bars(
         cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
     )
@@ -229,15 +231,17 @@ async def test_emit_alert_sqlite_error_skips_notify():
     ]
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
     tg.notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_emit_alert_runtime_error_propagates():
-    """insert_alert가 RuntimeError를 던지면 예외가 전파돼야 함 (프로그래밍 오류 경로)."""
+    """try_insert_alert_with_cooldown이 RuntimeError를 던지면 예외가 전파돼야 함."""
     d, kis, store, tg = _detector()
-    store.insert_alert = AsyncMock(side_effect=RuntimeError("SectorStore not open"))
+    store.try_insert_alert_with_cooldown = AsyncMock(
+        side_effect=RuntimeError("SectorStore not open")
+    )
     kis.get_minute_candles.return_value = _make_1m_bars(
         cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
     )
@@ -248,9 +252,27 @@ async def test_emit_alert_runtime_error_propagates():
         for i in range(3)
     ]
     now = datetime(2026, 4, 22, 10, 30)
-    import pytest
     with pytest.raises(RuntimeError, match="SectorStore not open"):
         await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
+    tg.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emit_alert_cooldown_skip_skips_notify():
+    """try_insert_alert_with_cooldown이 COOLDOWN_SKIP 반환 시 notify 호출 없음."""
+    d, kis, store, tg = _detector()
+    store.try_insert_alert_with_cooldown = AsyncMock(return_value=AlertResult.COOLDOWN_SKIP)
+    kis.get_minute_candles.return_value = _make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    )
+    kis.get_daily_candles.return_value = _make_daily(day_open=100)
+    stocks = [
+        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
+                    stock_name=f"종목{i}", added_order=i)
+        for i in range(3)
+    ]
+    now = datetime(2026, 4, 22, 10, 30)
+    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
     tg.notify.assert_not_awaited()
 
 
@@ -291,7 +313,7 @@ async def test_scan_once_global_sector_aggregation():
 
     await d.scan_once()
     # 전역 합산: 3종목 ≥ SECTOR_B_MIN_PASSED(=3) → 알림 발화
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
     tg.notify.assert_awaited_once()
 
 
@@ -333,7 +355,7 @@ async def test_scan_once_dedup_same_stock_across_picks():
     await d.scan_once()
     # 중복 제거 후 3종목 → evaluate_stock 3회만 호출되어야 함
     assert kis.get_minute_candles.await_count == 3
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
 
 
 # ---------- should_alert: 실제 SQLite in-memory ----------
