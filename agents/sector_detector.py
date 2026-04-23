@@ -6,7 +6,7 @@
     - 1분봉 30개 조회 → 현재봉/직전 N봉 거래량 평균 계산
     - 당일 시가(_fetch_day_open) → 캐시 miss 시 일봉 1행 조회
  3. 조건 A: 거래량≥(시간대별 배수)×avg, 당일 시가 대비 수익률≥(임계), 양봉
- 4. 조건 B: 같은 섹터 내 A 통과 ≥ SECTOR_B_MIN_PASSED
+ 4. 조건 B: 전체 Pick 합산, 같은 섹터명 A 통과 ≥ SECTOR_B_MIN_PASSED
  5. sector_store.should_alert 로 쿨다운 판정 → 통과 시 DB 기록 + 텔레그램
 
 설계 결정:
@@ -179,15 +179,19 @@ class SectorDetector:
             f"ret≥{thresholds['return']*100:.1f}%"
         )
 
+        global_by_sector: dict[str, list[SectorStock]] = defaultdict(list)
+        seen: set[tuple[str, str]] = set()
         for pick in picks:
             if pick.id is None:
                 continue
             stocks = await self.sector_store.get_stocks_by_pick(pick.id)
-            by_sector: dict[str, list[SectorStock]] = defaultdict(list)
             for s in stocks:
-                by_sector[s.sector_name].append(s)
-            for sector_name, sector_stocks in by_sector.items():
-                await self._scan_sector(sector_name, sector_stocks, thresholds, now)
+                key = (s.stock_code, s.sector_name)
+                if key not in seen:
+                    seen.add(key)
+                    global_by_sector[s.sector_name].append(s)
+        for sector_name, sector_stocks in global_by_sector.items():
+            await self._scan_sector(sector_name, sector_stocks, thresholds, now)
 
     async def _scan_sector(
         self,
@@ -210,6 +214,7 @@ class SectorDetector:
                 passed.append({
                     "code": s.stock_code,
                     "name": s.stock_name,
+                    "pick_id": s.pick_id,
                     **metrics,
                 })
 
@@ -240,6 +245,7 @@ class SectorDetector:
             {
                 "code": p["code"],
                 "name": p["name"],
+                "pick_id": p["pick_id"],
                 "vol_ratio": p["vol_ratio"],
                 "return": p["return"],
             }
@@ -257,10 +263,17 @@ class SectorDetector:
         except Exception as e:
             logger.error(f"[sector] alert DB 기록 실패: {e}")
 
-        lines = [f"[Stage1] {sector_name} 쏠림 감지 - {len(passed_stocks)}종목 통과"]
+        contrib_log = ", ".join(
+            f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
+        )
+        logger.info(
+            f"[sector] 신호 발생: sector={sector_name} "
+            f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
+        )
+        lines = [f"🔔 {sector_name} 섹터 신호 발생 ({len(passed_stocks)}종목)"]
         for p in passed_stocks:
             lines.append(
-                f"  · {p['name']}({p['code']}) "
+                f"  · {p['name']}({p['code']}) (Pick#{p['pick_id']}) "
                 f"vol×{p['vol_ratio']} / {p['return']*100:+.1f}%"
             )
         lines.append(

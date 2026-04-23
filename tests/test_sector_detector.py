@@ -211,6 +211,88 @@ async def test_scan_sector_below_threshold():
     tg.notify.assert_not_awaited()
 
 
+# ---------- scan_once: 전역 집계 검증 ----------
+@pytest.mark.asyncio
+async def test_scan_once_global_sector_aggregation():
+    """Pick별 분리 시 각각 임계값 미달이지만, 전역 합산 시 발화하는 케이스."""
+    d, kis, store, tg = _detector()
+
+    d.is_blocked_window = MagicMock(return_value=False)
+    d.pick_thresholds = MagicMock(return_value={"vol_mult": 3.0, "return": 0.02})
+
+    # 모든 종목 조건 A 통과 설정
+    kis.get_minute_candles.return_value = _make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    )
+    kis.get_daily_candles.return_value = _make_daily(day_open=100)
+
+    pick1 = MagicMock()
+    pick1.id = 1
+    pick2 = MagicMock()
+    pick2.id = 2
+    store.get_active_picks = AsyncMock(return_value=[pick1, pick2])
+    store.get_stocks_by_pick = AsyncMock(side_effect=[
+        # Pick#1: AI 2종목 (단독으로는 임계값 3 미달)
+        [
+            SectorStock(pick_id=1, sector_name="AI", stock_code="000001",
+                        stock_name="종목1", added_order=1),
+            SectorStock(pick_id=1, sector_name="AI", stock_code="000002",
+                        stock_name="종목2", added_order=2),
+        ],
+        # Pick#2: AI 1종목 (단독으로는 임계값 3 미달)
+        [
+            SectorStock(pick_id=2, sector_name="AI", stock_code="000003",
+                        stock_name="종목3", added_order=1),
+        ],
+    ])
+
+    await d.scan_once()
+    # 전역 합산: 3종목 ≥ SECTOR_B_MIN_PASSED(=3) → 알림 발화
+    store.insert_alert.assert_awaited_once()
+    tg.notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scan_once_dedup_same_stock_across_picks():
+    """동일 종목(stock_code)이 여러 Pick에 있어도 전역 집계에서 1회만 평가."""
+    d, kis, store, tg = _detector()
+
+    d.is_blocked_window = MagicMock(return_value=False)
+    d.pick_thresholds = MagicMock(return_value={"vol_mult": 3.0, "return": 0.02})
+
+    kis.get_minute_candles.return_value = _make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    )
+    kis.get_daily_candles.return_value = _make_daily(day_open=100)
+
+    pick1 = MagicMock()
+    pick1.id = 1
+    pick2 = MagicMock()
+    pick2.id = 2
+    store.get_active_picks = AsyncMock(return_value=[pick1, pick2])
+    store.get_stocks_by_pick = AsyncMock(side_effect=[
+        # Pick#1: AI 3종목
+        [
+            SectorStock(pick_id=1, sector_name="AI", stock_code="000001",
+                        stock_name="종목1", added_order=1),
+            SectorStock(pick_id=1, sector_name="AI", stock_code="000002",
+                        stock_name="종목2", added_order=2),
+            SectorStock(pick_id=1, sector_name="AI", stock_code="000003",
+                        stock_name="종목3", added_order=3),
+        ],
+        # Pick#2: 동일 종목 중복 포함
+        [
+            SectorStock(pick_id=2, sector_name="AI", stock_code="000001",
+                        stock_name="종목1", added_order=1),
+        ],
+    ])
+
+    await d.scan_once()
+    # 중복 제거 후 3종목 → evaluate_stock 3회만 호출되어야 함
+    assert kis.get_minute_candles.await_count == 3
+    store.insert_alert.assert_awaited_once()
+
+
 # ---------- should_alert: 실제 SQLite in-memory ----------
 @pytest_asyncio.fixture
 async def real_store():
