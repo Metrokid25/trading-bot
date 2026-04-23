@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -208,6 +209,48 @@ async def test_scan_sector_below_threshold():
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
     store.insert_alert.assert_not_awaited()
+    tg.notify.assert_not_awaited()
+
+
+# ---------- _emit_alert: insert_alert 실패 시 notify 차단 ----------
+@pytest.mark.asyncio
+async def test_emit_alert_sqlite_error_skips_notify():
+    """insert_alert가 sqlite3.Error를 던지면 notify는 호출되지 않아야 함."""
+    d, kis, store, tg = _detector()
+    store.insert_alert = AsyncMock(side_effect=sqlite3.Error("disk I/O error"))
+    kis.get_minute_candles.return_value = _make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    )
+    kis.get_daily_candles.return_value = _make_daily(day_open=100)
+    stocks = [
+        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
+                    stock_name=f"종목{i}", added_order=i)
+        for i in range(3)
+    ]
+    now = datetime(2026, 4, 22, 10, 30)
+    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
+    store.insert_alert.assert_awaited_once()
+    tg.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emit_alert_runtime_error_propagates():
+    """insert_alert가 RuntimeError를 던지면 예외가 전파돼야 함 (프로그래밍 오류 경로)."""
+    d, kis, store, tg = _detector()
+    store.insert_alert = AsyncMock(side_effect=RuntimeError("SectorStore not open"))
+    kis.get_minute_candles.return_value = _make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    )
+    kis.get_daily_candles.return_value = _make_daily(day_open=100)
+    stocks = [
+        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
+                    stock_name=f"종목{i}", added_order=i)
+        for i in range(3)
+    ]
+    now = datetime(2026, 4, 22, 10, 30)
+    import pytest
+    with pytest.raises(RuntimeError, match="SectorStore not open"):
+        await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
     tg.notify.assert_not_awaited()
 
 

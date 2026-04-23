@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
@@ -252,6 +253,9 @@ class SectorDetector:
             }
             for p in passed_stocks
         ]
+        contrib_log = ", ".join(
+            f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
+        )
         try:
             await self.sector_store.insert_alert(
                 sector_name=sector_name,
@@ -261,12 +265,14 @@ class SectorDetector:
                 metrics={"passed_count": len(passed_stocks)},
                 threshold_used=thresholds,
             )
-        except Exception as e:
-            logger.error(f"[sector] alert DB 기록 실패: {e}")
+        except sqlite3.Error as e:
+            logger.warning(
+                f"[sector] 신호 감지했으나 DB 기록 실패 — notify 스킵: "
+                f"sector={sector_name} 종목수={len(passed_stocks)} "
+                f"기여종목=[{contrib_log}] err={e}"
+            )
+            return
 
-        contrib_log = ", ".join(
-            f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
-        )
         logger.info(
             f"[sector] 신호 발생: sector={sector_name} "
             f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
