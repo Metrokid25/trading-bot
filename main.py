@@ -50,6 +50,12 @@ async def run() -> None:
         missing.append(f"KIS_{settings.KIS_ENV}_APP_SECRET")
     if not settings.account_no:
         missing.append(f"KIS_{settings.KIS_ENV}_ACCOUNT_NO")
+    # PAPER 모드에서도 시세는 실전 서버 사용 → 실전 키 필수
+    if settings.KIS_ENV == "PAPER":
+        if not settings.KIS_REAL_APP_KEY:
+            missing.append("KIS_REAL_APP_KEY")
+        if not settings.KIS_REAL_APP_SECRET:
+            missing.append("KIS_REAL_APP_SECRET")
     if missing:
         logger.error(f".env 필수값 누락: {', '.join(missing)}")
         return
