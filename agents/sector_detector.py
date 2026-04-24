@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
@@ -29,7 +28,7 @@ from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
 from core.time_utils import now_kst
 from data.sector_models import SectorStock
-from data.sector_store import AlertResult, SectorStore
+from data.sector_store import SectorStore
 
 _KIS_CONCURRENCY = 8
 
@@ -236,6 +235,14 @@ class SectorDetector:
         thresholds: dict[str, float],
         now: datetime,
     ) -> None:
+        if not await self.sector_store.should_alert(
+            sector_name=sector_name,
+            stage=1,
+            cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
+        ):
+            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
+            return
+
         passed_summary = [
             {
                 "code": p["code"],
@@ -249,32 +256,6 @@ class SectorDetector:
         contrib_log = ", ".join(
             f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
         )
-        try:
-            result = await self.sector_store.try_insert_alert_with_cooldown(
-                sector_name=sector_name,
-                stage=1,
-                cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
-                triggered_at=now,
-                passed_stocks=passed_summary,
-                metrics={"passed_count": len(passed_stocks)},
-                threshold_used=thresholds,
-            )
-        except sqlite3.Error as e:
-            logger.warning(
-                f"[sector] 신호 감지했으나 DB 기록 실패 — notify 스킵: "
-                f"sector={sector_name} 종목수={len(passed_stocks)} "
-                f"기여종목=[{contrib_log}] err={e}"
-            )
-            return
-
-        if result is AlertResult.COOLDOWN_SKIP:
-            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
-            return
-
-        logger.info(
-            f"[sector] 신호 발생: sector={sector_name} "
-            f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
-        )
         lines = [f"🔔 {sector_name} 섹터 신호 발생 ({len(passed_stocks)}종목)"]
         for p in passed_stocks:
             lines.append(
@@ -284,9 +265,29 @@ class SectorDetector:
         lines.append(
             f"threshold: vol×{thresholds['vol_mult']} / ret≥{thresholds['return']*100:.1f}%"
         )
+
+        sent = await self.telegram.notify("\n".join(lines))
+        if not sent:
+            return  # notify 실패 → cooldown 소비 안 함, 다음 스캔에서 재시도
+
+        logger.info(
+            f"[sector] 신호 발생: sector={sector_name} "
+            f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
+        )
         try:
-            await self.telegram.notify("\n".join(lines))
+            await self.sector_store.insert_alert(
+                sector_name=sector_name,
+                stage=1,
+                triggered_at=now,
+                passed_stocks=passed_summary,
+                metrics={"passed_count": len(passed_stocks)},
+                threshold_used=thresholds,
+            )
         except Exception as e:
-            logger.error(f"[sector] 텔레그램 알림 실패: {e}")
+            logger.warning(
+                f"[sector] 텔레그램 전송 성공했으나 DB 기록 실패 — 다음 쿨다운 미적용: "
+                f"sector={sector_name} err={e}"
+            )
+            return
 
         logger.info(f"[sector] alert emitted: {sector_name} ({len(passed_stocks)}종목)")

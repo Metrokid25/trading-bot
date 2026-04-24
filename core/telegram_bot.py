@@ -72,13 +72,15 @@ class TelegramBot:
                 await update.message.reply_text(reply)
         return handler
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str) -> bool:
         if not self._app or not settings.TELEGRAM_CHAT_ID:
-            return
+            return False
         try:
             await self._app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=text)
+            return True
         except Exception as e:
             logger.error(f"telegram notify failed: {e}")
+            return False
 
     async def alert(self, text: str) -> None:
         """비상 알림 — 별도 채널 있으면 그쪽, 없으면 일반 채널."""
