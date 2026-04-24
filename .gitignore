@@ -55,3 +55,6 @@ htmlcov/
 # Backtest outputs
 backtest/results/
 *.csv.bak
+
+# Windows 전용 런처 (로컬 생성)
+run_bot.bat

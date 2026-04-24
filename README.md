@@ -13,6 +13,9 @@
 - 9:00~9:10 매매 금지
 - 15:10~15:20 장마감 강제 청산
 
+## 실행
+`python main.py` (Windows: `run_bot.bat` 별도 생성 가능)
+
 ## 설정
 ```bash
 cp .env.example .env   # 키 값 채우기
