@@ -1,7 +1,9 @@
 """섹터 픽(스승님 워치리스트) SQLite 영속화."""
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -16,7 +18,8 @@ from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
 
 class AlertResult(Enum):
     INSERTED = "inserted"
-    COOLDOWN_SKIP = "cooldown_skip"
+    COOLDOWN_ACTIVE = "cooldown_active"
+    INSERT_FAILED = "insert_failed"
 
 
 class SectorStore:
@@ -30,6 +33,7 @@ class SectorStore:
         # isolation_level=None: 자동 트랜잭션 비활성. BEGIN/COMMIT/ROLLBACK을 명시적으로 관리.
         self._db = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.init_tables()
+        await self._migrate_alert_history_v2()
 
     async def close(self) -> None:
         if self._db:
@@ -84,13 +88,61 @@ class SectorStore:
                 triggered_at TEXT NOT NULL,
                 passed_stocks TEXT NOT NULL,
                 metrics TEXT NOT NULL,
-                threshold_used TEXT NOT NULL
+                threshold_used TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(delivery_status IN ('pending','sent','failed','disabled','crashed'))
             )"""
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_alerts_sector_time "
             "ON alert_history (sector_name, triggered_at)"
         )
+
+    async def _migrate_alert_history_v2(self) -> None:
+        """alert_history에 delivery_status 컬럼 추가 (멱등). 기존 행은 'sent'로 백필."""
+        if not self._db:
+            return
+        cur = await self._db.execute("PRAGMA table_info(alert_history)")
+        rows = await cur.fetchall()
+        if not rows:
+            return  # 테이블 미존재 — init_tables가 새 스키마로 생성
+        col_names = [row[1] for row in rows]
+        if 'delivery_status' in col_names:
+            return  # 이미 마이그레이션 완료
+        logger.info("[sector_store] alert_history v2 마이그레이션 시작")
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._db.execute(
+                """CREATE TABLE IF NOT EXISTS alert_history_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sector_name TEXT NOT NULL,
+                    stage INTEGER NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    passed_stocks TEXT NOT NULL,
+                    metrics TEXT NOT NULL,
+                    threshold_used TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(delivery_status IN ('pending','sent','failed','disabled','crashed'))
+                )"""
+            )
+            await self._db.execute(
+                "INSERT INTO alert_history_new "
+                "(id, sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used, delivery_status) "
+                "SELECT id, sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used, 'sent' "
+                "FROM alert_history"
+            )
+            await self._db.execute("DROP TABLE alert_history")
+            await self._db.execute("ALTER TABLE alert_history_new RENAME TO alert_history")
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alerts_sector_time "
+                "ON alert_history (sector_name, triggered_at)"
+            )
+            await self._db.execute("COMMIT")
+            logger.info("[sector_store] alert_history v2 마이그레이션 완료")
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            logger.exception("[sector_store] alert_history v2 마이그레이션 실패")
+            raise
 
     async def insert_pick(
         self,
@@ -606,8 +658,8 @@ class SectorStore:
             raise RuntimeError("SectorStore not open")
         cur = await self._db.execute(
             "INSERT INTO alert_history "
-            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used, delivery_status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 sector_name,
                 stage,
@@ -615,6 +667,7 @@ class SectorStore:
                 json.dumps(passed_stocks, ensure_ascii=False),
                 json.dumps(metrics, ensure_ascii=False),
                 json.dumps(threshold_used, ensure_ascii=False),
+                'sent',
             ),
         )
         alert_id = cur.lastrowid
@@ -631,39 +684,72 @@ class SectorStore:
         passed_stocks: list[dict[str, Any]] | dict[str, Any],
         metrics: dict[str, Any],
         threshold_used: dict[str, Any],
-    ) -> AlertResult:
+        initial_status: str = 'pending',
+    ) -> tuple[AlertResult, int | None]:
         """쿨다운 체크와 INSERT를 단일 SQL 문으로 원자 실행.
 
-        쿨다운 기간 내 동일 (sector_name, stage) 기록이 있으면
-        INSERT 없이 COOLDOWN_SKIP 반환. 없으면 INSERT 후 INSERTED 반환.
+        - 쿨다운 기간 내 동일 (sector_name, stage) 기록이 있으면 COOLDOWN_ACTIVE 반환.
+        - 없으면 delivery_status=initial_status 로 INSERT 후 (INSERTED, row_id) 반환.
+        - sqlite3.OperationalError(locked/busy) 시 최대 3회 재시도 (100/300/1000ms).
+        - 재시도 소진 시 INSERT_FAILED 반환 (notify 억제).
         """
         if not self._db:
             raise RuntimeError("SectorStore not open")
         threshold_iso = to_db_iso(triggered_at - timedelta(minutes=cooldown_min))
         now_iso = to_db_iso(triggered_at)
-        cur = await self._db.execute(
+        sql = (
             "INSERT INTO alert_history "
-            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
-            "SELECT ?, ?, ?, ?, ?, ? "
+            "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used, delivery_status) "
+            "SELECT ?, ?, ?, ?, ?, ?, ? "
             "WHERE NOT EXISTS ("
             "  SELECT 1 FROM alert_history "
             "  WHERE sector_name = ? AND stage = ? AND triggered_at > ?"
-            ")",
-            (
-                sector_name,
-                stage,
-                now_iso,
-                json.dumps(passed_stocks, ensure_ascii=False),
-                json.dumps(metrics, ensure_ascii=False),
-                json.dumps(threshold_used, ensure_ascii=False),
-                sector_name,
-                stage,
-                threshold_iso,
-            ),
+            ")"
         )
-        if cur.rowcount > 0:
-            return AlertResult.INSERTED
-        return AlertResult.COOLDOWN_SKIP
+        params = (
+            sector_name,
+            stage,
+            now_iso,
+            json.dumps(passed_stocks, ensure_ascii=False),
+            json.dumps(metrics, ensure_ascii=False),
+            json.dumps(threshold_used, ensure_ascii=False),
+            initial_status,
+            sector_name,
+            stage,
+            threshold_iso,
+        )
+        _retry_delays_ms = [100, 300, 1000]
+        for attempt, delay_ms in enumerate([0] + _retry_delays_ms):
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
+            try:
+                cur = await self._db.execute(sql, params)
+                if cur.rowcount > 0:
+                    return AlertResult.INSERTED, cur.lastrowid
+                return AlertResult.COOLDOWN_ACTIVE, None
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < len(_retry_delays_ms):
+                    logger.warning(
+                        "[sector_store] DB locked/busy, alert insert retry %d: %s",
+                        attempt + 1, exc,
+                    )
+                    continue
+                logger.error(
+                    "[sector_store] alert insert failed after %d attempts: %s",
+                    attempt + 1, exc,
+                )
+                return AlertResult.INSERT_FAILED, None
+        return AlertResult.INSERT_FAILED, None  # unreachable, satisfies type checker
+
+    async def update_delivery_status(self, alert_id: int, status: str) -> None:
+        """alert_history 행의 delivery_status를 갱신. UPDATE 실패 시 예외 전파."""
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        await self._db.execute(
+            "UPDATE alert_history SET delivery_status = ? WHERE id = ?",
+            (status, alert_id),
+        )
 
     async def should_alert(
         self,

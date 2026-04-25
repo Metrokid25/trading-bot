@@ -72,6 +72,10 @@ class TelegramBot:
                 await update.message.reply_text(reply)
         return handler
 
+    def is_configured(self) -> bool:
+        """봇 앱이 초기화되어 있고 chat_id가 설정된 경우 True."""
+        return self._app is not None and bool(settings.TELEGRAM_CHAT_ID)
+
     async def notify(self, text: str) -> bool:
         if not self._app or not settings.TELEGRAM_CHAT_ID:
             return False

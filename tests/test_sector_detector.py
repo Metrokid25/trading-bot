@@ -16,7 +16,7 @@ import pytest_asyncio
 from agents.sector_detector import SectorDetector
 from config import constants as C
 from data.sector_models import SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import AlertResult, SectorStore
 
 
 # ---------- 헬퍼 ----------
@@ -39,9 +39,10 @@ def _detector():
     kis.get_daily_candles = AsyncMock()
     store = MagicMock()
     store.get_active_picks = AsyncMock(return_value=[])
-    store.should_alert = AsyncMock(return_value=True)
-    store.insert_alert = AsyncMock(return_value=1)
+    store.try_insert_alert_with_cooldown = AsyncMock(return_value=(AlertResult.INSERTED, 1))
+    store.update_delivery_status = AsyncMock()
     tg = MagicMock()
+    tg.is_configured = MagicMock(return_value=True)
     tg.notify = AsyncMock(return_value=True)
     return SectorDetector(kis, store, tg), kis, store, tg
 
@@ -189,7 +190,7 @@ async def test_scan_sector_triggers_alert():
     ]
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
     tg.notify.assert_awaited_once()
 
 
@@ -208,107 +209,123 @@ async def test_scan_sector_below_threshold():
     ]
     now = datetime(2026, 4, 22, 10, 30)
     await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_not_awaited()
+    store.try_insert_alert_with_cooldown.assert_not_awaited()
     tg.notify.assert_not_awaited()
 
 
-# ---------- _emit_alert: 알림/DB 순서·실패 처리 ----------
-@pytest.mark.asyncio
-async def test_emit_alert_cooldown_active_skips_notify():
-    """should_alert=False(쿨다운) → notify 호출 없음."""
-    d, kis, store, tg = _detector()
-    store.should_alert = AsyncMock(return_value=False)
+# ---------- _emit_alert: insert-first 순서·실패 처리 ----------
+
+def _passing_stocks(n=3):
+    return [
+        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
+                    stock_name=f"종목{i}", added_order=i)
+        for i in range(n)
+    ]
+
+
+def _setup_passing_scan(kis):
     kis.get_minute_candles.return_value = _make_1m_bars(
         cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
     )
     kis.get_daily_candles.return_value = _make_daily(day_open=100)
-    stocks = [
-        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
-                    stock_name=f"종목{i}", added_order=i)
-        for i in range(3)
-    ]
-    now = datetime(2026, 4, 22, 10, 30)
-    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
+
+
+@pytest.mark.asyncio
+async def test_notify_not_called_on_cooldown_active():
+    """try_insert_alert_with_cooldown이 COOLDOWN_ACTIVE 반환 → notify/update 미호출."""
+    d, kis, store, tg = _detector()
+    store.try_insert_alert_with_cooldown = AsyncMock(
+        return_value=(AlertResult.COOLDOWN_ACTIVE, None)
+    )
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
     tg.notify.assert_not_awaited()
+    store.update_delivery_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_emit_alert_cooldown_active_skips_insert():
-    """should_alert=False(쿨다운) → insert_alert 호출 없음."""
+async def test_notify_not_called_when_insert_fails_after_retries():
+    """INSERT_FAILED → notify 미호출, update_delivery_status 미호출."""
     d, kis, store, tg = _detector()
-    store.should_alert = AsyncMock(return_value=False)
-    kis.get_minute_candles.return_value = _make_1m_bars(
-        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    store.try_insert_alert_with_cooldown = AsyncMock(
+        return_value=(AlertResult.INSERT_FAILED, None)
     )
-    kis.get_daily_candles.return_value = _make_daily(day_open=100)
-    stocks = [
-        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
-                    stock_name=f"종목{i}", added_order=i)
-        for i in range(3)
-    ]
-    now = datetime(2026, 4, 22, 10, 30)
-    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.insert_alert.assert_not_awaited()
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
+    tg.notify.assert_not_awaited()
+    store.update_delivery_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_emit_alert_should_alert_called_with_correct_params():
-    """_emit_alert는 should_alert를 stage=1, cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN로 호출해야 함."""
+async def test_try_insert_called_with_correct_params():
+    """_emit_alert가 try_insert_alert_with_cooldown을 stage=1, cooldown_min, initial_status='pending'으로 호출."""
     d, kis, store, tg = _detector()
-    kis.get_minute_candles.return_value = _make_1m_bars(
-        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
-    )
-    kis.get_daily_candles.return_value = _make_daily(day_open=100)
-    stocks = [
-        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
-                    stock_name=f"종목{i}", added_order=i)
-        for i in range(3)
-    ]
+    _setup_passing_scan(kis)
     now = datetime(2026, 4, 22, 10, 30)
-    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    store.should_alert.assert_awaited_once_with(
-        sector_name="AI", stage=1, cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN
-    )
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02}, now)
+    call_kwargs = store.try_insert_alert_with_cooldown.call_args.kwargs
+    assert call_kwargs["sector_name"] == "AI"
+    assert call_kwargs["stage"] == 1
+    assert call_kwargs["cooldown_min"] == C.SECTOR_ALERT_COOLDOWN_MIN
+    assert call_kwargs["initial_status"] == 'pending'
 
 
 @pytest.mark.asyncio
-async def test_emit_alert_notify_fails_skips_db():
-    """notify()가 False를 반환하면 insert_alert를 호출하지 않아야 함 (쿨다운 미소비)."""
+async def test_status_pending_to_sent_on_notify_true():
+    """notify()=True → update_delivery_status('sent') 호출."""
+    d, kis, store, tg = _detector()
+    tg.notify = AsyncMock(return_value=True)
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
+    store.update_delivery_status.assert_awaited_once_with(1, 'sent')
+
+
+@pytest.mark.asyncio
+async def test_status_pending_to_failed_on_notify_false():
+    """notify()=False → update_delivery_status('failed') 호출."""
     d, kis, store, tg = _detector()
     tg.notify = AsyncMock(return_value=False)
-    kis.get_minute_candles.return_value = _make_1m_bars(
-        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
-    )
-    kis.get_daily_candles.return_value = _make_daily(day_open=100)
-    stocks = [
-        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
-                    stock_name=f"종목{i}", added_order=i)
-        for i in range(3)
-    ]
-    now = datetime(2026, 4, 22, 10, 30)
-    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
-    tg.notify.assert_awaited_once()
-    store.insert_alert.assert_not_awaited()
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
+    store.update_delivery_status.assert_awaited_once_with(1, 'failed')
 
 
 @pytest.mark.asyncio
-async def test_emit_alert_notify_success_db_fails_warns():
-    """notify() 성공 후 insert_alert가 실패해도 예외는 전파되지 않고 WARNING만 로깅."""
+async def test_status_pending_to_failed_on_notify_exception():
+    """notify()가 예외 발생 → update_delivery_status('failed'), 예외 전파 없음."""
     d, kis, store, tg = _detector()
-    store.insert_alert = AsyncMock(side_effect=Exception("db error"))
-    kis.get_minute_candles.return_value = _make_1m_bars(
-        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
-    )
-    kis.get_daily_candles.return_value = _make_daily(day_open=100)
-    stocks = [
-        SectorStock(pick_id=1, sector_name="AI", stock_code=f"00000{i}",
-                    stock_name=f"종목{i}", added_order=i)
-        for i in range(3)
-    ]
-    now = datetime(2026, 4, 22, 10, 30)
-    await d._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)  # 예외 전파 없음
-    tg.notify.assert_awaited_once()
-    store.insert_alert.assert_awaited_once()
+    tg.notify = AsyncMock(side_effect=Exception("network error"))
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))  # 예외 전파 없음
+    store.update_delivery_status.assert_awaited_once_with(1, 'failed')
+
+
+@pytest.mark.asyncio
+async def test_status_disabled_when_telegram_not_configured():
+    """is_configured()=False → notify 미호출, update_delivery_status('disabled') 호출."""
+    d, kis, store, tg = _detector()
+    tg.is_configured = MagicMock(return_value=False)
+    _setup_passing_scan(kis)
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
+    tg.notify.assert_not_awaited()
+    store.update_delivery_status.assert_awaited_once_with(1, 'disabled')
+
+
+@pytest.mark.asyncio
+async def test_status_pending_remains_if_update_fails():
+    """update_delivery_status가 예외 발생해도 예외 전파 없음 (이력 행은 유지됨)."""
+    d, kis, store, tg = _detector()
+    store.update_delivery_status = AsyncMock(side_effect=Exception("db locked"))
+    _setup_passing_scan(kis)
+    # 예외가 전파되지 않아야 함
+    await d._scan_sector("AI", _passing_stocks(), {"vol_mult": 3.0, "return": 0.02},
+                         datetime(2026, 4, 22, 10, 30))
 
 
 # ---------- scan_once: 전역 집계 검증 ----------
@@ -348,7 +365,7 @@ async def test_scan_once_global_sector_aggregation():
 
     await d.scan_once()
     # 전역 합산: 3종목 ≥ SECTOR_B_MIN_PASSED(=3) → 알림 발화
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
     tg.notify.assert_awaited_once()
 
 
@@ -390,7 +407,7 @@ async def test_scan_once_dedup_same_stock_across_picks():
     await d.scan_once()
     # 중복 제거 후 3종목 → evaluate_stock 3회만 호출되어야 함
     assert kis.get_minute_candles.await_count == 3
-    store.insert_alert.assert_awaited_once()
+    store.try_insert_alert_with_cooldown.assert_awaited_once()
 
 
 # ---------- should_alert: 실제 SQLite in-memory ----------
@@ -441,3 +458,37 @@ async def test_should_alert_stage_independent(real_store):
     )
     # Stage 1 쿨다운 중이어도 Stage 2는 독립적으로 허용
     assert await real_store.should_alert("AI", 2, cooldown_min=5) is True
+
+
+# ---------- 통합: Telegram 비활성화 페이퍼 트레이딩 모드 ----------
+
+@pytest.mark.asyncio
+async def test_paper_run_with_no_telegram_token_still_logs_alert_history(real_store):
+    """TELEGRAM_BOT_TOKEN 없는 페이퍼 트레이딩 모드에서도 alert_history 행 생성.
+
+    is_configured()=False → notify 미호출, delivery_status='disabled', 이력 보존.
+    """
+    from core.telegram_bot import TelegramBot
+    from config import constants as C
+    from datetime import datetime
+
+    kis = MagicMock()
+    kis.get_minute_candles = AsyncMock(return_value=_make_1m_bars(
+        cur_open=102, cur_close=103, cur_vol=500, past_vol=100,
+    ))
+    kis.get_daily_candles = AsyncMock(return_value=_make_daily(day_open=100))
+
+    tg = TelegramBot()
+    # _app이 None(start() 미호출) → is_configured()=False
+    assert tg.is_configured() is False
+
+    detector = SectorDetector(kis, real_store, tg)
+    stocks = _passing_stocks()
+    now = datetime(2026, 4, 22, 10, 30)
+    await detector._scan_sector("AI", stocks, {"vol_mult": 3.0, "return": 0.02}, now)
+
+    # alert_history에 1행 삽입됨
+    cur = await real_store._db.execute("SELECT delivery_status FROM alert_history")
+    rows = await cur.fetchall()
+    assert len(rows) == 1, "alert_history 행이 삽입되지 않음"
+    assert rows[0][0] == 'disabled', f"delivery_status={rows[0][0]!r}, expected 'disabled'"

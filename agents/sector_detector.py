@@ -28,7 +28,7 @@ from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
 from core.time_utils import now_kst
 from data.sector_models import SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import AlertResult, SectorStore
 
 _KIS_CONCURRENCY = 8
 
@@ -235,14 +235,6 @@ class SectorDetector:
         thresholds: dict[str, float],
         now: datetime,
     ) -> None:
-        if not await self.sector_store.should_alert(
-            sector_name=sector_name,
-            stage=1,
-            cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
-        ):
-            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
-            return
-
         passed_summary = [
             {
                 "code": p["code"],
@@ -253,9 +245,49 @@ class SectorDetector:
             }
             for p in passed_stocks
         ]
+
+        # Step 1: 원자 쿨다운 게이트 + INSERT (delivery_status='pending')
+        result, alert_id = await self.sector_store.try_insert_alert_with_cooldown(
+            sector_name=sector_name,
+            stage=1,
+            cooldown_min=C.SECTOR_ALERT_COOLDOWN_MIN,
+            triggered_at=now,
+            passed_stocks=passed_summary,
+            metrics={"passed_count": len(passed_stocks)},
+            threshold_used=thresholds,
+            initial_status='pending',
+        )
+
+        if result == AlertResult.COOLDOWN_ACTIVE:
+            logger.debug(f"[sector] {sector_name} cooldown (stage=1)")
+            return
+        if result == AlertResult.INSERT_FAILED:
+            logger.error(
+                f"[sector] alert insert 재시도 소진 — notify 억제: sector={sector_name}"
+            )
+            return
+
+        # INSERTED: 이력 기록 완료, 쿨다운 활성
         contrib_log = ", ".join(
             f"{p['code']}(Pick#{p['pick_id']})" for p in passed_stocks
         )
+        logger.info(
+            f"[sector] 신호 발생: sector={sector_name} "
+            f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
+        )
+
+        # Step 2: 텔레그램 설정 여부 확인
+        if not self.telegram.is_configured():
+            try:
+                await self.sector_store.update_delivery_status(alert_id, 'disabled')
+            except Exception as exc:
+                logger.warning(
+                    f"[sector] delivery_status(disabled) 갱신 실패: "
+                    f"sector={sector_name} err={exc}"
+                )
+            return
+
+        # Step 3: 메시지 전송
         lines = [f"🔔 {sector_name} 섹터 신호 발생 ({len(passed_stocks)}종목)"]
         for p in passed_stocks:
             lines.append(
@@ -265,29 +297,21 @@ class SectorDetector:
         lines.append(
             f"threshold: vol×{thresholds['vol_mult']} / ret≥{thresholds['return']*100:.1f}%"
         )
-
-        sent = await self.telegram.notify("\n".join(lines))
-        if not sent:
-            return  # notify 실패 → cooldown 소비 안 함, 다음 스캔에서 재시도
-
-        logger.info(
-            f"[sector] 신호 발생: sector={sector_name} "
-            f"종목수={len(passed_stocks)} 기여종목=[{contrib_log}]"
-        )
         try:
-            await self.sector_store.insert_alert(
-                sector_name=sector_name,
-                stage=1,
-                triggered_at=now,
-                passed_stocks=passed_summary,
-                metrics={"passed_count": len(passed_stocks)},
-                threshold_used=thresholds,
-            )
-        except Exception as e:
-            logger.warning(
-                f"[sector] 텔레그램 전송 성공했으나 DB 기록 실패 — 다음 쿨다운 미적용: "
-                f"sector={sector_name} err={e}"
-            )
-            return
+            ok = await self.telegram.notify("\n".join(lines))
+            new_status = 'sent' if ok else 'failed'
+        except Exception as exc:
+            logger.warning(f"[sector] telegram notify 예외: sector={sector_name} err={exc}")
+            new_status = 'failed'
 
-        logger.info(f"[sector] alert emitted: {sector_name} ({len(passed_stocks)}종목)")
+        # Step 4: 전송 결과 기록 (실패해도 이력 행은 유지)
+        try:
+            await self.sector_store.update_delivery_status(alert_id, new_status)
+        except Exception as exc:
+            logger.warning(
+                f"[sector] delivery_status({new_status}) 갱신 실패: "
+                f"sector={sector_name} err={exc}"
+            )
+
+        if new_status == 'sent':
+            logger.info(f"[sector] alert emitted: {sector_name} ({len(passed_stocks)}종목)")

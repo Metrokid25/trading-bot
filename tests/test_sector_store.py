@@ -1,15 +1,20 @@
-"""SectorStore UPSERT / merge 단위 테스트.
+"""SectorStore UPSERT / merge / alert 단위 테스트.
 
 in-memory SQLite 사용. 외부 의존 없음.
 """
 from __future__ import annotations
 
+import asyncio
+import os
+import sqlite3
+import tempfile
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
-import asyncio
+import aiosqlite
 
 from data.sector_models import PickStatus, SectorPick, SectorStock
 from data.sector_store import AlertResult, SectorStore
@@ -297,20 +302,22 @@ _ALERT_KWARGS = dict(
 
 @pytest.mark.asyncio
 async def test_try_insert_first_call_returns_inserted(store: SectorStore):
-    """이력 없을 때 첫 호출은 INSERTED."""
+    """이력 없을 때 첫 호출은 INSERTED, row_id는 양수."""
     now = datetime.now()
-    result = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    result, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
     assert result is AlertResult.INSERTED
+    assert isinstance(row_id, int) and row_id > 0
 
 
 @pytest.mark.asyncio
-async def test_try_insert_second_call_within_cooldown_returns_skip(store: SectorStore):
-    """쿨다운 기간 내 두 번째 호출은 COOLDOWN_SKIP."""
+async def test_try_insert_second_call_within_cooldown_returns_active(store: SectorStore):
+    """쿨다운 기간 내 두 번째 호출은 COOLDOWN_ACTIVE."""
     now = datetime.now()
-    first = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
-    second = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    first, _ = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    second, row_id2 = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
     assert first is AlertResult.INSERTED
-    assert second is AlertResult.COOLDOWN_SKIP
+    assert second is AlertResult.COOLDOWN_ACTIVE
+    assert row_id2 is None
 
 
 @pytest.mark.asyncio
@@ -319,22 +326,211 @@ async def test_try_insert_after_cooldown_returns_inserted(store: SectorStore):
     past = datetime.now() - timedelta(minutes=10)
     recent = datetime.now()
     # 10분 전 기록 삽입 (cooldown=5분이므로 만료)
-    first = await store.try_insert_alert_with_cooldown(triggered_at=past, **_ALERT_KWARGS)
+    first, _ = await store.try_insert_alert_with_cooldown(triggered_at=past, **_ALERT_KWARGS)
     # 현재 시각 기준으로는 쿨다운 경과 → INSERTED
-    second = await store.try_insert_alert_with_cooldown(triggered_at=recent, **_ALERT_KWARGS)
+    second, row_id2 = await store.try_insert_alert_with_cooldown(triggered_at=recent, **_ALERT_KWARGS)
     assert first is AlertResult.INSERTED
     assert second is AlertResult.INSERTED
+    assert isinstance(row_id2, int) and row_id2 > 0
 
 
 @pytest.mark.asyncio
 async def test_try_insert_concurrent_calls_only_one_inserts(store: SectorStore):
-    """asyncio.gather로 동일 sector/stage 동시 호출 → 1건 INSERTED, 1건 COOLDOWN_SKIP."""
+    """asyncio.gather로 동일 sector/stage 동시 호출 → 1건 INSERTED, 1건 COOLDOWN_ACTIVE."""
     now = datetime.now()
-    results = await asyncio.gather(
+    pairs = await asyncio.gather(
         store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS),
         store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS),
     )
-    inserted = [r for r in results if r is AlertResult.INSERTED]
-    skipped = [r for r in results if r is AlertResult.COOLDOWN_SKIP]
+    statuses = [r[0] for r in pairs]
+    inserted = [s for s in statuses if s is AlertResult.INSERTED]
+    skipped = [s for s in statuses if s is AlertResult.COOLDOWN_ACTIVE]
     assert len(inserted) == 1
     assert len(skipped) == 1
+
+
+# ---------- try_insert: DB 잠금 재시도 ----------
+
+@pytest.mark.asyncio
+async def test_insert_retries_on_database_locked_succeeds_second_attempt(store: SectorStore):
+    """첫 번째 시도에서 locked 오류 → 재시도 후 INSERTED."""
+    now = datetime.now()
+    call_count = 0
+    original_execute = store._db.execute
+
+    async def patched_execute(sql, params=None):
+        nonlocal call_count
+        if params is not None and "INSERT INTO alert_history" in sql:
+            call_count += 1
+            if call_count == 1:
+                raise sqlite3.OperationalError("database is locked")
+        if params is not None:
+            return await original_execute(sql, params)
+        return await original_execute(sql)
+
+    store._db.execute = patched_execute
+    result, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert result is AlertResult.INSERTED
+    assert row_id is not None
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_insert_retries_exhausted_returns_insert_failed(store: SectorStore):
+    """모든 재시도 소진 시 INSERT_FAILED 반환."""
+    now = datetime.now()
+
+    async def always_locked(sql, params=None):
+        if params is not None and "INSERT INTO alert_history" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        if params is not None:
+            return await store._db._execute(sql, params)
+        return await store._db._execute(sql)
+
+    store._db.execute = always_locked
+    result, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert result is AlertResult.INSERT_FAILED
+    assert row_id is None
+
+
+# ---------- update_delivery_status ----------
+
+@pytest.mark.asyncio
+async def test_update_delivery_status_sent(store: SectorStore):
+    """insert 후 delivery_status를 'sent'로 갱신."""
+    now = datetime.now()
+    _, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert row_id is not None
+    await store.update_delivery_status(row_id, 'sent')
+    cur = await store._db.execute(
+        "SELECT delivery_status FROM alert_history WHERE id = ?", (row_id,)
+    )
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 'sent'
+
+
+@pytest.mark.asyncio
+async def test_update_delivery_status_disabled(store: SectorStore):
+    """insert 후 delivery_status를 'disabled'로 갱신."""
+    now = datetime.now()
+    _, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    assert row_id is not None
+    await store.update_delivery_status(row_id, 'disabled')
+    cur = await store._db.execute(
+        "SELECT delivery_status FROM alert_history WHERE id = ?", (row_id,)
+    )
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 'disabled'
+
+
+@pytest.mark.asyncio
+async def test_initial_status_pending_after_insert(store: SectorStore):
+    """try_insert_alert_with_cooldown 직후 delivery_status는 'pending'."""
+    now = datetime.now()
+    _, row_id = await store.try_insert_alert_with_cooldown(triggered_at=now, **_ALERT_KWARGS)
+    cur = await store._db.execute(
+        "SELECT delivery_status FROM alert_history WHERE id = ?", (row_id,)
+    )
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 'pending'
+
+
+# ---------- 마이그레이션 ----------
+
+@pytest.mark.asyncio
+async def test_migration_idempotent():
+    """SectorStore를 두 번 열어도 오류 없음 (멱등 마이그레이션)."""
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        db_path = f.name
+    try:
+        s = SectorStore(db_path=db_path)
+        await s.open()
+        await s.close()
+        s2 = SectorStore(db_path=db_path)
+        await s2.open()
+        await s2.close()
+    finally:
+        os.unlink(db_path)
+
+
+@pytest.mark.asyncio
+async def test_migration_backfills_existing_rows_as_sent():
+    """구 스키마(delivery_status 없음) DB → 마이그레이션 후 기존 행은 'sent'."""
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        db_path = f.name
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                """CREATE TABLE alert_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sector_name TEXT NOT NULL,
+                    stage INTEGER NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    passed_stocks TEXT NOT NULL,
+                    metrics TEXT NOT NULL,
+                    threshold_used TEXT NOT NULL
+                )"""
+            )
+            await db.execute(
+                "INSERT INTO alert_history "
+                "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
+                "VALUES ('반도체', 1, '2026-04-25T10:00:00+09:00', '[]', '{}', '{}')"
+            )
+            await db.commit()
+
+        s = SectorStore(db_path=db_path)
+        await s.open()
+        try:
+            cur = await s._db.execute(
+                "SELECT delivery_status FROM alert_history WHERE sector_name='반도체'"
+            )
+            row = await cur.fetchone()
+            assert row is not None, "마이그레이션 후 기존 행이 없음"
+            assert row[0] == 'sent', f"기존 행 delivery_status={row[0]!r}, expected 'sent'"
+        finally:
+            await s.close()
+    finally:
+        os.unlink(db_path)
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_existing_data():
+    """마이그레이션 후 기존 컬럼 데이터가 보존됨."""
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        db_path = f.name
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                """CREATE TABLE alert_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sector_name TEXT NOT NULL,
+                    stage INTEGER NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    passed_stocks TEXT NOT NULL,
+                    metrics TEXT NOT NULL,
+                    threshold_used TEXT NOT NULL
+                )"""
+            )
+            await db.execute(
+                "INSERT INTO alert_history "
+                "(sector_name, stage, triggered_at, passed_stocks, metrics, threshold_used) "
+                "VALUES ('AI', 2, '2026-04-25T11:00:00+09:00', '[{\"code\":\"000001\"}]', '{\"x\":1}', '{\"t\":2}')"
+            )
+            await db.commit()
+
+        s = SectorStore(db_path=db_path)
+        await s.open()
+        try:
+            cur = await s._db.execute(
+                "SELECT sector_name, stage, passed_stocks, delivery_status FROM alert_history"
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 'AI'
+            assert row[1] == 2
+            assert row[2] == '[{"code":"000001"}]'
+            assert row[3] == 'sent'
+        finally:
+            await s.close()
+    finally:
+        os.unlink(db_path)
