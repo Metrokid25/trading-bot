@@ -171,14 +171,21 @@ class KISClient:
         r.raise_for_status()
         return int(r.json()["output"]["stck_prpr"])
 
-    async def get_minute_candles(self, code: str, interval: str = "3") -> list[dict[str, Any]]:
-        """분봉 조회. KIS는 1/3/5/10/15/30/60분 지원."""
+    async def get_minute_candles(self, code: str) -> list[dict[str, Any]]:
+        """당일 1분봉 30개 조회 (현재 시각 기준 과거 방향).
+
+        KIS inquire-time-itemchartprice는 1분봉만 지원하며,
+        FID_INPUT_HOUR_1에는 조회 기준 시각 HHMMSS 6자리를 넘겨야 한다.
+        이 엔드포인트는 분봉 간격(interval) 선택을 지원하지 않는다.
+        """
+        from core.time_utils import now_kst
+        hhmmss = now_kst().strftime("%H%M%S")
         headers = await self._real_headers("FHKST03010200")
         params = {
             "FID_ETC_CLS_CODE": "",
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": code,
-            "FID_INPUT_HOUR_1": interval,
+            "FID_INPUT_HOUR_1": hhmmss,
             "FID_PW_DATA_INCU_YN": "N",
         }
         r = await self._real_client.get(

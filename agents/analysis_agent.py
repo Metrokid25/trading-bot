@@ -122,7 +122,10 @@ class AnalysisAgent(BaseAgent):
         if not self.store:
             return 0
         try:
-            rows = await self.kis.get_minute_candles(code, "3")
+            # NOTE: get_minute_candles는 1분봉 30개만 반환 (KIS API 제약).
+            # 아래 `c.ts.minute % 3 != 0` 필터는 3분봉 가정으로 작성된 레거시 로직이며,
+            # 1분봉 입력 시 30개 중 10개만 통과한다. AnalysisAgent retire(Phase 3) 시 함께 정리.
+            rows = await self.kis.get_minute_candles(code)
         except Exception as e:
             logger.warning(f"[BACKFILL] {code} fetch 실패: {e}")
             return 0

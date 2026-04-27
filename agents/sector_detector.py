@@ -112,7 +112,7 @@ class SectorDetector:
         """종목 1개에 대해 조건 A 판정. (passed, metrics)."""
         async with self._sema:
             try:
-                bars = await self.kis.get_minute_candles(code, interval="1")
+                bars = await self.kis.get_minute_candles(code)
             except Exception as e:
                 logger.warning(f"[sector] {code} 1분봉 조회 실패: {e}")
                 return False, {"error": str(e)}
