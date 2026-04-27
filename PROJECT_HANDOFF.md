@@ -290,3 +290,114 @@ PAPER 데이터가 1주일 이상 쌓이면 다음 major task 는 **Stage 1 back
 4. `.env` 의 `KIS_ENV`, REAL/PAPER key, Telegram token/chat_id 확인
 5. `db/trading.db` 의 `alert_history` schema 확인
 6. PAPER run 로그에서 `sector_scan`, `alert_history`, Telegram delivery status 확인
+
+---
+
+## 2026-04-27 페이퍼 1일차 결과 + 방향 전환
+
+### 인프라 검증
+- KIS API 분봉 파라미터 버그 수정 (commit 3176e86)
+  FID_INPUT_HOUR_1은 HHMMSS 6자리, 분봉 간격 아님
+  get_minute_candles는 1분봉 30개만 지원 (interval 인자 제거)
+  호출처 3곳 동기화: kis_api.py / sector_detector.py / analysis_agent.py(dead code)
+- KIS rate limit 슬라이딩 윈도우 대응 (commit f46ce54)
+  KIS 공식 한도: 실전 20 TPS, 모의 5 TPS, 슬라이딩 윈도우 방식
+  _RateLimiter 추가 (deque 기반, 15 TPS 안전 마진)
+  시세 함수 5개에 acquire 게이트 (get_current_price, get_minute_candles,
+  get_minute_candles_at, get_investor_trend, get_daily_candles)
+  매매/잔고 경로(_trade_client)는 무영향 — 실머니 경로 보호 유지
+  세마포어 _KIS_CONCURRENCY 8 → 4 축소 (rate limiter가 주 게이트)
+  evaluate_stock에 2회 재시도 (0.3s, 0.6s 백오프) 추가
+- 09:55 이후 76종목 안정 가동 확인
+  500 에러 99.6% 감소 (산발적 1~2건만 발생, 재시도가 흡수)
+
+### 신호 0건의 진짜 원인 (페이퍼 1일차 핵심 발견)
+- 광전자(017900) +13.37%, 대한광통신(010170) +18.47%, 한미반도체(042700) +22.79% 폭등
+- sector_detector 알림 0건 (4시간 30분 가동, 270회 스캔)
+- 진단 스크립트 v3 (scripts/diag_sector_signal.py): 종일 분봉 페이지네이션
+  광통신 섹터: 29개 분봉이 조건 A 통과
+  반도체톱10 섹터: 19개 분봉이 조건 A 통과
+  그러나 같은 1분봉에 같은 섹터 3종목 동시 통과는 0건
+- 결론: 봇 버그 아님. SECTOR_B_MIN_PASSED=3 + 1분 정확 동기화 가정이
+  현실에서 거의 발생 불가능
+- 진짜 섹터 쏠림은 분 단위 동기화가 아니라 30분~수 시간에 걸친 누적 동조
+
+### 방향 전환 — Phase 2.5 데이터 누적 모드
+- 신호 알림 봇 → 픽 사후 추적 + 폭발 직전 시그널 데이터 누적 봇으로 역할 전환
+- 이유: 임계치 답을 모른 채 신호 띄우기보다 데이터 누적으로 답을 도출하는 게 우선
+- ai-moneyingbot 완성 후 두 봇 데이터 합쳐서 trading-bot 신호 룰 재설계
+- ai-moneyingbot의 4만 2천 게시물 RAG = 형의 매매 철학 객관화의 원천
+- 두 봇은 데이터 영역에서 자연스럽게 결합
+
+### 데이터 누적 결정 사항
+- 추적 윈도우: D+20일 (스승님 단타/스윙 스타일 반영)
+- 폭발 정의: +10% (VI 트리거 일치, 깔끔한 임계치)
+- 펀더멘털 데이터 제외: 스승님 철학 — "주가는 조작, 업황과 수급만 본다"
+  PER, PBR, ROE, 부채비율 모두 스키마에서 제외
+- 수급 데이터 강화: 외국인/기관/개인 매매 동향이 핵심 컬럼
+- 분봉 raw 저장 전략: 옵션 A 채택
+  모든 픽의 모든 거래일 분봉 raw 통째 저장
+  KIS API 제약: 분봉은 당일만 제공, D+N에 D 분봉 못 받음
+  → 매일 장마감 후 active 픽 분봉 일괄 저장 필수
+  용량 추정: 1년 약 2GB, SQLite 운영 한계 ~5GB
+  5GB 초과 시 년도별 파일 분리 또는 PostgreSQL 마이그
+  config 토글: MINUTE_RAW_ARCHIVE_ENABLED (부담 시 끄고 통계만)
+- 재픽업 처리: 별도 pick_id + 재픽업 마킹
+  새 컬럼: is_repick, prev_pick_id, days_since_last_pick, total_pick_count
+  형 직감: 장기 재픽업(91일+)이 폭발 경향 강함 → 정량 검증 가능
+- 섹터 단위 재픽업도 별도 추적: sector_pick_events 신규 테이블
+
+### 새 스키마 (확정 6개 테이블)
+1. picks — 기존 테이블, 재픽업 컬럼 추가
+   추가: is_repick, prev_pick_id, days_since_last_pick, total_pick_count
+   추가: initial_price, initial_market_cap, initial_shares
+   추가: initial_52w_high_pct, initial_52w_low_pct
+   추가: d_minus_5_avg_volume, d_minus_5_return
+   추가: d_minus_5_foreign_net, d_minus_5_inst_net
+   추가: sector_d_minus_5_avg_return
+2. sector_pick_events — 신규
+   event_id, sector_name, registered_at_kst
+   is_sector_repick, prev_event_id
+   days_since_last_sector_pick, total_sector_pick_count
+3. pick_daily_tracking — 신규, D+1~D+20 일봉
+   pick_id, trading_day, day_offset
+   open, high, low, close, volume, transaction_amount
+   return_vs_pick, return_vs_prev_close
+   vi_count, vi_first_time, upper_limit_hit, lower_limit_hit
+   foreign_net, inst_net, individual_net
+   kospi_return, kosdaq_return, relative_strength
+   sector_avg_return
+4. pick_minute_raw — 신규, 분봉 raw 저장
+   pick_id, trading_day, bar_time
+   open, high, low, close, volume, transaction_amount
+5. pick_daily_minute_stats — 신규, 분봉 집계
+   pick_id, trading_day, bars_count
+   vol_ratio_max, vol_ratio_avg
+   vol_x3_count, vol_x5_count, vol_x10_count
+   max_1min_return, min_1min_return
+   bullish_bar_count, bearish_bar_count
+   morning_volume_pct, lunch_volume_pct, closing_volume_pct
+6. explosion_events — 신규, +10% 폭발 마킹
+   pick_id, explosion_day, day_offset
+   peak_return, peak_time
+
+### 다음 작업 (병행)
+- ai-moneyingbot Phase 2: "본인확인" false positive 디버깅 (browser.py _BLOCK_CONTENT)
+- trading-bot Phase 2.5: 추적 모듈 신규 개발
+  sector_detector 알림 로직은 일단 그대로 둠 (인프라 검증 데이터 누적)
+  추적 모듈은 별도 신규 모듈로 추가, 기존 코드 충돌 없이
+  Claude Code 2개 동시 실행으로 두 봇 병행 가능
+
+### 페이퍼 1일차 메타 교훈
+- 페이퍼 트레이딩의 진짜 가치는 인프라 버그(분봉 파라미터, rate limit)와
+  설계 결함(임계치 비현실성)을 실머니 들어가기 전에 잡는 것
+- 형의 의심("광전자도 한미반도체도 올랐는데 왜 못 잡냐") 한 마디가
+  봇 방향 전환의 결정적 트리거였음
+- "신호 0건이지만 시스템 정상"을 자동 인정하지 말고, 실제 시장과 대조 검증 필요
+- 임계치/구조 결정은 직관 대신 데이터 누적 후 정량 도출
+
+### 미해결 (의도적 보류)
+- SECTOR_B_MIN_PASSED 임계치 / 시간 윈도우 도입
+  → 1~2개월 데이터 누적 후 정량적 답 도출
+- AnalysisAgent retire → Phase 3 작업
+- M1~M4 MEDIUM 이슈 (handoff 이전 섹션 참조)
