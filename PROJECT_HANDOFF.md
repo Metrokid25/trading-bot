@@ -401,3 +401,43 @@ PAPER 데이터가 1주일 이상 쌓이면 다음 major task 는 **Stage 1 back
   → 1~2개월 데이터 누적 후 정량적 답 도출
 - AnalysisAgent retire → Phase 3 작업
 - M1~M4 MEDIUM 이슈 (handoff 이전 섹션 참조)
+
+---
+
+## 2026-04-27 Phase 2.5 작업 1단계 완료: DB 마이그레이션 인프라
+
+### 결정 사항
+- "picks 테이블"의 실체 = 기존 sector_stocks 테이블 (per-stock 추적 단위)
+- A안 채택: sector_stocks에 추적 컬럼 직접 추가
+- 추적 5개 테이블의 FK 컬럼명: stock_pick_id → sector_stocks(id)
+
+### 추가된 파일
+- scripts/migrations/__init__.py
+- scripts/migrations/migration_runner.py — 백업 + 멱등 + 트랜잭션 보호
+- scripts/migrations/m001_phase25_tracking.py — Phase 2.5 스키마
+
+### sector_stocks 추가 컬럼 7개
+is_repick, prev_pick_id, days_since_last_pick, total_pick_count,
+tracking_status, tracking_start_date, tracking_end_date
+
+### 신규 테이블 6개 (schema_migrations 포함)
+- schema_migrations: 마이그레이션 버전 추적
+- sector_pick_events (7컬럼): 섹터 단위 재픽업 추적
+- pick_daily_tracking (24컬럼): D+0~D+20 일봉, UNIQUE(stock_pick_id, trading_day)
+- pick_minute_raw (12컬럼): 분봉 raw, UNIQUE(stock_pick_id, trading_day, minute_idx)
+- pick_daily_minute_stats (17컬럼): 분봉 집계, UNIQUE(stock_pick_id, trading_day)
+- explosion_events (7컬럼): +10% 폭발 마킹, UNIQUE(stock_pick_id, explosion_day)
+
+### 인덱스 4개
+- idx_pdt_pick_day, idx_pmr_pick_day_min, idx_ee_pick, idx_spe_sector_at
+
+### 검증 완료
+- 기존 데이터 무결성 OK (sector_picks 13행, sector_stocks 96행 변경 없음)
+- DEFAULT 값 96행 모두 적용 OK
+- 멱등성 재실행 OK (skip 메시지 확인)
+
+### 백로그
+- 마이그레이션 runner: 이미 적용된 상태일 때 백업 skip 옵션 추가 (현재는 매 실행마다 백업)
+
+### 다음 단계
+Phase 2.5 작업 2번: /add 핸들러에 재픽업 마킹 로직 추가
