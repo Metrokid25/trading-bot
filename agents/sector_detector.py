@@ -30,7 +30,7 @@ from core.time_utils import now_kst
 from data.sector_models import SectorStock
 from data.sector_store import AlertResult, SectorStore
 
-_KIS_CONCURRENCY = 8
+_KIS_CONCURRENCY = 4  # rate limiter가 주 게이트, 세마포어는 보조 (커넥션 풀 보호)
 
 
 class SectorDetector:
@@ -111,11 +111,20 @@ class SectorDetector:
     ) -> tuple[bool, dict[str, Any]]:
         """종목 1개에 대해 조건 A 판정. (passed, metrics)."""
         async with self._sema:
-            try:
-                bars = await self.kis.get_minute_candles(code)
-            except Exception as e:
-                logger.warning(f"[sector] {code} 1분봉 조회 실패: {e}")
-                return False, {"error": str(e)}
+            last_err = None
+            for attempt in range(3):
+                try:
+                    bars = await self.kis.get_minute_candles(code)
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+                        continue
+                    logger.warning(f"[sector] {code} 1분봉 조회 실패 (재시도 {attempt+1}회): {e}")
+                    return False, {"error": str(e)}
+            else:
+                return False, {"error": str(last_err)}
 
         if len(bars) < C.VOLUME_LOOKBACK + 1:
             return False, {"reason": "insufficient_bars", "n": len(bars)}

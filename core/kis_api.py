@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import time
 from dataclasses import dataclass
@@ -20,6 +21,30 @@ from config import settings
 
 _TOKEN_CACHE_REAL = Path(settings.DB_PATH).parent / "kis_token_real.json"
 _TOKEN_CACHE_PAPER = Path(settings.DB_PATH).parent / "kis_token_paper.json"
+
+
+class _RateLimiter:
+    """초당 max_per_sec 회 제한 토큰 버킷 (sliding window)."""
+
+    def __init__(self, max_per_sec: int) -> None:
+        self.max = max_per_sec
+        self.window = 1.0
+        self.timestamps: collections.deque[float] = collections.deque()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self.lock:
+            now = time.monotonic()
+            while self.timestamps and self.timestamps[0] < now - self.window:
+                self.timestamps.popleft()
+            if len(self.timestamps) >= self.max:
+                wait = self.window - (now - self.timestamps[0])
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    now = time.monotonic()
+                    while self.timestamps and self.timestamps[0] < now - self.window:
+                        self.timestamps.popleft()
+            self.timestamps.append(now)
 
 
 @dataclass
@@ -39,6 +64,7 @@ class KISClient:
         self._real_client = httpx.AsyncClient(base_url=settings.KIS_REAL_BASE_URL, timeout=10.0)
         self._real_token: AccessToken | None = None
         self._real_lock = asyncio.Lock()
+        self._market_limiter = _RateLimiter(max_per_sec=15)
 
         # 매매: PAPER 모드 시 모의 서버, REAL 모드 시 실전 서버(동일 클라이언트 재사용)
         if self._is_paper:
@@ -161,6 +187,7 @@ class KISClient:
     # ----- 시세 (항상 실전 서버) -----
     async def get_current_price(self, code: str) -> int:
         """현재가 조회 (국내주식 현재가 시세)."""
+        await self._market_limiter.acquire()
         headers = await self._real_headers("FHKST01010100")
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         r = await self._real_client.get(
@@ -178,6 +205,7 @@ class KISClient:
         FID_INPUT_HOUR_1에는 조회 기준 시각 HHMMSS 6자리를 넘겨야 한다.
         이 엔드포인트는 분봉 간격(interval) 선택을 지원하지 않는다.
         """
+        await self._market_limiter.acquire()
         from core.time_utils import now_kst
         hhmmss = now_kst().strftime("%H%M%S")
         headers = await self._real_headers("FHKST03010200")
@@ -204,6 +232,7 @@ class KISClient:
         KIS 주식당일분봉조회는 `FID_INPUT_HOUR_1` 에 HHMMSS(6자리)를 주면
         그 시각 기준 이전 30개 분봉을 돌려준다. 페이지네이션에 사용.
         """
+        await self._market_limiter.acquire()
         headers = await self._real_headers("FHKST03010200")
         params = {
             "FID_ETC_CLS_CODE": "",
@@ -228,6 +257,7 @@ class KISClient:
         """
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         for attempt in range(4):
+            await self._market_limiter.acquire()
             headers = await self._real_headers("FHKST01010900")
             r = await self._real_client.get(
                 "/uapi/domestic-stock/v1/quotations/inquire-investor",
@@ -255,6 +285,7 @@ class KISClient:
             "FID_ORG_ADJ_PRC": "0",
         }
         for attempt in range(4):
+            await self._market_limiter.acquire()
             headers = await self._real_headers("FHKST03010100")
             r = await self._real_client.get(
                 "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
