@@ -182,15 +182,15 @@ class SectorStore:
     async def _compute_repick_metadata(
         self,
         stock_code: str,
-        pick_created_at_iso: str,
+        pick_date_str: str,
     ) -> dict:
         """직전 픽(stock_code 기준, 모든 섹터 포함) 조회 후 재픽업 메타데이터 계산."""
         cur = await self._db.execute(
-            "SELECT ss.id, ss.total_pick_count, sp.created_at "
+            "SELECT ss.id, ss.total_pick_count, sp.pick_date "
             "FROM sector_stocks ss "
             "JOIN sector_picks sp ON ss.pick_id = sp.id "
             "WHERE ss.stock_code = ? "
-            "ORDER BY sp.created_at DESC "
+            "ORDER BY sp.pick_date DESC, sp.created_at DESC "
             "LIMIT 1",
             (stock_code,),
         )
@@ -202,10 +202,8 @@ class SectorStore:
                 "days_since_last_pick": None,
                 "total_pick_count": 1,
             }
-        prev_ss_id, prev_total_count, prev_created_at_iso = row
-        prev_date = datetime.fromisoformat(prev_created_at_iso).date()
-        current_date = datetime.fromisoformat(pick_created_at_iso).date()
-        days_since = (current_date - prev_date).days
+        prev_ss_id, prev_total_count, prev_pick_date = row
+        days_since = (date.fromisoformat(pick_date_str) - date.fromisoformat(prev_pick_date)).days
         return {
             "is_repick": 1,
             "prev_pick_id": prev_ss_id,
@@ -307,7 +305,7 @@ class SectorStore:
                     else:
                         max_order += 1
                         s.added_order = max_order
-                        meta = await self._compute_repick_metadata(s.stock_code, pick_created_at_iso)
+                        meta = await self._compute_repick_metadata(s.stock_code, pick_template.pick_date)
                         s.is_repick = meta["is_repick"]
                         s.prev_pick_id = meta["prev_pick_id"]
                         s.days_since_last_pick = meta["days_since_last_pick"]
@@ -362,7 +360,7 @@ class SectorStore:
 
                 for i, s in enumerate(stocks_deduped, start=1):
                     s.added_order = i
-                    meta = await self._compute_repick_metadata(s.stock_code, pick_created_at_iso)
+                    meta = await self._compute_repick_metadata(s.stock_code, pick_template.pick_date)
                     s.is_repick = meta["is_repick"]
                     s.prev_pick_id = meta["prev_pick_id"]
                     s.days_since_last_pick = meta["days_since_last_pick"]

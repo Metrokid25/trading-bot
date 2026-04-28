@@ -216,7 +216,7 @@ def _build_handlers(store: SectorStore, master: StockMaster):
         resolved: dict[str, list[SectorStock]] = {}
         failed: list[str] = []
         skipped_duplicates: list[str] = []
-        seen_codes: set[str] = set()
+        seen_codes: dict[str, set[str]] = {}
         order = 0
         for (sector, name), res in zip(flat, results):
             if isinstance(res, Exception) or res is None:
@@ -224,11 +224,12 @@ def _build_handlers(store: SectorStore, master: StockMaster):
                 continue
             code, resolved_name = res
             display_name = resolved_name or name
-            if code in seen_codes:
+            sector_seen = seen_codes.setdefault(sector, set())
+            if code in sector_seen:
                 logger.info("중복 stock_code skip: %s (이미 같은 /p 세션에 등록됨)", code)
                 skipped_duplicates.append(display_name)
                 continue
-            seen_codes.add(code)
+            sector_seen.add(code)
             order += 1
             resolved.setdefault(sector, []).append(
                 SectorStock(

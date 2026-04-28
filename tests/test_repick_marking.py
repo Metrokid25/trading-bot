@@ -140,3 +140,67 @@ async def test_same_session_duplicate_deduped(store: SectorStore):
     codes = [s.stock_code for s in rows]
     assert codes.count("005930") == 1
     assert r.added_count == 1
+
+
+# ---------- 시나리오 (h): cross-sector 중복 보존 ----------
+
+@pytest.mark.asyncio
+async def test_cross_sector_both_preserved(store: SectorStore):
+    """다른 섹터에서 같은 종목 → 둘 다 INSERT / 같은 섹터 내 중복 → 두 번째 skip."""
+    # 다른 섹터: 반도체 005930, AI 005930 → 둘 다 저장
+    r1 = await store.upsert_sector("반도체", [_stock("반도체", "005930", "삼성전자")], _pick("2025-04-28"))
+    r2 = await store.upsert_sector("AI", [_stock("AI", "005930", "삼성전자")], _pick("2025-04-28"))
+
+    rows_semicon = await store.get_stocks_by_sector(r1.pick_id, "반도체")
+    rows_ai = await store.get_stocks_by_sector(r2.pick_id, "AI")
+    assert len(rows_semicon) == 1
+    assert len(rows_ai) == 1
+    assert rows_ai[0].is_repick == 1
+    assert rows_ai[0].prev_pick_id == rows_semicon[0].id
+
+    # 같은 섹터 내 중복은 여전히 dedup
+    r3 = await store.upsert_sector("반도체2", [
+        _stock("반도체2", "006400", "삼성SDI"),
+        _stock("반도체2", "006400", "삼성SDI_dup"),
+    ], _pick("2025-04-28"))
+    assert r3.added_count == 1
+
+
+# ---------- 시나리오 (i): pick_date 기준 정렬 ----------
+
+@pytest.mark.asyncio
+async def test_repick_uses_pick_date_not_created_at(store: SectorStore):
+    """pick_date 기준 정렬: created_at이 늦어도 pick_date가 이른 픽은 prev로 선택 안 됨."""
+    # Pick A: pick_date 늦음(2025-05-10), created_at 이름
+    # Pick B: pick_date 이름(2025-04-28), created_at 늦음
+    # → created_at 기준이면 Pick B가 prev, pick_date 기준이면 Pick A가 prev
+    early_created = datetime(2025, 4, 28, 9, 0, 0, tzinfo=_KST)
+    late_created = datetime(2025, 4, 29, 9, 0, 0, tzinfo=_KST)
+
+    pick_a = SectorPick(
+        pick_date="2025-05-10",
+        created_at=early_created,
+        expires_at=early_created + timedelta(days=7),
+    )
+    pick_b = SectorPick(
+        pick_date="2025-04-28",
+        created_at=late_created,
+        expires_at=late_created + timedelta(days=7),
+    )
+
+    id_a = await store.insert_pick(pick_a, [_stock("반도체", "005930", "삼성전자")])
+    await store.insert_pick(pick_b, [_stock("AI", "005930", "삼성전자")])
+
+    ss_a_id = (await store.get_stocks_by_pick(id_a))[0].id
+
+    pick_c = SectorPick(
+        pick_date="2025-05-15",
+        created_at=datetime(2025, 4, 30, 9, 0, 0, tzinfo=_KST),
+        expires_at=datetime(2025, 5, 7, 9, 0, 0, tzinfo=_KST),
+    )
+    r_c = await store.upsert_sector("반도체2", [_stock("반도체2", "005930", "삼성전자")], pick_c)
+    s_c = (await store.get_stocks_by_sector(r_c.pick_id, "반도체2"))[0]
+
+    assert s_c.is_repick == 1
+    assert s_c.prev_pick_id == ss_a_id  # pick_date 기준: pick_a(2025-05-10)이 prev
+    assert s_c.days_since_last_pick == 5  # 2025-05-15 - 2025-05-10 = 5일
