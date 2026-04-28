@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -12,6 +12,7 @@ import aiosqlite
 from loguru import logger
 
 from config import settings
+from core.market_calendar import add_trading_days
 from core.time_utils import now_kst, to_db_iso
 from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
 
@@ -34,6 +35,7 @@ class SectorStore:
         self._db = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self.init_tables()
         await self._migrate_alert_history_v2()
+        await self._migrate_sector_stocks_repick()
 
     async def close(self) -> None:
         if self._db:
@@ -61,6 +63,13 @@ class SectorStore:
                 stock_code TEXT NOT NULL,
                 stock_name TEXT NOT NULL,
                 added_order INTEGER NOT NULL,
+                is_repick INTEGER NOT NULL DEFAULT 0,
+                prev_pick_id INTEGER,
+                days_since_last_pick INTEGER,
+                total_pick_count INTEGER NOT NULL DEFAULT 1,
+                tracking_status TEXT DEFAULT 'active',
+                tracking_start_date TEXT,
+                tracking_end_date TEXT,
                 FOREIGN KEY (pick_id) REFERENCES sector_picks(id)
             )"""
         )
@@ -144,6 +153,66 @@ class SectorStore:
             logger.exception("[sector_store] alert_history v2 마이그레이션 실패")
             raise
 
+    async def _migrate_sector_stocks_repick(self) -> None:
+        """sector_stocks에 재픽업 마킹 7개 컬럼 추가 (멱등). 신규 DB는 init_tables가 처리."""
+        if not self._db:
+            return
+        cur = await self._db.execute("PRAGMA table_info(sector_stocks)")
+        rows = await cur.fetchall()
+        if not rows:
+            return
+        existing_cols = {row[1] for row in rows}
+        if "is_repick" in existing_cols:
+            return
+        logger.info("[sector_store] sector_stocks repick 마이그레이션 시작")
+        for col_name, col_def in [
+            ("is_repick", "INTEGER NOT NULL DEFAULT 0"),
+            ("prev_pick_id", "INTEGER"),
+            ("days_since_last_pick", "INTEGER"),
+            ("total_pick_count", "INTEGER NOT NULL DEFAULT 1"),
+            ("tracking_status", "TEXT DEFAULT 'active'"),
+            ("tracking_start_date", "TEXT"),
+            ("tracking_end_date", "TEXT"),
+        ]:
+            await self._db.execute(
+                f"ALTER TABLE sector_stocks ADD COLUMN {col_name} {col_def}"
+            )
+        logger.info("[sector_store] sector_stocks repick 마이그레이션 완료")
+
+    async def _compute_repick_metadata(
+        self,
+        stock_code: str,
+        pick_created_at_iso: str,
+    ) -> dict:
+        """직전 픽(stock_code 기준, 모든 섹터 포함) 조회 후 재픽업 메타데이터 계산."""
+        cur = await self._db.execute(
+            "SELECT ss.id, ss.total_pick_count, sp.created_at "
+            "FROM sector_stocks ss "
+            "JOIN sector_picks sp ON ss.pick_id = sp.id "
+            "WHERE ss.stock_code = ? "
+            "ORDER BY sp.created_at DESC "
+            "LIMIT 1",
+            (stock_code,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return {
+                "is_repick": 0,
+                "prev_pick_id": None,
+                "days_since_last_pick": None,
+                "total_pick_count": 1,
+            }
+        prev_ss_id, prev_total_count, prev_created_at_iso = row
+        prev_date = datetime.fromisoformat(prev_created_at_iso).date()
+        current_date = datetime.fromisoformat(pick_created_at_iso).date()
+        days_since = (current_date - prev_date).days
+        return {
+            "is_repick": 1,
+            "prev_pick_id": prev_ss_id,
+            "days_since_last_pick": days_since,
+            "total_pick_count": prev_total_count + 1,
+        }
+
     async def insert_pick(
         self,
         pick: SectorPick,
@@ -200,6 +269,8 @@ class SectorStore:
             raise RuntimeError("SectorStore not open")
 
         now_iso = to_db_iso(now_kst())
+        pick_created_at_iso = to_db_iso(pick_template.created_at)
+        tracking_end_date_iso = add_trading_days(pick_template.created_at.date(), 20).isoformat()
         await self._db.execute("BEGIN IMMEDIATE")
         try:
             cur = await self._db.execute(
@@ -229,20 +300,34 @@ class SectorStore:
 
                 added: list[SectorStock] = []
                 skipped: list[SectorStock] = []
+                seen_new: set[str] = set()
                 for s in stocks:
-                    if s.stock_code in existing_codes:
+                    if s.stock_code in existing_codes or s.stock_code in seen_new:
                         skipped.append(s)
                     else:
                         max_order += 1
                         s.added_order = max_order
+                        meta = await self._compute_repick_metadata(s.stock_code, pick_created_at_iso)
+                        s.is_repick = meta["is_repick"]
+                        s.prev_pick_id = meta["prev_pick_id"]
+                        s.days_since_last_pick = meta["days_since_last_pick"]
+                        s.total_pick_count = meta["total_pick_count"]
+                        s.tracking_status = "active"
+                        s.tracking_start_date = pick_created_at_iso
+                        s.tracking_end_date = tracking_end_date_iso
+                        seen_new.add(s.stock_code)
                         added.append(s)
 
                 if added:
                     await self._db.executemany(
                         "INSERT INTO sector_stocks "
-                        "(pick_id, sector_name, stock_code, stock_name, added_order) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order)
+                        "(pick_id, sector_name, stock_code, stock_name, added_order, "
+                        "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+                        "tracking_status, tracking_start_date, tracking_end_date) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order,
+                          s.is_repick, s.prev_pick_id, s.days_since_last_pick, s.total_pick_count,
+                          s.tracking_status, s.tracking_start_date, s.tracking_end_date)
                          for s in added],
                     )
 
@@ -268,20 +353,39 @@ class SectorStore:
                 if pick_id is None:
                     raise RuntimeError("lastrowid missing after sector_picks insert")
 
-                for i, s in enumerate(stocks, start=1):
-                    s.added_order = i
+                seen_in_batch: set[str] = set()
+                stocks_deduped: list[SectorStock] = []
+                for s in stocks:
+                    if s.stock_code not in seen_in_batch:
+                        seen_in_batch.add(s.stock_code)
+                        stocks_deduped.append(s)
 
-                if stocks:
+                for i, s in enumerate(stocks_deduped, start=1):
+                    s.added_order = i
+                    meta = await self._compute_repick_metadata(s.stock_code, pick_created_at_iso)
+                    s.is_repick = meta["is_repick"]
+                    s.prev_pick_id = meta["prev_pick_id"]
+                    s.days_since_last_pick = meta["days_since_last_pick"]
+                    s.total_pick_count = meta["total_pick_count"]
+                    s.tracking_status = "active"
+                    s.tracking_start_date = pick_created_at_iso
+                    s.tracking_end_date = tracking_end_date_iso
+
+                if stocks_deduped:
                     await self._db.executemany(
                         "INSERT INTO sector_stocks "
-                        "(pick_id, sector_name, stock_code, stock_name, added_order) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order)
-                         for s in stocks],
+                        "(pick_id, sector_name, stock_code, stock_name, added_order, "
+                        "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+                        "tracking_status, tracking_start_date, tracking_end_date) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [(pick_id, s.sector_name, s.stock_code, s.stock_name, s.added_order,
+                          s.is_repick, s.prev_pick_id, s.days_since_last_pick, s.total_pick_count,
+                          s.tracking_status, s.tracking_start_date, s.tracking_end_date)
+                         for s in stocks_deduped],
                     )
 
-                added = list(stocks)
-                total = len(stocks)
+                added = list(stocks_deduped)
+                total = len(stocks_deduped)
 
             await self._db.execute("COMMIT")
 
@@ -328,7 +432,9 @@ class SectorStore:
         if not self._db:
             return []
         cur = await self._db.execute(
-            "SELECT id, pick_id, sector_name, stock_code, stock_name, added_order "
+            "SELECT id, pick_id, sector_name, stock_code, stock_name, added_order, "
+            "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+            "tracking_status, tracking_start_date, tracking_end_date "
             "FROM sector_stocks WHERE pick_id = ? "
             "ORDER BY added_order",
             (pick_id,),
@@ -342,6 +448,13 @@ class SectorStore:
                 stock_code=r[3],
                 stock_name=r[4],
                 added_order=r[5],
+                is_repick=r[6] or 0,
+                prev_pick_id=r[7],
+                days_since_last_pick=r[8],
+                total_pick_count=r[9] or 1,
+                tracking_status=r[10] or "active",
+                tracking_start_date=r[11],
+                tracking_end_date=r[12],
             )
             for r in rows
         ]
@@ -352,7 +465,9 @@ class SectorStore:
         if not self._db:
             return []
         cur = await self._db.execute(
-            "SELECT id, pick_id, sector_name, stock_code, stock_name, added_order "
+            "SELECT id, pick_id, sector_name, stock_code, stock_name, added_order, "
+            "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+            "tracking_status, tracking_start_date, tracking_end_date "
             "FROM sector_stocks WHERE pick_id = ? AND sector_name = ? "
             "ORDER BY added_order",
             (pick_id, sector_name),
@@ -366,6 +481,13 @@ class SectorStore:
                 stock_code=r[3],
                 stock_name=r[4],
                 added_order=r[5],
+                is_repick=r[6] or 0,
+                prev_pick_id=r[7],
+                days_since_last_pick=r[8],
+                total_pick_count=r[9] or 1,
+                tracking_status=r[10] or "active",
+                tracking_start_date=r[11],
+                tracking_end_date=r[12],
             )
             for r in rows
         ]

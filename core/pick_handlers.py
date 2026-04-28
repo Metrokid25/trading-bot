@@ -215,19 +215,27 @@ def _build_handlers(store: SectorStore, master: StockMaster):
 
         resolved: dict[str, list[SectorStock]] = {}
         failed: list[str] = []
+        skipped_duplicates: list[str] = []
+        seen_codes: set[str] = set()
         order = 0
         for (sector, name), res in zip(flat, results):
             if isinstance(res, Exception) or res is None:
                 failed.append(name)
                 continue
             code, resolved_name = res
+            display_name = resolved_name or name
+            if code in seen_codes:
+                logger.info("중복 stock_code skip: %s (이미 같은 /p 세션에 등록됨)", code)
+                skipped_duplicates.append(display_name)
+                continue
+            seen_codes.add(code)
             order += 1
             resolved.setdefault(sector, []).append(
                 SectorStock(
                     pick_id=0,  # insert_pick 이후 DB row엔 실제 pick_id 기록됨
                     sector_name=sector,
                     stock_code=code,
-                    stock_name=resolved_name or name,
+                    stock_name=display_name,
                     added_order=order,
                 )
             )
@@ -246,6 +254,10 @@ def _build_handlers(store: SectorStore, master: StockMaster):
         if failed:
             msg_lines.append(f"⚠️ 변환 실패 ({len(failed)}종목): {', '.join(failed)}")
             msg_lines.append("위 종목명을 수정 후 다시 /p 명령하십시오.")
+            msg_lines.append("")
+
+        if skipped_duplicates:
+            msg_lines.append(f"⚠️ 중복 skip ({len(skipped_duplicates)}종목): {', '.join(skipped_duplicates)}")
             msg_lines.append("")
 
         for sector_name, stocks in resolved.items():

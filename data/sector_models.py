@@ -48,6 +48,13 @@ class SectorStock:
     stock_name: str
     added_order: int
     id: int | None = None
+    is_repick: int = 0
+    prev_pick_id: int | None = None
+    days_since_last_pick: int | None = None
+    total_pick_count: int = 1
+    tracking_status: str = "active"
+    tracking_start_date: str | None = None
+    tracking_end_date: str | None = None
 
 
 @dataclass
