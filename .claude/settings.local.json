@@ -1,7 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)",
       "Bash(pip install:*)",
       "Bash(notepad .env:*)",
       "Bash(gh auth:*)",
