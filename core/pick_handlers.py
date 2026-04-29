@@ -263,7 +263,9 @@ def _build_handlers(store: SectorStore, master: StockMaster):
 
         for sector_name, stocks in resolved.items():
             try:
-                result = await store.upsert_sector(sector_name, stocks, pick_template)
+                result = await store.upsert_sector(
+                    sector_name, stocks, pick_template, record_pick_event=True
+                )
                 msg_lines.append(_format_upsert_sector(sector_name, result, pick_template))
             except Exception:
                 logger.exception("upsert_sector 실패 sector=%s", sector_name)

@@ -283,3 +283,60 @@ async def test_backdated_pick_gap_uses_pick_date(store: SectorStore):
     assert r2[6] == 10               # trading_days_since (화 4/15 → 화 4/29)
     assert r2[7] == 2                # total_sector_pick_count
     assert r2[8] == "2026-04-29"     # pick_date
+
+
+# ---------- TC-Integration1: upsert_sector 경로 end-to-end 통합 ----------
+
+@pytest.mark.asyncio
+async def test_integration_upsert_two_picks_repick_marked(store: SectorStore):
+    """upsert_sector(record_pick_event=True) 두 번 → sector_pick_events 2행, 두 번째 재픽업."""
+    pick1 = _pick("2026-04-21")
+    pick2 = _pick("2026-04-28", offset_hours=1)
+
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        pick1,
+        record_pick_event=True,
+    )
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        pick2,
+        record_pick_event=True,
+    )
+
+    rows = await _get_events(store, "반도체")
+    assert len(rows) == 2
+
+    r1, r2 = rows
+    assert r1[3] == 0               # is_sector_repick: 첫 픽
+    assert r1[8] == "2026-04-21"    # pick_date
+
+    assert r2[3] == 1               # is_sector_repick: 재픽업
+    assert r2[4] == r1[0]           # prev_event_id → 첫 번째 event_id
+    assert r2[5] == 7               # days_since (4/21 → 4/28)
+    assert r2[6] == 5               # trading_days_since (월→월 한 주)
+    assert r2[7] == 2               # total_sector_pick_count
+    assert r2[8] == "2026-04-28"    # pick_date
+
+
+# ---------- TC-Integration2: record_pick_event=False → sector_pick_events 0행 ----------
+
+@pytest.mark.asyncio
+async def test_integration_no_event_record_pick_event_false(store: SectorStore):
+    """record_pick_event=False(기본값): upsert_sector 경로로 호출해도 sector_pick_events 0행."""
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        _pick("2026-04-21"),
+        record_pick_event=False,
+    )
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        _pick("2026-04-28", offset_hours=1),
+        record_pick_event=False,
+    )
+    rows = await _get_events(store)
+    assert len(rows) == 0
