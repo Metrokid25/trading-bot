@@ -112,6 +112,10 @@ def run_migrations(db_path: str, migrations: list, *, backup: bool = True) -> No
 
 if __name__ == "__main__":
     from config.settings import settings
-    from scripts.migrations import m001_phase25_tracking
+    from scripts.migrations import m001_phase25_tracking, m002_sector_repick_trading_days
 
-    run_migrations(str(settings.DB_PATH), [m001_phase25_tracking], backup=True)
+    run_migrations(
+        str(settings.DB_PATH),
+        [m001_phase25_tracking, m002_sector_repick_trading_days],
+        backup=True,
+    )
