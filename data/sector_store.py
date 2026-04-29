@@ -183,43 +183,44 @@ class SectorStore:
         self,
         sector_name: str,
         registered_at_kst: str,
+        pick_date: date,
     ) -> int:
         """sector_pick_events에 이벤트를 INSERT하고 새 event_id를 반환한다.
 
         호출자의 트랜잭션 안에서 실행된다 — 자체 commit 금지.
+        gap 계산 기준: 직전 이벤트의 pick_date (NULL이면 첫 픽으로 처리).
         """
         cur = await self._db.execute(
-            "SELECT event_id, registered_at_kst, total_sector_pick_count "
+            "SELECT event_id, pick_date, total_sector_pick_count "
             "FROM sector_pick_events "
             "WHERE sector_name = ? "
-            "ORDER BY registered_at_kst DESC, event_id DESC LIMIT 1",
+            "ORDER BY pick_date DESC, event_id DESC LIMIT 1",
             (sector_name,),
         )
         prev_row = await cur.fetchone()
 
-        if prev_row is None:
+        if prev_row is None or prev_row[1] is None:
             is_sector_repick = 0
             prev_event_id = None
             days_since = None
             trading_days_since = None
-            total_count = 1
+            total_count = 1 if prev_row is None else prev_row[2] + 1
         else:
-            prev_event_id, prev_registered_at_kst, prev_total_count = prev_row
+            prev_event_id, prev_pick_date_str, prev_total_count = prev_row
             is_sector_repick = 1
-            start_date = date.fromisoformat(prev_registered_at_kst[:10])
-            end_date = date.fromisoformat(registered_at_kst[:10])
-            days_since = (end_date - start_date).days
-            trading_days_since = count_trading_days_between(start_date, end_date)
+            prev_pick_date = date.fromisoformat(prev_pick_date_str)
+            days_since = (pick_date - prev_pick_date).days
+            trading_days_since = count_trading_days_between(prev_pick_date, pick_date)
             total_count = prev_total_count + 1
 
         cur2 = await self._db.execute(
             "INSERT INTO sector_pick_events "
-            "(sector_name, registered_at_kst, is_sector_repick, prev_event_id, "
+            "(sector_name, registered_at_kst, pick_date, is_sector_repick, prev_event_id, "
             "days_since_last_sector_pick, trading_days_since_last_sector_pick, "
             "total_sector_pick_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sector_name, registered_at_kst, is_sector_repick, prev_event_id,
-             days_since, trading_days_since, total_count),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sector_name, registered_at_kst, pick_date.isoformat(), is_sector_repick,
+             prev_event_id, days_since, trading_days_since, total_count),
         )
         event_id = cur2.lastrowid
         if event_id is None:
@@ -434,7 +435,9 @@ class SectorStore:
                 total = len(stocks_deduped)
 
             if record_pick_event:
-                await self._record_sector_pick_event(sector_name, pick_created_at_iso)
+                await self._record_sector_pick_event(
+                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date)
+                )
 
             await self._db.execute("COMMIT")
 
