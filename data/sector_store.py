@@ -12,7 +12,7 @@ import aiosqlite
 from loguru import logger
 
 from config import settings
-from core.market_calendar import add_trading_days
+from core.market_calendar import add_trading_days, count_trading_days_between
 from core.time_utils import now_kst, to_db_iso
 from data.sector_models import PickStatus, SectorPick, SectorStock, UpsertResult
 
@@ -179,6 +179,53 @@ class SectorStore:
             )
         logger.info("[sector_store] sector_stocks repick 마이그레이션 완료")
 
+    async def _record_sector_pick_event(
+        self,
+        sector_name: str,
+        registered_at_kst: str,
+    ) -> int:
+        """sector_pick_events에 이벤트를 INSERT하고 새 event_id를 반환한다.
+
+        호출자의 트랜잭션 안에서 실행된다 — 자체 commit 금지.
+        """
+        cur = await self._db.execute(
+            "SELECT event_id, registered_at_kst, total_sector_pick_count "
+            "FROM sector_pick_events "
+            "WHERE sector_name = ? "
+            "ORDER BY registered_at_kst DESC, event_id DESC LIMIT 1",
+            (sector_name,),
+        )
+        prev_row = await cur.fetchone()
+
+        if prev_row is None:
+            is_sector_repick = 0
+            prev_event_id = None
+            days_since = None
+            trading_days_since = None
+            total_count = 1
+        else:
+            prev_event_id, prev_registered_at_kst, prev_total_count = prev_row
+            is_sector_repick = 1
+            start_date = date.fromisoformat(prev_registered_at_kst[:10])
+            end_date = date.fromisoformat(registered_at_kst[:10])
+            days_since = (end_date - start_date).days
+            trading_days_since = count_trading_days_between(start_date, end_date)
+            total_count = prev_total_count + 1
+
+        cur2 = await self._db.execute(
+            "INSERT INTO sector_pick_events "
+            "(sector_name, registered_at_kst, is_sector_repick, prev_event_id, "
+            "days_since_last_sector_pick, trading_days_since_last_sector_pick, "
+            "total_sector_pick_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sector_name, registered_at_kst, is_sector_repick, prev_event_id,
+             days_since, trading_days_since, total_count),
+        )
+        event_id = cur2.lastrowid
+        if event_id is None:
+            raise RuntimeError("lastrowid missing after sector_pick_events insert")
+        return event_id
+
     async def _compute_repick_metadata(
         self,
         stock_code: str,
@@ -261,6 +308,7 @@ class SectorStore:
         sector_name: str,
         stocks: list[SectorStock],
         pick_template: SectorPick,
+        record_pick_event: bool = False,
     ) -> UpsertResult:
         """섹터 단위 UPSERT: 동일 sector_name의 활성 픽이 있으면 종목만 추가, 없으면 새 픽 생성."""
         if not self._db:
@@ -384,6 +432,9 @@ class SectorStore:
 
                 added = list(stocks_deduped)
                 total = len(stocks_deduped)
+
+            if record_pick_event:
+                await self._record_sector_pick_event(sector_name, pick_created_at_iso)
 
             await self._db.execute("COMMIT")
 

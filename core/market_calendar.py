@@ -38,3 +38,15 @@ def is_trading_day(d: date) -> bool:
     """Check if the given date is a KRX trading day."""
     schedule = _KRX.schedule(start_date=d, end_date=d)
     return len(schedule) > 0
+
+
+def count_trading_days_between(start_date: date, end_date: date) -> int:
+    """Count KRX trading days in (start_date, end_date] — exclusive start, inclusive end.
+
+    Returns 0 if end_date <= start_date (same day or reversed order).
+    """
+    if end_date <= start_date:
+        return 0
+    schedule = _KRX.schedule(start_date=start_date, end_date=end_date)
+    trading_days = schedule.index.date
+    return sum(1 for d in trading_days if d > start_date)
