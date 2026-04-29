@@ -434,17 +434,31 @@ class SectorStore:
                 added = list(stocks_deduped)
                 total = len(stocks_deduped)
 
-            if record_pick_event:
-                await self._record_sector_pick_event(
-                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date)
-                )
-
             await self._db.execute("COMMIT")
 
         except Exception:
             await self._db.execute("ROLLBACK")
             logger.exception("upsert_sector failed, rolled back (sector=%s)", sector_name)
             raise
+
+        # 본 트랜잭션 COMMIT 성공 후, 이벤트 기록은 best-effort (실패해도 픽 저장 유지)
+        if record_pick_event:
+            try:
+                await self._db.execute("BEGIN")
+                await self._record_sector_pick_event(
+                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date)
+                )
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                logger.warning(
+                    "sector_pick_event 기록 실패 (sector=%s) — 픽 저장은 유지됨",
+                    sector_name,
+                    exc_info=True,
+                )
 
         return UpsertResult(
             pick_id=pick_id,

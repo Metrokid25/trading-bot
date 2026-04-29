@@ -340,3 +340,111 @@ async def test_integration_no_event_record_pick_event_false(store: SectorStore):
     )
     rows = await _get_events(store)
     assert len(rows) == 0
+
+
+# ---------- TC-Integration3: 이벤트 기록 실패해도 픽 저장은 유지 (H1 격리 검증) ----------
+
+@pytest.mark.asyncio
+async def test_integration_event_failure_does_not_rollback_pick(store: SectorStore):
+    """sector_pick_events 테이블 없으면 이벤트 기록 실패하지만 픽 저장은 유지."""
+    from loguru import logger as _logger
+    await store._db.execute("DROP TABLE IF EXISTS sector_pick_events")
+
+    warning_messages: list[str] = []
+    sink_id = _logger.add(
+        lambda msg: warning_messages.append(msg.record["message"]),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        result = await store.upsert_sector(
+            "반도체",
+            [_stock("반도체", "005930", "삼성전자")],
+            _pick("2026-04-21"),
+            record_pick_event=True,
+        )
+    finally:
+        _logger.remove(sink_id)
+
+    # 픽은 저장됨 (예외 전파 없음)
+    assert result.pick_id is not None
+    cur = await store._db.execute("SELECT COUNT(*) FROM sector_picks")
+    assert (await cur.fetchone())[0] == 1
+
+    # warning 로그 발생 확인 (loguru sink 직접 캡처)
+    assert any("sector_pick_event 기록 실패" in m for m in warning_messages)
+
+
+# ---------- TC-Integration4: 별도 트랜잭션 분리 후 정상 케이스 회귀 ----------
+
+@pytest.mark.asyncio
+async def test_integration_separate_tx_two_picks_repick_marked(store: SectorStore):
+    """best-effort 분리 후에도 두 번 호출 시 sector_pick_events 2행 + 재픽업 마킹 정상."""
+    pick1 = _pick("2026-04-21")
+    pick2 = _pick("2026-04-28", offset_hours=1)
+
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        pick1,
+        record_pick_event=True,
+    )
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "000660", "SK하이닉스")],
+        pick2,
+        record_pick_event=True,
+    )
+
+    rows = await _get_events(store, "반도체")
+    assert len(rows) == 2
+    r1, r2 = rows
+    assert r1[3] == 0               # is_sector_repick: 첫 픽
+    assert r1[8] == "2026-04-21"
+    assert r2[3] == 1               # is_sector_repick: 재픽업
+    assert r2[4] == r1[0]           # prev_event_id 연결
+    assert r2[5] == 7               # days_since
+    assert r2[6] == 5               # trading_days_since
+    assert r2[8] == "2026-04-28"
+
+
+# ---------- TC-Integration5: pick_date 형식 오류 시 픽 저장은 유지 (M3 부분 해소) ----------
+
+@pytest.mark.asyncio
+async def test_integration_bad_pick_date_format_does_not_rollback_pick(store: SectorStore):
+    """pick_date 형식 오류('2026/04/29')로 fromisoformat 실패해도 픽 저장은 유지."""
+    from loguru import logger as _logger
+    kst = ZoneInfo("Asia/Seoul")
+    bad_pick = SectorPick(
+        pick_date="2026/04/29",  # 잘못된 형식 — date.fromisoformat() 실패 유도
+        created_at=datetime(2026, 4, 29, 9, 0, 0, tzinfo=kst),
+        expires_at=datetime(2026, 4, 29, 9, 0, 0, tzinfo=kst) + timedelta(days=7),
+    )
+
+    warning_messages: list[str] = []
+    sink_id = _logger.add(
+        lambda msg: warning_messages.append(msg.record["message"]),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        result = await store.upsert_sector(
+            "반도체",
+            [_stock("반도체", "005930", "삼성전자")],
+            bad_pick,
+            record_pick_event=True,
+        )
+    finally:
+        _logger.remove(sink_id)
+
+    # 픽은 저장됨 (예외 전파 없음)
+    assert result.pick_id is not None
+    cur = await store._db.execute("SELECT COUNT(*) FROM sector_picks")
+    assert (await cur.fetchone())[0] == 1
+
+    # warning 로그 발생 확인 (loguru sink 직접 캡처)
+    assert any("sector_pick_event 기록 실패" in m for m in warning_messages)
+
+    # sector_pick_events는 0행
+    rows = await _get_events(store)
+    assert len(rows) == 0
