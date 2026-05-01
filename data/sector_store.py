@@ -191,27 +191,32 @@ class SectorStore:
         gap 계산 기준: 직전 이벤트의 pick_date (NULL이면 첫 픽으로 처리).
         """
         cur = await self._db.execute(
-            "SELECT event_id, pick_date, total_sector_pick_count "
+            "SELECT event_id, pick_date "
             "FROM sector_pick_events "
-            "WHERE sector_name = ? "
+            "WHERE sector_name = ? AND pick_date IS NOT NULL AND pick_date < ? "
             "ORDER BY pick_date DESC, event_id DESC LIMIT 1",
-            (sector_name,),
+            (sector_name, pick_date.isoformat()),
         )
         prev_row = await cur.fetchone()
 
-        if prev_row is None or prev_row[1] is None:
+        cur_total = await self._db.execute(
+            "SELECT COALESCE(MAX(total_sector_pick_count), 0) "
+            "FROM sector_pick_events WHERE sector_name = ?",
+            (sector_name,),
+        )
+        total_count = (await cur_total.fetchone())[0] + 1
+
+        if prev_row is None:
             is_sector_repick = 0
             prev_event_id = None
             days_since = None
             trading_days_since = None
-            total_count = 1 if prev_row is None else prev_row[2] + 1
         else:
-            prev_event_id, prev_pick_date_str, prev_total_count = prev_row
+            prev_event_id, prev_pick_date_str = prev_row
             is_sector_repick = 1
             prev_pick_date = date.fromisoformat(prev_pick_date_str)
             days_since = (pick_date - prev_pick_date).days
             trading_days_since = count_trading_days_between(prev_pick_date, pick_date)
-            total_count = prev_total_count + 1
 
         cur2 = await self._db.execute(
             "INSERT INTO sector_pick_events "

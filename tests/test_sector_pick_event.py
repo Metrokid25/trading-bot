@@ -149,7 +149,8 @@ async def test_repick_one_full_week(store: SectorStore):
 
 @pytest.mark.asyncio
 async def test_repick_same_day(store: SectorStore):
-    """같은 날 두 번 픽: days=0, trading_days=0."""
+    """같은 날 두 번 픽: pick_date < ? 조건으로 동일 날짜 prev 미참조 → is_repick=0, days=NULL.
+    total_count는 MAX 기반 누적이므로 2."""
     id1 = await store._record_sector_pick_event(
         "반도체", _ts("2026-04-21"), date(2026, 4, 21)
     )
@@ -158,11 +159,11 @@ async def test_repick_same_day(store: SectorStore):
     )
     rows = await _get_events(store, "반도체")
     r2 = rows[1]
-    assert r2[3] == 1                # is_sector_repick
-    assert r2[4] == id1              # prev_event_id
-    assert r2[5] == 0                # days_since_last_sector_pick
-    assert r2[6] == 0                # trading_days_since_last_sector_pick
-    assert r2[7] == 2                # total_sector_pick_count
+    assert r2[3] == 0                # is_sector_repick: 동일 날짜 prev 미참조
+    assert r2[4] is None             # prev_event_id
+    assert r2[5] is None             # days_since_last_sector_pick
+    assert r2[6] is None             # trading_days_since_last_sector_pick
+    assert r2[7] == 2                # total_sector_pick_count (MAX 누적)
 
 
 # ---------- TC5: 다른 섹터 이벤트가 끼어 있어도 자기 섹터만 참조 ----------
@@ -448,3 +449,56 @@ async def test_integration_bad_pick_date_format_does_not_rollback_pick(store: Se
     # sector_pick_events는 0행
     rows = await _get_events(store)
     assert len(rows) == 0
+
+
+# ---------- TC-Integration6: H2 백데이팅 픽 — days_since 음수 방지 ----------
+
+@pytest.mark.asyncio
+async def test_integration6_backdating_no_negative_days(store: SectorStore):
+    """H2: 미래 pick_date 행이 prev로 잡혀 days_since 음수가 되지 않는다."""
+    # 먼저 pick_date=2026-04-30 이벤트 기록
+    await store._record_sector_pick_event(
+        "반도체", _ts("2026-04-30"), date(2026, 4, 30)
+    )
+
+    # 이후 백데이팅 픽: pick_date=2026-04-25 (이미 등록된 4/30보다 과거)
+    await store._record_sector_pick_event(
+        "반도체", _ts("2026-05-01"), date(2026, 4, 25)
+    )
+
+    rows = await _get_events(store, "반도체")
+    assert len(rows) == 2
+    r2 = rows[1]  # event_id 순서 기준 두 번째 = 백데이팅 픽
+    # days_since는 NULL이거나 양수 — 절대 음수 아님
+    assert r2[5] is None or r2[5] >= 0
+
+
+# ---------- TC-Integration7: H3 NULL 행 제외 + total_count 누적 확인 ----------
+
+@pytest.mark.asyncio
+async def test_integration7_null_pick_date_excluded_and_count_accumulated(store: SectorStore):
+    """H3: pick_date=NULL 행은 prev 조회에서 제외, days_since=NULL.
+    total_count는 NULL 행 포함 MAX+1로 누적되어야 한다."""
+    # 마이그레이션 이전 데이터 시뮬레이션: pick_date=NULL 행 직접 INSERT
+    await store._db.execute(
+        "INSERT INTO sector_pick_events "
+        "(sector_name, registered_at_kst, is_sector_repick, total_sector_pick_count) "
+        "VALUES (?, ?, ?, ?)",
+        ("반도체", _ts("2026-04-01"), 0, 1),
+    )
+
+    # 정상 픽 등록 (upsert_sector 경로로 통합 검증)
+    await store.upsert_sector(
+        "반도체",
+        [_stock("반도체", "005930", "삼성전자")],
+        _pick("2026-04-21"),
+        record_pick_event=True,
+    )
+
+    rows = await _get_events(store, "반도체")
+    assert len(rows) == 2
+    r2 = rows[1]
+    assert r2[3] == 0      # is_sector_repick = 0 (NULL 행이 prev로 잡히지 않음)
+    assert r2[4] is None   # prev_event_id = None
+    assert r2[5] is None   # days_since = None
+    assert r2[7] == 2      # total_sector_pick_count: NULL 행(count=1) 포함 MAX+1
