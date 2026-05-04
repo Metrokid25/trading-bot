@@ -441,3 +441,79 @@ tracking_status, tracking_start_date, tracking_end_date
 
 ### 다음 단계
 Phase 2.5 작업 2번: /add 핸들러에 재픽업 마킹 로직 추가
+
+---
+
+## 2026-04-29 Phase 2.5 작업 2번 완료: /p 핸들러 재픽업 마킹 로직
+
+### 결정 사항
+- pandas_market_calendars 도입 — 거래일 수 계산에 사용
+- repick 마킹 로직: 섹터별 cross-sector dedup + pick_date 기준 정렬 채택
+- Codex adversarial review HIGH 2건 수정 완료
+  - cross-sector dedup 데이터 손상 버그 수정
+  - pick_date 기준 정렬 버그 수정
+
+### 추가된 파일 / 변경
+- deps: pandas_market_calendars 추가
+- core/market_calendar.py — 거래일 수 계산 유틸
+- /p 핸들러 — 재픽업 마킹 + cross-sector dedup 정렬 로직
+
+### 검증 완료
+- pytest 73 passed (커밋: ac7ba33)
+- 수동 검증 7/7 PASS
+
+### 다음 단계
+Phase 2.5 작업 3번: sector_pick_events 섹터 재픽업 추적
+
+---
+
+## 2026-05-01 Phase 2.5 작업 3번 완료: 섹터 재픽업 추적 (sector_pick_events)
+
+### 커밋 목록 (7개)
+- 87a46bd: db — m002 마이그레이션 (trading_days_since_last_sector_pick 컬럼)
+- 1270c1b: feat — SectorStore._record_sector_pick_event 헬퍼 + core/market_calendar.count_trading_days_between
+- 4d7d4e6: db — m003 마이그레이션 (pick_date 컬럼)
+- 2917003: feat — gap 계산 기준을 registered_at_kst → pick_date로 전환
+- 08c2ccf: feat — core/pick_handlers.py:266 호출 사이트 record_pick_event=True + TC-Integration1·2
+- 2c508ae: fix — B2-D1: _record_sector_pick_event 트랜잭션 분리, best-effort (H1)
+- 67b82fb: fix — B2-D2: pick_date < ? AND IS NOT NULL, total_count MAX 누적 (H2/H3)
+
+### 사양 결정 (작업 4/5/6/7번에서도 참조)
+- prev lookup 정책: pick_date < ? AND pick_date IS NOT NULL (같은 날/미래/NULL 제외)
+- total_count 계산: COALESCE(MAX(total_sector_pick_count), 0) + 1 (NULL 행 포함 누적)
+
+### 격리 원칙 (불변식 #8)
+추적 모듈은 본 기능(/p 픽 등록)과 격리 — 추적 데이터 기록 실패해도 본 기능 저장 유지.
+_record_sector_pick_event는 best-effort, 트랜잭션 분리로 구현.
+
+### 검증 완료
+- Codex adversarial review B2-D1 + B2-D2 둘 다 통과 (no material findings)
+- TC-Integration1·2 신규 통과
+
+### 백로그 (작업 3번 이월)
+- M1: fresh DB crash — 사전 마이그레이션 미적용 상태에서 _record_sector_pick_event 호출 시
+- M3: pick_date 형식 strict 검증 부재
+- M5: 마이그레이션 down 미구현
+- L1: 추적 모듈 격리 convention-only (코드 레벨 강제 없음)
+- L2: 테스트 공백 (sector_pick_events 단독 테스트 부족)
+
+### 다음 단계
+Phase 2.5 작업 4번: D+N 일봉 추적 (pick_daily_tracking) — 사양 결정 후 단계 분할
+
+---
+
+## Phase 2.5 작업 4번 사양 결정 항목 (시작 전 합의 필요)
+
+**목표**: sector_pick_events 픽 기록 후 D+1 ~ D+N일 동안 픽 섹터 종목 일봉 OHLCV 자동 수집해서 pick_daily_tracking 적재.
+
+### 결정 필요 항목 7개
+1. N (추적 일수): 7일 / 10일 / 20일?
+2. 추적 대상: 섹터 전체 종목 / 픽 시점 sector_stocks 종목만?
+3. 일봉 수집 시점: 장 마감 후(15:30) 일괄 / 다음날 장 시작 전(08:30)?
+4. KIS API: 실전 서버 사용 (시세 ENV 분기 무관)
+5. 실패 처리: 재시도 정책 + 영구 실패 마킹 기준
+6. 격리: sector_detector 알림 로직과 격리 (불변식 #8)
+7. 마이그레이션: pick_daily_tracking 스키마 (event_id FK, ticker, trade_date, OHLCV, status)
+
+### 다음 단계
+Phase 2.5 작업 4번: D+N 일봉 추적 (pick_daily_tracking) — 사양 결정 후 단계 분할
