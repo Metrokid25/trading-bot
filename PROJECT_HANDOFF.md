@@ -1,8 +1,8 @@
 # 트레이딩봇 핸드오프 문서
 
 > 다음 AI 세션이 이 프로젝트를 즉시 이해하고 이어받기 위한 기술 문서.
-> 마지막 업데이트: 2026-04-25
-> 기준 커밋: `b5eafe0 fix(alerts): persist alert before telegram delivery`
+> 마지막 업데이트: 2026-05-06
+> 기준 커밋: `a749e87 feat(phase2.5): D2 add fetch_daily_candles_for_pick adapter`
 
 ---
 
@@ -517,3 +517,52 @@ Phase 2.5 작업 4번: D+N 일봉 추적 (pick_daily_tracking) — 사양 결정
 
 ### 다음 단계
 Phase 2.5 작업 4번: D+N 일봉 추적 (pick_daily_tracking) — 사양 결정 후 단계 분할
+
+---
+
+## 2026-05-06 Phase 2.5 작업 4번 D1·D2 완료: m004 마이그레이션 + KIS 일봉 어댑터
+
+### 단계 분할표
+
+| 단계 | 내용 | 커밋 |
+|---|---|---|
+| ✅ D1 | m004 마이그레이션 (status/retry_count/event_id 컬럼 추가) | 52fdc75 |
+| ✅ D2 | KIS 일봉 어댑터 (DailyOHLCV + fetch_daily_candles_for_pick) | a749e87 |
+| 🔜 D3 | DailyTracker 모듈 (수집 로직 + best-effort + DB 적재) | — |
+| 🔜 D4 | 16:00 KST 스케줄러 + 통합 테스트 | — |
+| 🔜 D5 | 재시도 정책 + 영구 실패 마킹 | — |
+| 🔜 D6 | Codex adversarial review + fix | — |
+
+### D2 결정사항 (작업 4 진행 중 확정)
+
+- **모듈 위치**: `core/daily_tracker.py` 신규. `core/kis_api.py` 확장 안 함 — `get_daily_candles()` 이미 존재하므로 재사용
+- **DailyOHLCV dataclass**: `trade_date(str 'YYYY-MM-DD')`, `open/high/low/close(int)`, `volume(int)`, `value(int 거래대금 KRW)`
+  - 정수형 이유: KIS 응답이 원 단위 정수 문자열로 옴, 소수 없음
+  - `trade_date` 형식: `pick_daily_tracking` 스키마(m004)와 일관성
+- **재시도 정책**: KIS 4회 재시도 내장 + DailyTracker는 일별 1회 시도, 3일 연속 실패 → `failed_perm` (D5에서 구현)
+- **rt_cd 체계적 처리**: 별도 위생 작업으로 분리. D2에서는 TODO 주석만
+- **호출 단위**: D+0 포함, 20일 캘린더 범위 KIS 일괄 호출, incremental + 실패 재시도 결합
+- **KIS 서버**: 시세 API 불변식 유지 — 항상 REAL 서버 (`_real_client` 고정, `get_daily_candles` 그대로 사용)
+
+### D2 산출물
+
+- `core/daily_tracker.py` 89줄 — `DailyOHLCV` (frozen, slots) + `fetch_daily_candles_for_pick`
+- `tests/test_daily_tracker.py` 153줄 — 16 cases (parametrize 포함)
+- commit: a749e87
+
+### D2 검증
+
+- `pytest tests/test_daily_tracker.py`: **16 passed in 0.10s**
+- 회귀: 기존 test_indicators 3 + test_risk 2 동일 통과. 본 변경으로 인한 회귀 없음
+- 참고: `pandas_market_calendars` 미설치 환경에서 5개 모듈 collection error — 기존 환경 문제, 본 변경 무관
+- 불변식 8개 영향 없음 (core/kis_api.py 미수정, DB INSERT 없음, 스케줄러 없음)
+
+### 다음 (D3 사양 결정 항목)
+
+D3 시작 전 형이 결정해야 할 항목:
+
+1. **추적 대상 종목 로딩**: `sector_pick_events`에서 어떻게 끌어올지 — `event_id` 기준? `sector_pick_id` 기준? `sector_stocks` JOIN?
+2. **INSERT 정책**: 픽 등록 직후 D+0~D+20 빈 행 21개 미리 생성? vs 수집 성공 시마다 INSERT?
+3. **UPSERT 충돌 키**: `event_id + ticker + trade_date`? `stock_pick_id + trading_day`?
+4. **best-effort 격리**: 추적 모듈 실패가 본 기능 저장에 영향 없도록 (작업 3번 패턴 동일하게)
+5. **D3 입력 인터페이스**: DailyTracker가 받을 입력 — 어디서 호출되는가? D4 스케줄러에서만? D3는 함수 정의만?
