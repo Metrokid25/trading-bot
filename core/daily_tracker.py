@@ -267,7 +267,7 @@ class DailyTracker:
                          return_vs_pick, return_vs_prev_close,
                          status, event_id, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?)
-                    ON CONFLICT(stock_pick_id, trading_day) DO UPDATE SET
+                    ON CONFLICT(event_id, stock_pick_id, trading_day) DO UPDATE SET
                         open                 = excluded.open,
                         high                 = excluded.high,
                         low                  = excluded.low,
@@ -276,8 +276,7 @@ class DailyTracker:
                         transaction_amount   = excluded.transaction_amount,
                         return_vs_pick       = excluded.return_vs_pick,
                         return_vs_prev_close = excluded.return_vs_prev_close,
-                        status               = 'success',
-                        event_id             = COALESCE(event_id, excluded.event_id)
+                        status               = 'success'
                     """,
                     (
                         stock_pick_id, target_date_str, day_offset,

@@ -65,8 +65,8 @@ _DDL_STATEMENTS = [
         created_at           TEXT    NOT NULL,
         status               TEXT    NOT NULL DEFAULT 'pending',
         retry_count          INTEGER NOT NULL DEFAULT 0,
-        event_id             INTEGER REFERENCES sector_pick_events(event_id),
-        UNIQUE(stock_pick_id, trading_day)
+        event_id             INTEGER NOT NULL REFERENCES sector_pick_events(event_id),
+        UNIQUE(event_id, stock_pick_id, trading_day)
     )
     """,
 ]
@@ -387,29 +387,29 @@ async def test_collect_daily_false_when_no_target_date(db_path):
 
 
 # ---------------------------------------------------------------------------
-# TC10: COALESCE — 기존 event_id 있으면 새 event_id로 덮지 않음
+# TC10: multi-event 격리 — 같은 stock_pick_id+trading_day에 다른 event_id 행 공존 가능
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_collect_daily_coalesce_keeps_existing_event_id(db_path):
+async def test_collect_daily_multi_event_isolation(db_path):
+    """동일한 종목+날짜라도 event_id가 다르면 별도 행으로 격리 저장.
+
+    Codex 적대적 리뷰 회귀 방지: 한 event의 수집이 다른 event 행을 silently
+    덮어쓰지 않음을 검증.
+    """
     pick_date = "2026-05-06"
     target_date = date(2026, 5, 7)
-    event_id = _insert_event(db_path, "반도체", pick_date, [("005930", "삼성전자")])
 
+    # 같은 섹터·같은 pick_date로 두 개의 event 등록 (재픽업 시뮬레이션)
+    event_a = _insert_event(db_path, "반도체", pick_date, [("005930", "삼성전자")])
+    # 두 번째 event는 sector_pick_events만 추가 (같은 stock_pick_id 공유)
     conn = sqlite3.connect(db_path)
-    spid = conn.execute(
-        "SELECT id FROM sector_stocks WHERE stock_code = '005930'"
-    ).fetchone()[0]
-    conn.close()
-
-    # 수동으로 pending 행 삽입 (event_id=999 — collect_daily의 event_id와 다름)
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "INSERT INTO pick_daily_tracking"
-        " (stock_pick_id, trading_day, day_offset, status, retry_count, event_id, created_at)"
-        " VALUES (?, '2026-05-07', 1, 'pending', 0, 999, '2026-05-06T09:00:00')",
-        (spid,),
+    cur = conn.execute(
+        "INSERT INTO sector_pick_events (sector_name, registered_at_kst, pick_date)"
+        " VALUES ('반도체', '2026-05-01T10:00:00', ?)",
+        (pick_date,),
     )
+    event_b = cur.lastrowid
     conn.commit()
     conn.close()
 
@@ -417,13 +417,32 @@ async def test_collect_daily_coalesce_keeps_existing_event_id(db_path):
         _kis_row("20260506", 9800, 10200, 9700, 10000, 1_000_000, 10_000_000_000),
         _kis_row("20260507", 10000, 10800, 9900, 10500, 800_000,   8_400_000_000),
     ]
-    result = await _make_tracker(db_path, kis_rows).collect_daily(
-        event_id, "005930", target_date
+
+    # event_a로 수집
+    result_a = await _make_tracker(db_path, kis_rows).collect_daily(
+        event_a, "005930", target_date
+    )
+    # event_b로 수집 (같은 종목, 같은 target_date)
+    result_b = await _make_tracker(db_path, kis_rows).collect_daily(
+        event_b, "005930", target_date
     )
 
-    assert result is True
-    row = _tracking_for(db_path, "005930", "2026-05-07")
-    assert row["event_id"] == 999   # COALESCE: 기존 999 유지
+    assert result_a is True
+    assert result_b is True
+
+    # 같은 stock_pick_id + trading_day에 event_id가 다른 두 행이 모두 존재
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT event_id, status, close FROM pick_daily_tracking"
+        " WHERE trading_day = '2026-05-07'"
+        " ORDER BY event_id"
+    ).fetchall()
+    conn.close()
+
+    assert len(rows) == 2
+    assert {r[0] for r in rows} == {event_a, event_b}
+    assert all(r[1] == "success" for r in rows)
+    assert all(r[2] == 10500 for r in rows)
 
 
 # ---------------------------------------------------------------------------
