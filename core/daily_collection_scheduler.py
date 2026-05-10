@@ -30,10 +30,10 @@ async def run_daily_collection(
     async with aiosqlite.connect(tracker.db_path, isolation_level=None) as db:
         cur = await db.execute(
             """
-            SELECT pdt.event_id, pdt.stock_pick_id, pdt.trading_day, ss.stock_code
+            SELECT pdt.id, pdt.event_id, pdt.stock_pick_id, pdt.trading_day, ss.stock_code
             FROM pick_daily_tracking pdt
             JOIN sector_stocks ss ON ss.id = pdt.stock_pick_id
-            WHERE pdt.trading_day <= ? AND pdt.status = 'pending'
+            WHERE pdt.trading_day <= ? AND pdt.status = 'pending' AND ss.tracking_status = 'active'
             ORDER BY pdt.trading_day, pdt.event_id, pdt.stock_pick_id
             """,
             (today_str,),
@@ -46,7 +46,21 @@ async def run_daily_collection(
     failed_count = 0
     failed_list: list[str] = []
 
-    for event_id, stock_pick_id, trading_day, ticker in targets:
+    for pdt_id, event_id, stock_pick_id, trading_day, ticker in targets:
+        # Re-check status: narrow the race window between snapshot and collect_daily.
+        async with aiosqlite.connect(tracker.db_path, isolation_level=None) as recheck_db:
+            recheck_cur = await recheck_db.execute(
+                "SELECT status FROM pick_daily_tracking WHERE id = ?",
+                (pdt_id,),
+            )
+            recheck_row = await recheck_cur.fetchone()
+        if recheck_row is None or recheck_row[0] != "pending":
+            logger.info(
+                "[D4] row skipped — no longer pending: id=%d status=%s",
+                pdt_id, recheck_row[0] if recheck_row else "deleted",
+            )
+            continue
+
         row_start = time.monotonic()
         try:
             result = await tracker.collect_daily(
@@ -87,7 +101,8 @@ async def daily_collection_job(tracker: DailyTracker, kis_client) -> None:
     try:
         await kis_client._ensure_real_token()
     except Exception as exc:
-        logger.warning("[D4] KIS 토큰 갱신 실패: %s — 수집 계속 시도", exc)
+        logger.error("[D4] KIS 토큰 갱신 실패 — 수집 중단: %s", exc)
+        raise
 
     try:
         await run_daily_collection(tracker)

@@ -589,3 +589,39 @@ async def test_ensure_tracking_rows_pick_id_isolation(db_path):
     assert wrong_event == 0
 
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TC14: collect_daily — status='failed_permanent' 행은 success로 덮어쓰지 않음 (변경 2 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collect_daily_does_not_overwrite_non_pending_status(db_path):
+    """TC14: 조건부 UPSERT 회귀 — status='failed_permanent' 행은 collect_daily가
+    성공(True)을 반환해도 DB의 status가 그대로 유지됨."""
+    pick_date = "2026-05-06"
+    target_date = date(2026, 5, 7)
+    event_id = _insert_event(db_path, "반도체", pick_date, [("005930", "삼성전자")])
+
+    conn = sqlite3.connect(db_path)
+    stock_pick_id = conn.execute(
+        "SELECT id FROM sector_stocks WHERE stock_code = '005930'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO pick_daily_tracking"
+        " (stock_pick_id, trading_day, day_offset, status, retry_count, event_id, created_at)"
+        " VALUES (?, '2026-05-07', 1, 'failed_permanent', 3, ?, '2026-05-06T09:00:00')",
+        (stock_pick_id, event_id),
+    )
+    conn.commit()
+    conn.close()
+
+    kis_rows = [
+        _kis_row("20260506", 9800, 10200, 9700, 10000, 1_000_000, 10_000_000_000),
+        _kis_row("20260507", 10000, 10800, 9900, 10500, 800_000,   8_400_000_000),
+    ]
+    result = await _make_tracker(db_path, kis_rows).collect_daily(event_id, "005930", target_date)
+
+    assert result is True
+    row = _tracking_for(db_path, "005930", "2026-05-07")
+    assert row["status"] == "failed_permanent"

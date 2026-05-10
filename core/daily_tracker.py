@@ -272,6 +272,7 @@ class DailyTracker:
                         return_vs_pick       = excluded.return_vs_pick,
                         return_vs_prev_close = excluded.return_vs_prev_close,
                         status               = 'success'
+                    WHERE pick_daily_tracking.status = 'pending'
                     """,
                     (
                         stock_pick_id, target_date_str, day_offset,

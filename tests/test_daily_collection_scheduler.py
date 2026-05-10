@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.daily_collection_scheduler import run_daily_collection
+from core.daily_collection_scheduler import daily_collection_job, run_daily_collection
 from core.daily_tracker import DailyTracker
 
 
@@ -280,3 +280,120 @@ async def test_non_pending_statuses_excluded(db_path):
     assert tracker.collect_daily.call_count == 1
     called_ticker = tracker.collect_daily.call_args.args[1]
     assert called_ticker == "058470"
+
+
+# ---------------------------------------------------------------------------
+# TC8: 스냅샷 후 외부에서 status 변경된 행은 collect_daily 호출 전 스킵 (MEDIUM 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_row_skipped_if_status_changed_after_snapshot(db_path):
+    """TC8: 스냅샷 로딩 후 다른 writer가 row의 status를 변경하면
+    collect_daily 호출 직전 재확인에서 스킵됨."""
+    _seed_multi_stocks(db_path, [
+        ("005930", "2026-05-08", "pending"),
+        ("000660", "2026-05-08", "pending"),
+        ("042700", "2026-05-08", "pending"),
+    ])
+
+    tracker = _make_tracker(db_path)
+    called_tickers: list[str] = []
+
+    async def side_effect(event_id, ticker, target_date):
+        called_tickers.append(ticker)
+        if ticker == "005930":
+            # 첫 번째 처리 중 000660 row를 외부에서 failed_permanent로 변경
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """UPDATE pick_daily_tracking SET status = 'failed_permanent'
+                   WHERE stock_pick_id = (
+                       SELECT id FROM sector_stocks WHERE stock_code = '000660'
+                   ) AND trading_day = '2026-05-08'"""
+            )
+            conn.commit()
+            conn.close()
+        return True
+
+    tracker.collect_daily = AsyncMock(side_effect=side_effect)
+    await run_daily_collection(tracker, today=_TODAY)
+
+    assert tracker.collect_daily.call_count == 2
+    assert "000660" not in called_tickers
+    assert "005930" in called_tickers
+    assert "042700" in called_tickers
+
+
+# ---------------------------------------------------------------------------
+# TC6: inactive tracking_status 종목은 수집 대상에서 제외 (HIGH 1 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_inactive_stock_excluded(db_path):
+    """TC6: tracking_status='inactive'인 sector_stocks의 pending 행은 호출 안 됨."""
+    conn = sqlite3.connect(db_path)
+    sp = conn.execute(
+        "INSERT INTO sector_picks (pick_date, created_at, expires_at, status)"
+        " VALUES ('2026-05-06', '2026-05-01T09:00:00', '2026-05-27T09:00:00', 'active')"
+    )
+    pick_id = sp.lastrowid
+    ev = conn.execute(
+        "INSERT INTO sector_pick_events (pick_id, sector_name, registered_at_kst, pick_date)"
+        " VALUES (?, '반도체', '2026-05-06T09:00:00', '2026-05-06')",
+        (pick_id,),
+    )
+    event_id = ev.lastrowid
+
+    # active stock — pending
+    active_row = conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '005930', '삼성전자', 1, 'active')",
+        (pick_id,),
+    )
+    active_id = active_row.lastrowid
+
+    # inactive stock — still pending in pick_daily_tracking
+    inactive_row = conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '000660', 'SK하이닉스', 2, 'inactive')",
+        (pick_id,),
+    )
+    inactive_id = inactive_row.lastrowid
+
+    for spi in (active_id, inactive_id):
+        conn.execute(
+            "INSERT INTO pick_daily_tracking"
+            " (stock_pick_id, trading_day, day_offset, status, event_id, created_at)"
+            " VALUES (?, '2026-05-08', 0, 'pending', ?, '2026-05-06T09:00:00')",
+            (spi, event_id),
+        )
+    conn.commit()
+    conn.close()
+
+    tracker = _make_tracker(db_path)
+    await run_daily_collection(tracker, today=_TODAY)
+
+    assert tracker.collect_daily.call_count == 1
+    called_ticker = tracker.collect_daily.call_args.args[1]
+    assert called_ticker == "005930"
+
+
+# ---------------------------------------------------------------------------
+# TC7: KIS 토큰 갱신 실패 시 배치 전체 중단 (HIGH 2 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auth_failure_aborts_batch(db_path):
+    """TC7: _ensure_real_token() 예외 시 collect_daily는 한 번도 호출되지 않음."""
+    _seed(db_path, [("005930", "2026-05-08", "pending")])
+
+    tracker = _make_tracker(db_path)
+
+    kis_client = MagicMock()
+    kis_client._ensure_real_token = AsyncMock(side_effect=RuntimeError("auth down"))
+
+    with pytest.raises(RuntimeError, match="auth down"):
+        await daily_collection_job(tracker, kis_client)
+
+    tracker.collect_daily.assert_not_called()
