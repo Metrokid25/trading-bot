@@ -566,3 +566,44 @@ D3 시작 전 형이 결정해야 할 항목:
 3. **UPSERT 충돌 키**: `event_id + ticker + trade_date`? `stock_pick_id + trading_day`?
 4. **best-effort 격리**: 추적 모듈 실패가 본 기능 저장에 영향 없도록 (작업 3번 패턴 동일하게)
 5. **D3 입력 인터페이스**: DailyTracker가 받을 입력 — 어디서 호출되는가? D4 스케줄러에서만? D3는 함수 정의만?
+
+---
+
+## 2026-05-10 Phase 2.5 작업 4번 D3 완료: DailyTracker + m005/m006 마이그레이션 (Codex HIGH 2 수정)
+
+### 단계 분할표 업데이트
+
+| 단계 | 내용 | 커밋 |
+|---|---|---|
+| ✅ D1 | m004 마이그레이션 (status/retry_count/event_id 컬럼 추가) | 52fdc75 |
+| ✅ D2 | KIS 일봉 어댑터 (DailyOHLCV + fetch_daily_candles_for_pick) | a749e87 |
+| ✅ D3 | DailyTracker 모듈 + m005 UNIQUE 스키마 | 8876975 |
+| ✅ D3-fix | Codex HIGH 1 수정: UPSERT event 단위 격리 | 8a8187a |
+| ✅ D3-fix2 | Codex HIGH 2 수정: sector_pick_events.pick_id NOT NULL FK + m006 | 2406340 |
+| 🔜 D4 | 16:00 KST 스케줄러 + 통합 테스트 | — |
+| 🔜 D5 | 재시도 정책 + 영구 실패 마킹 | — |
+
+### D3 Codex 재재리뷰 통과 (commit 2406340)
+
+- **HIGH 2 (event 멤버십 모호성) 해결**: `sector_pick_events.pick_id INTEGER NOT NULL REFERENCES sector_picks(id)` 추가
+  - 기존 문제: `sector_pick_events`가 `sector_name + pick_date`만 가지고 있어 동일 (sector_name, pick_date)에 여러 `sector_picks` row가 존재할 경우 DailyTracker가 잘못된 stock universe를 추적할 위험
+  - 해결: `pick_id` FK로 owning pick 명시 → DailyTracker JOIN에서 `sector_picks` 테이블 완전 제거, `spe.pick_id` 직접 조인
+- **변경 파일 6개**: `m006_phase25_event_pick_id.py` (신규) + `migration_runner.py` + `sector_store.py` + `daily_tracker.py` + `test_daily_tracker_d3.py` + `test_sector_pick_event.py`
+- **pytest**: 124 passed, 1 skipped (TC13 신규 포함)
+- **운영 DB m006 적용 완료**: `2026-05-10T13:37:23` (db/trading.db)
+
+### TC13 회귀 테스트 (신규)
+
+- 동일 `(sector_name, pick_date)`에 서로 다른 `pick_id`를 가진 두 `sector_picks` row + 각각 다른 stock universe
+- `ensure_tracking_rows`를 한 event에 대해서만 호출
+- 검증: 해당 event의 `pick_id` stocks만 `pick_daily_tracking`에 생성, 다른 `pick_id`의 stocks는 침범 없음
+
+### 백로그 (신규 항목 추가)
+
+**[DEFERRED] 마이그레이션 backfill 정책 통일 (m005, m006)**
+
+- **현재 상태**: m005 (`pick_daily_tracking` UNIQUE 확장), m006 (`sector_pick_events.pick_id` 추가) 모두 non-empty 테이블에 대해 abort 가드만 존재
+- **미적용 이유**: 단일 PC + 노트북 git sync 환경, m005/m006 적용 시점 양쪽 모두 대상 테이블 0 rows, 실운영 미수행 → reproducible하지 않음
+- **향후 필요 시점**: 다중 머신 배포 또는 외부 사용자 추가 시
+- **작업 내용**: 두 마이그레이션 모두 deterministic backfill + ambiguous case 진단 출력 방식으로 재작성 (Codex 권장: unambiguous rows backfill, ambiguous rows 진단 리스트 출력 후 실패)
+- **우선순위**: LOW
