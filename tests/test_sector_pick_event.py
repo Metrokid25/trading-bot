@@ -20,6 +20,7 @@ _KST = ZoneInfo("Asia/Seoul")
 _SPE_DDL = """
 CREATE TABLE IF NOT EXISTS sector_pick_events (
     event_id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+    pick_id                             INTEGER NOT NULL REFERENCES sector_picks(id),
     sector_name                         TEXT NOT NULL,
     registered_at_kst                   TEXT NOT NULL,
     is_sector_repick                    INTEGER DEFAULT 0,
@@ -64,6 +65,19 @@ def _stock(sector: str, code: str, name: str) -> SectorStock:
                        stock_name=name, added_order=1)
 
 
+async def _new_pick_id(store: SectorStore, pick_date: str = "2026-04-21") -> int:
+    """sector_picks에 더미 row를 INSERT하고 pick_id를 반환.
+
+    _record_sector_pick_event 직접 호출 테스트에서 NOT NULL pick_id를 공급하기 위한 헬퍼.
+    """
+    cur = await store._db.execute(
+        "INSERT INTO sector_picks (pick_date, created_at, expires_at, status)"
+        " VALUES (?, '2026-04-21T09:00:00', '2026-05-05T09:00:00', 'active')",
+        (pick_date,),
+    )
+    return cur.lastrowid
+
+
 async def _get_events(store: SectorStore, sector_name: str | None = None) -> list:
     if sector_name:
         cur = await store._db.execute(
@@ -88,8 +102,9 @@ async def _get_events(store: SectorStore, sector_name: str | None = None) -> lis
 @pytest.mark.asyncio
 async def test_first_pick_no_repick(store: SectorStore):
     """첫 픽: is_sector_repick=0, prev/days NULL, total_count=1."""
+    pid = await _new_pick_id(store, "2026-04-21")
     event_id = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-21"), date(2026, 4, 21)
+        "반도체", _ts("2026-04-21"), date(2026, 4, 21), pid
     )
     rows = await _get_events(store, "반도체")
     assert len(rows) == 1
@@ -108,11 +123,13 @@ async def test_first_pick_no_repick(store: SectorStore):
 @pytest.mark.asyncio
 async def test_repick_friday_to_monday(store: SectorStore):
     """금(2026-04-24) → 월(2026-04-27): 자연일 3, 거래일 1."""
+    pid1 = await _new_pick_id(store, "2026-04-24")
     id1 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-24"), date(2026, 4, 24)
+        "반도체", _ts("2026-04-24"), date(2026, 4, 24), pid1
     )
+    pid2 = await _new_pick_id(store, "2026-04-27")
     id2 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-27"), date(2026, 4, 27)
+        "반도체", _ts("2026-04-27"), date(2026, 4, 27), pid2
     )
     rows = await _get_events(store, "반도체")
     assert len(rows) == 2
@@ -130,11 +147,13 @@ async def test_repick_friday_to_monday(store: SectorStore):
 @pytest.mark.asyncio
 async def test_repick_one_full_week(store: SectorStore):
     """월(2026-04-21) → 월(2026-04-28): 자연일 7, 거래일 5."""
+    pid1 = await _new_pick_id(store, "2026-04-21")
     id1 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-21"), date(2026, 4, 21)
+        "반도체", _ts("2026-04-21"), date(2026, 4, 21), pid1
     )
+    pid2 = await _new_pick_id(store, "2026-04-28")
     id2 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-28"), date(2026, 4, 28)
+        "반도체", _ts("2026-04-28"), date(2026, 4, 28), pid2
     )
     rows = await _get_events(store, "반도체")
     r2 = rows[1]
@@ -151,11 +170,13 @@ async def test_repick_one_full_week(store: SectorStore):
 async def test_repick_same_day(store: SectorStore):
     """같은 날 두 번 픽: pick_date < ? 조건으로 동일 날짜 prev 미참조 → is_repick=0, days=NULL.
     total_count는 MAX 기반 누적이므로 2."""
+    pid1 = await _new_pick_id(store, "2026-04-21")
     id1 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-21"), date(2026, 4, 21)
+        "반도체", _ts("2026-04-21"), date(2026, 4, 21), pid1
     )
+    pid2 = await _new_pick_id(store, "2026-04-21")
     id2 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-21"), date(2026, 4, 21)
+        "반도체", _ts("2026-04-21"), date(2026, 4, 21), pid2
     )
     rows = await _get_events(store, "반도체")
     r2 = rows[1]
@@ -171,14 +192,17 @@ async def test_repick_same_day(store: SectorStore):
 @pytest.mark.asyncio
 async def test_cross_sector_isolation(store: SectorStore):
     """'AI' 이벤트가 중간에 삽입돼도 '반도체' 두 번째 픽은 '반도체' 직전 이벤트를 참조한다."""
+    pid_s1 = await _new_pick_id(store, "2026-04-21")
     id_semi_1 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-21"), date(2026, 4, 21)
+        "반도체", _ts("2026-04-21"), date(2026, 4, 21), pid_s1
     )
+    pid_ai = await _new_pick_id(store, "2026-04-22")
     _id_ai = await store._record_sector_pick_event(
-        "AI", _ts("2026-04-22"), date(2026, 4, 22)
+        "AI", _ts("2026-04-22"), date(2026, 4, 22), pid_ai
     )
+    pid_s2 = await _new_pick_id(store, "2026-04-28")
     id_semi_2 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-28"), date(2026, 4, 28)
+        "반도체", _ts("2026-04-28"), date(2026, 4, 28), pid_s2
     )
 
     rows = await _get_events(store, "반도체")
@@ -194,9 +218,12 @@ async def test_cross_sector_isolation(store: SectorStore):
 @pytest.mark.asyncio
 async def test_total_count_increments(store: SectorStore):
     """3번 픽 후 total_sector_pick_count = 3."""
-    await store._record_sector_pick_event("반도체", _ts("2026-04-21"), date(2026, 4, 21))
-    await store._record_sector_pick_event("반도체", _ts("2026-04-22"), date(2026, 4, 22))
-    await store._record_sector_pick_event("반도체", _ts("2026-04-23"), date(2026, 4, 23))
+    pid1 = await _new_pick_id(store, "2026-04-21")
+    await store._record_sector_pick_event("반도체", _ts("2026-04-21"), date(2026, 4, 21), pid1)
+    pid2 = await _new_pick_id(store, "2026-04-22")
+    await store._record_sector_pick_event("반도체", _ts("2026-04-22"), date(2026, 4, 22), pid2)
+    pid3 = await _new_pick_id(store, "2026-04-23")
+    await store._record_sector_pick_event("반도체", _ts("2026-04-23"), date(2026, 4, 23), pid3)
     rows = await _get_events(store, "반도체")
     assert len(rows) == 3
     assert rows[0][7] == 1
@@ -244,14 +271,16 @@ async def test_upsert_records_event_when_flag_true(store: SectorStore):
 @pytest.mark.asyncio
 async def test_null_prev_pick_date_treated_as_first(store: SectorStore):
     """마이그레이션 전 기존 행(pick_date=NULL)이 있을 때: 첫 픽처럼 처리, total_count만 누적."""
+    pid_old = await _new_pick_id(store, "2026-04-20")
     await store._db.execute(
         "INSERT INTO sector_pick_events "
-        "(sector_name, registered_at_kst, is_sector_repick, total_sector_pick_count) "
-        "VALUES (?, ?, ?, ?)",
-        ("반도체", _ts("2026-04-20"), 0, 1),
+        "(pick_id, sector_name, registered_at_kst, is_sector_repick, total_sector_pick_count) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid_old, "반도체", _ts("2026-04-20"), 0, 1),
     )
 
-    await store._record_sector_pick_event("반도체", _ts("2026-04-21"), date(2026, 4, 21))
+    pid_new = await _new_pick_id(store, "2026-04-21")
+    await store._record_sector_pick_event("반도체", _ts("2026-04-21"), date(2026, 4, 21), pid_new)
 
     rows = await _get_events(store, "반도체")
     assert len(rows) == 2
@@ -269,11 +298,13 @@ async def test_null_prev_pick_date_treated_as_first(store: SectorStore):
 @pytest.mark.asyncio
 async def test_backdated_pick_gap_uses_pick_date(store: SectorStore):
     """pick_date=2026-04-15(백데이팅) → pick_date=2026-04-29: 자연일 14, 거래일 10."""
+    pid1 = await _new_pick_id(store, "2026-04-15")
     id1 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-29"), date(2026, 4, 15)
+        "반도체", _ts("2026-04-29"), date(2026, 4, 15), pid1
     )
+    pid2 = await _new_pick_id(store, "2026-04-29")
     id2 = await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-29"), date(2026, 4, 29)
+        "반도체", _ts("2026-04-29"), date(2026, 4, 29), pid2
     )
     rows = await _get_events(store, "반도체")
     assert len(rows) == 2
@@ -457,13 +488,15 @@ async def test_integration_bad_pick_date_format_does_not_rollback_pick(store: Se
 async def test_integration6_backdating_no_negative_days(store: SectorStore):
     """H2: 미래 pick_date 행이 prev로 잡혀 days_since 음수가 되지 않는다."""
     # 먼저 pick_date=2026-04-30 이벤트 기록
+    pid1 = await _new_pick_id(store, "2026-04-30")
     await store._record_sector_pick_event(
-        "반도체", _ts("2026-04-30"), date(2026, 4, 30)
+        "반도체", _ts("2026-04-30"), date(2026, 4, 30), pid1
     )
 
     # 이후 백데이팅 픽: pick_date=2026-04-25 (이미 등록된 4/30보다 과거)
+    pid2 = await _new_pick_id(store, "2026-04-25")
     await store._record_sector_pick_event(
-        "반도체", _ts("2026-05-01"), date(2026, 4, 25)
+        "반도체", _ts("2026-05-01"), date(2026, 4, 25), pid2
     )
 
     rows = await _get_events(store, "반도체")
@@ -479,12 +512,13 @@ async def test_integration6_backdating_no_negative_days(store: SectorStore):
 async def test_integration7_null_pick_date_excluded_and_count_accumulated(store: SectorStore):
     """H3: pick_date=NULL 행은 prev 조회에서 제외, days_since=NULL.
     total_count는 NULL 행 포함 MAX+1로 누적되어야 한다."""
-    # 마이그레이션 이전 데이터 시뮬레이션: pick_date=NULL 행 직접 INSERT
+    # 마이그레이션 이전 데이터 시뮬레이션: pick_date=NULL 행 직접 INSERT (pick_id는 필수)
+    pid_legacy = await _new_pick_id(store, "2026-04-01")
     await store._db.execute(
         "INSERT INTO sector_pick_events "
-        "(sector_name, registered_at_kst, is_sector_repick, total_sector_pick_count) "
-        "VALUES (?, ?, ?, ?)",
-        ("반도체", _ts("2026-04-01"), 0, 1),
+        "(pick_id, sector_name, registered_at_kst, is_sector_repick, total_sector_pick_count) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid_legacy, "반도체", _ts("2026-04-01"), 0, 1),
     )
 
     # 정상 픽 등록 (upsert_sector 경로로 통합 검증)

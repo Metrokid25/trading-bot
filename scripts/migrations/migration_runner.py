@@ -118,6 +118,7 @@ if __name__ == "__main__":
         m003_sector_pick_event_pick_date,
         m004_phase25_daily_tracking_status,
         m005_phase25_event_scoped_uniqueness,
+        m006_phase25_event_pick_id,
     )
 
     run_migrations(
@@ -128,6 +129,7 @@ if __name__ == "__main__":
             m003_sector_pick_event_pick_date,
             m004_phase25_daily_tracking_status,
             m005_phase25_event_scoped_uniqueness,
+            m006_phase25_event_pick_id,
         ],
         backup=True,
     )

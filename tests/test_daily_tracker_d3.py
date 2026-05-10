@@ -43,6 +43,7 @@ _DDL_STATEMENTS = [
     """
     CREATE TABLE sector_pick_events (
         event_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        pick_id           INTEGER NOT NULL REFERENCES sector_picks(id),
         sector_name       TEXT    NOT NULL,
         registered_at_kst TEXT    NOT NULL,
         pick_date         TEXT
@@ -136,9 +137,9 @@ def _insert_event(
                 (pick_id, sector_name, code, name, i),
             )
     cur2 = conn.execute(
-        "INSERT INTO sector_pick_events (sector_name, registered_at_kst, pick_date)"
-        " VALUES (?, '2026-05-01T09:00:00', ?)",
-        (sector_name, pick_date_str),
+        "INSERT INTO sector_pick_events (pick_id, sector_name, registered_at_kst, pick_date)"
+        " VALUES (?, ?, '2026-05-01T09:00:00', ?)",
+        (pick_id, sector_name, pick_date_str),
     )
     event_id = cur2.lastrowid
     conn.commit()
@@ -402,12 +403,15 @@ async def test_collect_daily_multi_event_isolation(db_path):
 
     # 같은 섹터·같은 pick_date로 두 개의 event 등록 (재픽업 시뮬레이션)
     event_a = _insert_event(db_path, "반도체", pick_date, [("005930", "삼성전자")])
-    # 두 번째 event는 sector_pick_events만 추가 (같은 stock_pick_id 공유)
+    # 두 번째 event는 sector_pick_events만 추가 (같은 pick_id, 같은 stock_pick_id 공유)
     conn = sqlite3.connect(db_path)
+    pick_id_row = conn.execute(
+        "SELECT id FROM sector_picks WHERE pick_date = ?", (pick_date,)
+    ).fetchone()
     cur = conn.execute(
-        "INSERT INTO sector_pick_events (sector_name, registered_at_kst, pick_date)"
-        " VALUES ('반도체', '2026-05-01T10:00:00', ?)",
-        (pick_date,),
+        "INSERT INTO sector_pick_events (pick_id, sector_name, registered_at_kst, pick_date)"
+        " VALUES (?, '반도체', '2026-05-01T10:00:00', ?)",
+        (pick_id_row[0], pick_date),
     )
     event_b = cur.lastrowid
     conn.commit()
@@ -481,3 +485,107 @@ async def test_collect_daily_unknown_ticker_returns_false(db_path):
 
     assert result is False
     assert len(_all_tracking(db_path)) == 0
+
+
+# ---------------------------------------------------------------------------
+# TC13: pick_id 격리 회귀 — 동일 (sector_name, pick_date)에 서로 다른 pick_id를 가진
+#        두 sector_picks가 존재할 때, ensure_tracking_rows가 자기 event의
+#        stock universe만 생성하고 다른 pick_id의 stocks는 건드리지 않음
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ensure_tracking_rows_pick_id_isolation(db_path):
+    """Codex HIGH 2 회귀 방지: spe.pick_id 직접 조인으로 stock universe 격리.
+
+    구버전 JOIN (sector_name + pick_date) 은 pick_id_a / pick_id_b 둘 다 매칭해
+    다른 pick의 stocks를 추적 행에 포함시키는 버그가 있었다.
+    """
+    pick_date = "2026-05-06"
+
+    conn = sqlite3.connect(db_path)
+
+    # pick_id_a: 삼성전자, SK하이닉스
+    cur_a = conn.execute(
+        "INSERT INTO sector_picks (pick_date, created_at, expires_at, status)"
+        " VALUES (?, '2026-05-01T09:00:00', '2026-05-20T09:00:00', 'active')",
+        (pick_date,),
+    )
+    pick_id_a = cur_a.lastrowid
+    conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '005930', '삼성전자', 1, 'active')",
+        (pick_id_a,),
+    )
+    conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '000660', 'SK하이닉스', 2, 'active')",
+        (pick_id_a,),
+    )
+    cur_ea = conn.execute(
+        "INSERT INTO sector_pick_events (pick_id, sector_name, registered_at_kst, pick_date)"
+        " VALUES (?, '반도체', '2026-05-01T09:00:00', ?)",
+        (pick_id_a, pick_date),
+    )
+    event_a = cur_ea.lastrowid
+
+    # pick_id_b: 한미반도체, 리노공업 (같은 sector_name, 같은 pick_date, 다른 pick)
+    cur_b = conn.execute(
+        "INSERT INTO sector_picks (pick_date, created_at, expires_at, status)"
+        " VALUES (?, '2026-05-01T10:00:00', '2026-05-20T10:00:00', 'active')",
+        (pick_date,),
+    )
+    pick_id_b = cur_b.lastrowid
+    conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '042700', '한미반도체', 1, 'active')",
+        (pick_id_b,),
+    )
+    conn.execute(
+        "INSERT INTO sector_stocks"
+        " (pick_id, sector_name, stock_code, stock_name, added_order, tracking_status)"
+        " VALUES (?, '반도체', '058470', '리노공업', 2, 'active')",
+        (pick_id_b,),
+    )
+    cur_eb = conn.execute(
+        "INSERT INTO sector_pick_events (pick_id, sector_name, registered_at_kst, pick_date)"
+        " VALUES (?, '반도체', '2026-05-01T10:00:00', ?)",
+        (pick_id_b, pick_date),
+    )
+    event_b = cur_eb.lastrowid  # noqa: F841
+
+    # pick_id_b의 sector_stocks id 목록 (침범 여부 확인용)
+    pick_b_stock_ids = [
+        r[0] for r in conn.execute(
+            "SELECT id FROM sector_stocks WHERE pick_id = ?", (pick_id_b,)
+        ).fetchall()
+    ]
+
+    conn.commit()
+    conn.close()
+
+    # event_a에 대해서만 ensure_tracking_rows 호출
+    created = await _make_tracker(db_path, []).ensure_tracking_rows(event_a)
+
+    # (a) pick_id_a의 stocks 2개 × 21일 = 42행 생성
+    assert created == 42
+
+    conn = sqlite3.connect(db_path)
+
+    # (b) pick_id_b 소속 stocks는 단 하나도 없음
+    contaminated = conn.execute(
+        f"SELECT COUNT(*) FROM pick_daily_tracking"
+        f" WHERE stock_pick_id IN ({','.join('?' * len(pick_b_stock_ids))})",
+        pick_b_stock_ids,
+    ).fetchone()[0]
+    assert contaminated == 0
+
+    # (c) 모든 행의 event_id = event_a
+    wrong_event = conn.execute(
+        "SELECT COUNT(*) FROM pick_daily_tracking WHERE event_id != ?", (event_a,)
+    ).fetchone()[0]
+    assert wrong_event == 0
+
+    conn.close()

@@ -125,15 +125,12 @@ class DailyTracker:
                 raise ValueError(f"event_id={event_id} has NULL pick_date")
             pick_date = date.fromisoformat(pick_date_str)
 
-            # 3-테이블 JOIN: sector_pick_events → sector_picks → sector_stocks
-            # sector_picks에 sector_name 컬럼 없으므로 ss.sector_name = spe.sector_name으로 섹터 필터링
             cur = await db.execute(
                 """
                 SELECT DISTINCT ss.id
                 FROM sector_pick_events spe
-                JOIN sector_picks sp ON sp.pick_date = spe.pick_date
                 JOIN sector_stocks ss
-                    ON ss.pick_id = sp.id AND ss.sector_name = spe.sector_name
+                    ON ss.pick_id = spe.pick_id AND ss.sector_name = spe.sector_name
                 WHERE spe.event_id = ? AND ss.tracking_status = 'active'
                 """,
                 (event_id,),
@@ -191,14 +188,12 @@ class DailyTracker:
             if pick_date_str is None:
                 return False
 
-            # 3-테이블 JOIN으로 stock_pick_id 조회 (ensure_tracking_rows와 동일 구조)
             cur = await db.execute(
                 """
                 SELECT DISTINCT ss.id
                 FROM sector_pick_events spe
-                JOIN sector_picks sp ON sp.pick_date = spe.pick_date
                 JOIN sector_stocks ss
-                    ON ss.pick_id = sp.id AND ss.sector_name = spe.sector_name
+                    ON ss.pick_id = spe.pick_id AND ss.sector_name = spe.sector_name
                 WHERE spe.event_id = ? AND ss.stock_code = ? AND ss.tracking_status = 'active'
                 LIMIT 1
                 """,

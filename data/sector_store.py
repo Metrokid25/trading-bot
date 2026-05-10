@@ -184,6 +184,7 @@ class SectorStore:
         sector_name: str,
         registered_at_kst: str,
         pick_date: date,
+        pick_id: int,
     ) -> int:
         """sector_pick_events에 이벤트를 INSERT하고 새 event_id를 반환한다.
 
@@ -220,11 +221,11 @@ class SectorStore:
 
         cur2 = await self._db.execute(
             "INSERT INTO sector_pick_events "
-            "(sector_name, registered_at_kst, pick_date, is_sector_repick, prev_event_id, "
+            "(pick_id, sector_name, registered_at_kst, pick_date, is_sector_repick, prev_event_id, "
             "days_since_last_sector_pick, trading_days_since_last_sector_pick, "
             "total_sector_pick_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (sector_name, registered_at_kst, pick_date.isoformat(), is_sector_repick,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (pick_id, sector_name, registered_at_kst, pick_date.isoformat(), is_sector_repick,
              prev_event_id, days_since, trading_days_since, total_count),
         )
         event_id = cur2.lastrowid
@@ -451,7 +452,7 @@ class SectorStore:
             try:
                 await self._db.execute("BEGIN")
                 await self._record_sector_pick_event(
-                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date)
+                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date), pick_id
                 )
                 await self._db.execute("COMMIT")
             except Exception:
