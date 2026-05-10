@@ -1,8 +1,8 @@
 # 트레이딩봇 핸드오프 문서
 
 > 다음 AI 세션이 이 프로젝트를 즉시 이해하고 이어받기 위한 기술 문서.
-> 마지막 업데이트: 2026-05-06
-> 기준 커밋: `a749e87 feat(phase2.5): D2 add fetch_daily_candles_for_pick adapter`
+> 마지막 업데이트: 2026-05-10
+> 기준 커밋: `400205b feat(phase2.5): D4 - Codex MEDIUM (silent no-op) 수정 + D4/D5 concurrency contract 명시`
 
 ---
 
@@ -580,7 +580,7 @@ D3 시작 전 형이 결정해야 할 항목:
 | ✅ D3 | DailyTracker 모듈 + m005 UNIQUE 스키마 | 8876975 |
 | ✅ D3-fix | Codex HIGH 1 수정: UPSERT event 단위 격리 | 8a8187a |
 | ✅ D3-fix2 | Codex HIGH 2 수정: sector_pick_events.pick_id NOT NULL FK + m006 | 2406340 |
-| 🔜 D4 | 16:00 KST 스케줄러 + 통합 테스트 | — |
+| ✅ D4 | 16:00 KST 스케줄러 + Codex 4사이클 통과 | 309eb39 → 032a7a5 → 400205b |
 | 🔜 D5 | 재시도 정책 + 영구 실패 마킹 | — |
 
 ### D3 Codex 재재리뷰 통과 (commit 2406340)
@@ -607,3 +607,78 @@ D3 시작 전 형이 결정해야 할 항목:
 - **향후 필요 시점**: 다중 머신 배포 또는 외부 사용자 추가 시
 - **작업 내용**: 두 마이그레이션 모두 deterministic backfill + ambiguous case 진단 출력 방식으로 재작성 (Codex 권장: unambiguous rows backfill, ambiguous rows 진단 리스트 출력 후 실패)
 - **우선순위**: LOW
+
+---
+
+## 2026-05-10 Phase 2.5 작업 4번 D4 완료: 일일 수집 스케줄러 (Codex 4사이클 통과)
+
+### 단계 분할표 최종
+
+| 단계 | 내용 | 커밋 |
+|---|---|---|
+| ✅ D1 | m004 마이그레이션 (status/retry_count/event_id 컬럼 추가) | 52fdc75 |
+| ✅ D2 | KIS 일봉 어댑터 (DailyOHLCV + fetch_daily_candles_for_pick) | a749e87 |
+| ✅ D3 | DailyTracker 모듈 + m005 UNIQUE 스키마 | 8876975 |
+| ✅ D3-fix | Codex HIGH 1 수정: UPSERT event 단위 격리 | 8a8187a |
+| ✅ D3-fix2 | Codex HIGH 2 수정: sector_pick_events.pick_id NOT NULL FK + m006 | 2406340 |
+| ✅ D4 | 16:00 KST 스케줄러 본 구현 | 309eb39 |
+| ✅ D4-fix | Codex HIGH 1+2 + MEDIUM stale snapshot race 수정 | 032a7a5 |
+| ✅ D4-fix2 | Codex MEDIUM silent no-op + D4/D5 contract 명시 | 400205b |
+| 🔜 D5 | 재시도 정책 + 영구 실패 마킹 | — |
+
+### D4 구현 내용 (309eb39)
+
+- **APScheduler AsyncIOScheduler**, `CronTrigger(hour=16, minute=0, timezone="Asia/Seoul")`, `misfire_grace_time=300`
+- **별도 프로세스**: `main_tracker.py` (sector_detector / main.py와 완전 격리)
+- **순차 실행**: 종목별 직렬 + 0.1초 sleep, `today` 파라미터 주입으로 테스트 가능
+- **KIS 토큰**: `daily_collection_job` 진입 시 `_ensure_real_token()` 선행 실행
+- **per-stock try/except**: 1건 실패해도 배치 계속 진행
+
+### D4 Codex 수정 내용 (032a7a5)
+
+- **HIGH 1**: 스케줄러 타겟 쿼리에 `AND ss.tracking_status = 'active'` 필터 추가 (inactive 종목 수집 방지)
+- **HIGH 2**: `_ensure_real_token()` 실패 시 `logger.error + raise` → 배치 전체 중단 (기존: warning 후 계속)
+- **MEDIUM stale snapshot race (1층)**: `collect_daily` 호출 직전 per-row status 재확인, non-pending이면 pre-check skip
+- **MEDIUM stale snapshot race (2층)**: DailyTracker UPSERT에 `WHERE pick_daily_tracking.status = 'pending'` 가드 추가
+- **회귀 테스트**: TC6 (inactive 제외), TC7 (auth 실패 배치 중단), TC8 (pre-check skip)
+
+### D4 Codex 수정 내용 (400205b) — D4/D5 concurrency contract 명시
+
+- **CollectResult Enum 도입**: `SUCCESS` / `SKIPPED_NOT_PENDING` / `FAILED`
+  - Enum 방식 채택 이유: 코드베이스 컨벤션 (sector_models.py, sector_store.py, constants.py 모두 Enum 사용)
+- **cursor.rowcount 체크**: UPSERT 후 `rowcount == 0` → `SKIPPED_NOT_PENDING` 반환 (silent no-op 차단)
+  - INSERT (신규 row): rowcount = 1 → SUCCESS
+  - UPDATE (pending → success, WHERE true): rowcount = 1 → SUCCESS
+  - 충돌 + WHERE false (race 발생): rowcount = 0 → SKIPPED_NOT_PENDING
+- **스케줄러 3분류 카운터**: `success_count / skipped_count / failed_count`
+  - pre-check skip → skipped_count + `[D4] row skipped (pre-check)` 로그
+  - UPSERT race skip → skipped_count + `[D4] row skipped (race)` 로그
+- **`run_daily_collection` 반환**: `dict[str, int]` → 테스트에서 카운트 직접 검증 가능
+- **회귀 테스트**: TC14 assertion 수정 (failed_permanent row → SKIPPED_NOT_PENDING), TC15 (KIS fetch 후 UPSERT 전 race 시뮬레이션), TC9 (3분류 카운트 검증)
+
+### D4/D5 concurrency contract (확정)
+
+| 역할 | 담당 |
+|---|---|
+| status='pending' 행 수집 | D4 (collect_daily) |
+| 수집 직전 status 재확인 (pre-check) | D4 스케줄러 |
+| UPSERT WHERE status='pending' 가드 | D4 DailyTracker |
+| race 발생 시 SKIPPED_NOT_PENDING 반환 | D4 DailyTracker |
+| failed_temp / failed_permanent 마킹 | D5 전담 |
+| retry_count 관리 + 재시도 로직 | D5 전담 |
+| D4는 D5 영역(failed_temp, failed_permanent 설정) 절대 불가침 | 불변식 |
+
+- `CollectResult.SKIPPED_NOT_PENDING` = D5 또는 다른 writer가 이미 status를 mutation한 상태
+- D4는 `SKIPPED_NOT_PENDING` 발생 시 skipped_count만 증가, 별도 재시도 없음 (D5 책임)
+
+### D4 검증 완료
+
+- **Codex adversarial review 4사이클**: 1차 (HIGH 1+2+MEDIUM 발견) → 2차 (MEDIUM silent no-op 발견) → 3차 (approve, no material findings) → 4차 (approve, no material findings)
+- **pytest**: **135 passed, 1 skipped** (TC1~TC15 D3 + TC1~TC9 D4 포함)
+- **회귀 없음**: D3 TC1~TC14 전체 통과 유지
+
+### 다음 단계
+
+Phase 2.5 작업 5번: 분봉 raw 수집 (pick_minute_raw)
+- D5 (재시도 정책 + 영구 실패 마킹)를 작업 5번 또는 별도 선행 단계로 처리 여부 결정 필요
+- 작업 6번 (분봉 집계), 작업 7번 (폭발 마킹) 대기 중
