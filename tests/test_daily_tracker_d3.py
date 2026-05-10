@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.daily_tracker import DailyTracker
+from core.daily_tracker import CollectResult, DailyTracker
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ async def test_collect_daily_success(db_path):
 
     result = await tracker.collect_daily(event_id, "005930", target_date)
 
-    assert result is True
+    assert result == CollectResult.SUCCESS
     row = _tracking_for(db_path, "005930", "2026-05-08")
     assert row is not None
     assert row["status"] == "success"
@@ -334,7 +334,7 @@ async def test_collect_daily_updates_pending_row(db_path):
         event_id, "005930", target_date
     )
 
-    assert result is True
+    assert result == CollectResult.SUCCESS
     post = _tracking_for(db_path, "005930", "2026-05-08")
     assert post["status"] == "success"
     assert post["close"] == 11000
@@ -358,7 +358,7 @@ async def test_collect_daily_inserts_without_prior_ensure(db_path):
         event_id, "005930", target_date
     )
 
-    assert result is True
+    assert result == CollectResult.SUCCESS
     rows = _all_tracking(db_path)
     assert len(rows) == 1
     assert rows[0][3] == "success"
@@ -383,7 +383,7 @@ async def test_collect_daily_false_when_no_target_date(db_path):
         event_id, "005930", target_date
     )
 
-    assert result is False
+    assert result == CollectResult.FAILED
     assert len(_all_tracking(db_path)) == 0
 
 
@@ -431,8 +431,8 @@ async def test_collect_daily_multi_event_isolation(db_path):
         event_b, "005930", target_date
     )
 
-    assert result_a is True
-    assert result_b is True
+    assert result_a == CollectResult.SUCCESS
+    assert result_b == CollectResult.SUCCESS
 
     # 같은 stock_pick_id + trading_day에 event_id가 다른 두 행이 모두 존재
     conn = sqlite3.connect(db_path)
@@ -483,7 +483,7 @@ async def test_collect_daily_unknown_ticker_returns_false(db_path):
         event_id, "999999", date(2026, 5, 7)
     )
 
-    assert result is False
+    assert result == CollectResult.FAILED
     assert len(_all_tracking(db_path)) == 0
 
 
@@ -622,6 +622,52 @@ async def test_collect_daily_does_not_overwrite_non_pending_status(db_path):
     ]
     result = await _make_tracker(db_path, kis_rows).collect_daily(event_id, "005930", target_date)
 
-    assert result is True
+    assert result == CollectResult.SKIPPED_NOT_PENDING
+    row = _tracking_for(db_path, "005930", "2026-05-07")
+    assert row["status"] == "failed_permanent"
+
+
+# ---------------------------------------------------------------------------
+# TC15: race 시뮬레이션 — KIS fetch 중 status 변경 → SKIPPED_NOT_PENDING (변경 2 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collect_daily_race_during_kis_fetch(db_path):
+    """TC15: UPSERT 직전 (KIS candle fetch 후) 외부에서 status를 'failed_permanent'로
+    변경하면 collect_daily가 SKIPPED_NOT_PENDING을 반환하고 DB 상태를 보존."""
+    pick_date = "2026-05-06"
+    target_date = date(2026, 5, 7)
+    event_id = _insert_event(db_path, "반도체", pick_date, [("005930", "삼성전자")])
+
+    # pending 행 사전 생성
+    await _make_tracker(db_path, []).ensure_tracking_rows(event_id)
+    pre = _tracking_for(db_path, "005930", "2026-05-07")
+    assert pre is not None and pre["status"] == "pending"
+
+    kis_rows = [
+        _kis_row("20260506", 9800, 10200, 9700, 10000, 1_000_000, 10_000_000_000),
+        _kis_row("20260507", 10000, 10800, 9900, 10500, 800_000,   8_400_000_000),
+    ]
+
+    async def candle_side_effect(ticker, start, end, period):
+        # KIS fetch 완료 직후, UPSERT 직전 타이밍에 status를 외부 변경
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """UPDATE pick_daily_tracking SET status = 'failed_permanent'
+               WHERE stock_pick_id = (
+                   SELECT id FROM sector_stocks WHERE stock_code = '005930'
+               ) AND trading_day = '2026-05-07'"""
+        )
+        conn.commit()
+        conn.close()
+        return kis_rows
+
+    client = MagicMock()
+    client.get_daily_candles = AsyncMock(side_effect=candle_side_effect)
+    tracker = DailyTracker(db_path, client)
+
+    result = await tracker.collect_daily(event_id, "005930", target_date)
+
+    assert result == CollectResult.SKIPPED_NOT_PENDING
     row = _tracking_for(db_path, "005930", "2026-05-07")
     assert row["status"] == "failed_permanent"

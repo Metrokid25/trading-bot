@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.daily_collection_scheduler import daily_collection_job, run_daily_collection
-from core.daily_tracker import DailyTracker
+from core.daily_tracker import CollectResult, DailyTracker
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def _make_tracker(db_path: str) -> DailyTracker:
     client = MagicMock()
     client.get_daily_candles = AsyncMock(return_value=[])
     tracker = DailyTracker(db_path, client)
-    tracker.collect_daily = AsyncMock(return_value=True)
+    tracker.collect_daily = AsyncMock(return_value=CollectResult.SUCCESS)
     return tracker
 
 
@@ -232,7 +232,7 @@ async def test_single_failure_does_not_stop_others(db_path):
         call_count += 1
         if call_count == 2:
             raise RuntimeError("KIS 오류 시뮬레이션")
-        return True
+        return CollectResult.SUCCESS
 
     tracker.collect_daily = AsyncMock(side_effect=side_effect)
 
@@ -312,7 +312,7 @@ async def test_row_skipped_if_status_changed_after_snapshot(db_path):
             )
             conn.commit()
             conn.close()
-        return True
+        return CollectResult.SUCCESS
 
     tracker.collect_daily = AsyncMock(side_effect=side_effect)
     await run_daily_collection(tracker, today=_TODAY)
@@ -397,3 +397,38 @@ async def test_auth_failure_aborts_batch(db_path):
         await daily_collection_job(tracker, kis_client)
 
     tracker.collect_daily.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TC9: success / skipped / failed 3분류 카운트 검증 (MEDIUM 회귀)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collect_result_three_way_count(db_path):
+    """TC9: collect_daily가 SUCCESS / SKIPPED_NOT_PENDING / FAILED를 각각 반환할 때
+    run_daily_collection이 3가지 카운트를 정확히 분류해 반환함."""
+    _seed_multi_stocks(db_path, [
+        ("005930", "2026-05-08", "pending"),
+        ("000660", "2026-05-08", "pending"),
+        ("042700", "2026-05-08", "pending"),
+    ])
+
+    tracker = _make_tracker(db_path)
+    call_count = 0
+
+    async def side_effect(event_id, ticker, target_date):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return CollectResult.SUCCESS
+        elif call_count == 2:
+            return CollectResult.SKIPPED_NOT_PENDING
+        else:
+            return CollectResult.FAILED
+
+    tracker.collect_daily = AsyncMock(side_effect=side_effect)
+    counts = await run_daily_collection(tracker, today=_TODAY)
+
+    assert counts["success"] == 1
+    assert counts["skipped"] == 1
+    assert counts["failed"] == 1

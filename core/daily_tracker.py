@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -17,6 +18,12 @@ from core.time_utils import now_kst, to_db_iso
 
 if TYPE_CHECKING:
     from core.kis_api import KISClient
+
+
+class CollectResult(Enum):
+    SUCCESS = "success"
+    SKIPPED_NOT_PENDING = "skipped_not_pending"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,11 +176,14 @@ class DailyTracker:
 
     async def collect_daily(
         self, event_id: int, ticker: str, target_date: date
-    ) -> bool:
+    ) -> CollectResult:
         """event_id + ticker + target_date 조합의 일봉을 KIS에서 수집해 DB에 UPSERT.
 
-        반환값: True(수집 성공), False(데이터 없음 또는 종목 미조회).
-        target_date 데이터 없으면 False — DB 변경 없음, status는 D5 담당.
+        반환값:
+            CollectResult.SUCCESS           — 수집 성공 (INSERT 또는 pending→success UPDATE)
+            CollectResult.SKIPPED_NOT_PENDING — UPSERT 충돌 시 status가 'pending'이 아니어서
+                                               conditional UPDATE가 no-op (race condition)
+            CollectResult.FAILED            — 데이터 없음 또는 종목 미조회
         """
         # 1단계: 메타 조회 (DB 커넥션 짧게 유지)
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
@@ -183,10 +193,10 @@ class DailyTracker:
             )
             row = await cur.fetchone()
             if row is None:
-                return False
+                return CollectResult.FAILED
             pick_date_str = row[0]
             if pick_date_str is None:
-                return False
+                return CollectResult.FAILED
 
             cur = await db.execute(
                 """
@@ -204,7 +214,7 @@ class DailyTracker:
                 logger.warning(
                     "collect_daily: stock not found event_id=%d ticker=%s", event_id, ticker
                 )
-                return False
+                return CollectResult.FAILED
             stock_pick_id = spid_row[0]
 
         # 2단계: 날짜 변환 + KIS 호출 (DB 커넥션 닫은 후)
@@ -215,7 +225,7 @@ class DailyTracker:
         target_date_str = target_date.isoformat()
         target_candle = next((c for c in candles if c.trade_date == target_date_str), None)
         if target_candle is None:
-            return False
+            return CollectResult.FAILED
 
         pick_date_candle = next((c for c in candles if c.trade_date == pick_date_str), None)
 
@@ -247,14 +257,16 @@ class DailyTracker:
                 " event_id=%d ticker=%s",
                 target_date, event_id, ticker,
             )
-            return False
+            return CollectResult.FAILED
 
         # 3단계: UPSERT
+        # ON CONFLICT DO UPDATE WHERE status='pending' — status가 'pending'이 아니면
+        # no-op (rowcount=0). 이 경우 SKIPPED_NOT_PENDING을 반환해 race를 호출부에 노출.
         now_iso = to_db_iso(now_kst())
         async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
             await db.execute("BEGIN")
             try:
-                await db.execute(
+                cursor = await db.execute(
                     """
                     INSERT INTO pick_daily_tracking
                         (stock_pick_id, trading_day, day_offset,
@@ -288,4 +300,6 @@ class DailyTracker:
                 await db.execute("ROLLBACK")
                 raise
 
-        return True
+        if cursor.rowcount == 0:
+            return CollectResult.SKIPPED_NOT_PENDING
+        return CollectResult.SUCCESS

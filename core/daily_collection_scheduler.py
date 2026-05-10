@@ -8,14 +8,14 @@ from datetime import date
 import aiosqlite
 from loguru import logger
 
-from core.daily_tracker import DailyTracker
+from core.daily_tracker import CollectResult, DailyTracker
 from core.time_utils import now_kst
 
 
 async def run_daily_collection(
     tracker: DailyTracker,
     today: date | None = None,
-) -> None:
+) -> dict[str, int]:
     """pick_daily_tracking의 당일 이하 pending 행에 대해 collect_daily 순차 실행.
 
     Args:
@@ -43,6 +43,7 @@ async def run_daily_collection(
     logger.info("[D4] daily collection started, targets=%d", len(targets))
 
     success_count = 0
+    skipped_count = 0
     failed_count = 0
     failed_list: list[str] = []
 
@@ -56,9 +57,10 @@ async def run_daily_collection(
             recheck_row = await recheck_cur.fetchone()
         if recheck_row is None or recheck_row[0] != "pending":
             logger.info(
-                "[D4] row skipped — no longer pending: id=%d status=%s",
+                "[D4] row skipped (pre-check) — id=%d status=%s",
                 pdt_id, recheck_row[0] if recheck_row else "deleted",
             )
+            skipped_count += 1
             continue
 
         row_start = time.monotonic()
@@ -67,14 +69,23 @@ async def run_daily_collection(
                 event_id, ticker, date.fromisoformat(trading_day)
             )
             elapsed = time.monotonic() - row_start
-            result_str = "success" if result else "failed"
-            logger.info(
-                "[D4] event_id=%d ticker=%s trading_day=%s result=%s elapsed=%.1fs",
-                event_id, ticker, trading_day, result_str, elapsed,
-            )
-            if result:
+            if result == CollectResult.SUCCESS:
+                logger.info(
+                    "[D4] event_id=%d ticker=%s trading_day=%s result=success elapsed=%.1fs",
+                    event_id, ticker, trading_day, elapsed,
+                )
                 success_count += 1
+            elif result == CollectResult.SKIPPED_NOT_PENDING:
+                logger.info(
+                    "[D4] row skipped (race) — event_id=%d ticker=%s trading_day=%s",
+                    event_id, ticker, trading_day,
+                )
+                skipped_count += 1
             else:
+                logger.warning(
+                    "[D4] event_id=%d ticker=%s trading_day=%s result=failed elapsed=%.1fs",
+                    event_id, ticker, trading_day, elapsed,
+                )
                 failed_count += 1
                 failed_list.append(f"{ticker}@{trading_day}")
         except Exception as exc:
@@ -91,9 +102,10 @@ async def run_daily_collection(
     total_elapsed = time.monotonic() - job_start
     failed_note = f", failed_list={failed_list}" if failed_list else ""
     logger.info(
-        "[D4] daily collection finished, success=%d, failed=%d, elapsed=%.1fs%s",
-        success_count, failed_count, total_elapsed, failed_note,
+        "[D4] daily collection finished, success=%d, skipped=%d, failed=%d, elapsed=%.1fs%s",
+        success_count, skipped_count, failed_count, total_elapsed, failed_note,
     )
+    return {"success": success_count, "skipped": skipped_count, "failed": failed_count}
 
 
 async def daily_collection_job(tracker: DailyTracker, kis_client) -> None:
