@@ -119,6 +119,7 @@ if __name__ == "__main__":
         m004_phase25_daily_tracking_status,
         m005_phase25_event_scoped_uniqueness,
         m006_phase25_event_pick_id,
+        m007_phase25_minute_raw_rebuild,
     )
 
     run_migrations(
@@ -130,6 +131,7 @@ if __name__ == "__main__":
             m004_phase25_daily_tracking_status,
             m005_phase25_event_scoped_uniqueness,
             m006_phase25_event_pick_id,
+            m007_phase25_minute_raw_rebuild,
         ],
         backup=True,
     )
