@@ -121,6 +121,7 @@ if __name__ == "__main__":
         m006_phase25_event_pick_id,
         m007_phase25_minute_raw_rebuild,
         m008_phase25_minute_agg,
+        m009_phase25_breakout_marks,
     )
 
     run_migrations(
@@ -134,6 +135,7 @@ if __name__ == "__main__":
             m006_phase25_event_pick_id,
             m007_phase25_minute_raw_rebuild,
             m008_phase25_minute_agg,
+            m009_phase25_breakout_marks,
         ],
         backup=True,
     )
