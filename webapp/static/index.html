@@ -37,6 +37,17 @@
   header .stat { color: var(--muted); font-size: 13px; }
   header .stat b { color: var(--text); }
 
+  .indexbar {
+    display: flex; gap: 28px; flex-wrap: wrap; align-items: center;
+    padding: 13px 28px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .ix { display: flex; align-items: baseline; gap: 9px; }
+  .ix .ixn { color: var(--muted); font-size: 13px; }
+  .ix .ixv { font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
+  .ix .ixc { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--faint); }
+  .ix .ixc.chg-up { color: var(--up); }
+  .ix .ixc.chg-down { color: var(--down); }
+
   .wrap {
     display: grid; grid-template-columns: 360px 1fr 300px; gap: 18px;
     padding: 22px 28px; max-width: 1500px; margin: 0 auto; align-items: start;
@@ -163,6 +174,8 @@
     <span class="stat">등록 <b id="hcount">0</b>종목 · <b id="hsectors">0</b>섹터</span>
   </header>
 
+  <div class="indexbar" id="indexbar"></div>
+
   <div class="wrap">
     <!-- 등록 패널 -->
     <section class="panel panel-pad">
@@ -282,7 +295,7 @@ $("submit").addEventListener("click", async () => {
   } finally { updateSubmit(); }
 });
 
-$("refresh").addEventListener("click", loadPicks);
+$("refresh").addEventListener("click", () => { loadIndices(); loadPicks(); });
 
 async function loadPicks(){
   try {
@@ -313,7 +326,10 @@ async function loadPicks(){
           <td class="rank">${i+1}</td>
           <td class="nm"><span class="avatar">${esc(initial(s.name))}</span>${esc(s.name)}</td>
           <td class="code">${s.code}</td>
+          <td class="r" data-q="price-${s.code}">—</td>
           <td class="r chg-na" data-chg="${s.code}">—</td>
+          <td class="r" data-q="value-${s.code}">—</td>
+          <td class="r" data-q="vol-${s.code}">—</td>
         </tr>`).join("");
       return `
         <div class="sector-block">
@@ -323,7 +339,10 @@ async function loadPicks(){
             <span class="cnt">${items.length}종목</span>
           </div>
           <table>
-            <thead><tr><th class="l" style="width:30px"></th><th class="l">종목</th><th class="l">코드</th><th>등락률</th></tr></thead>
+            <thead><tr>
+              <th class="l" style="width:30px"></th><th class="l">종목</th><th class="l">코드</th>
+              <th>현재가</th><th>등락률</th><th>거래대금</th><th>거래량</th>
+            </tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>`;
@@ -347,6 +366,11 @@ async function loadPicks(){
   }
 }
 
+function fmtPrice(p){ return p ? p.toLocaleString()+"원" : "—"; }
+function fmtValue(v){ return v ? Math.round(v/1e8).toLocaleString()+"억" : "—"; }
+function fmtVol(v){ return v ? Math.round(v/1e4).toLocaleString()+"만" : "—"; }
+function setCell(sel, text){ document.querySelectorAll(sel).forEach(el => el.textContent = text); }
+
 async function fetchQuotes(codes){
   if (!codes.length) return;
   try {
@@ -361,6 +385,9 @@ async function fetchQuotes(codes){
         el.textContent = (r > 0 ? "+" : "") + r.toFixed(2) + "%";
         el.classList.add(r > 0 ? "chg-up" : r < 0 ? "chg-down" : "chg-na");
       });
+      setCell(`td[data-q="price-${code}"]`, q ? fmtPrice(q.price) : "—");
+      setCell(`td[data-q="value-${code}"]`, q ? fmtValue(q.value) : "—");
+      setCell(`td[data-q="vol-${code}"]`, q ? fmtVol(q.volume) : "—");
     });
   } catch {}
 }
@@ -368,9 +395,27 @@ async function fetchQuotes(codes){
 // 드롭다운 내부 클릭은 바깥-클릭-닫기에서 제외. (innerHTML 재생성으로 e.target이
 // detach되면 closest 판정이 깨지므로, 컨테이너에서 전파를 끊어 오닫힘을 막는다.)
 $("dropdown").addEventListener("click", (e) => e.stopPropagation());
+async function loadIndices(){
+  try {
+    const res = await fetch("/api/indices");
+    const items = await res.json();
+    $("indexbar").innerHTML = items.map(it => {
+      if (it.value == null) return `<div class="ix"><span class="ixn">${esc(it.name)}</span><span class="ixv">—</span></div>`;
+      const r = it.change_rate, cls = r > 0 ? "chg-up" : r < 0 ? "chg-down" : "";
+      const v = it.value.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+      return `<div class="ix">
+        <span class="ixn">${esc(it.name)}</span>
+        <span class="ixv">${v}</span>
+        <span class="ixc ${cls}">${r>0?"+":""}${it.change.toFixed(2)} (${r>0?"+":""}${r.toFixed(2)}%)</span>
+      </div>`;
+    }).join("");
+  } catch {}
+}
+
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".search-box")) $("dropdown").style.display = "none";
 });
+loadIndices();
 loadPicks();
 </script>
 </body>

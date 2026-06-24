@@ -107,6 +107,27 @@ async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
     return out
 
 
+_INDICES = [("0001", "코스피"), ("1001", "코스닥")]
+
+
+@app.get("/api/indices")
+async def indices(kis: KISClient = Depends(get_kis)) -> list[dict]:
+    """국내 주요 지수(코스피·코스닥) 현재값·등락. 실패 시 값은 null."""
+    out: list[dict] = []
+    for code, name in _INDICES:
+        try:
+            q = await kis.get_index(code)
+            out.append({
+                "name": name,
+                "value": q["value"],
+                "change": q["change"],
+                "change_rate": q["change_rate"],
+            })
+        except Exception:
+            out.append({"name": name, "value": None, "change": None, "change_rate": None})
+    return out
+
+
 @app.get("/api/quotes")
 async def quotes(
     codes: str = "",
@@ -118,7 +139,12 @@ async def quotes(
     for code in code_list:
         try:
             q = await kis.get_quote(code)
-            out[code] = {"price": q["price"], "change_rate": q["change_rate"]}
+            out[code] = {
+                "price": q["price"],
+                "change_rate": q["change_rate"],
+                "volume": q.get("volume", 0),
+                "value": q.get("value", 0),
+            }
         except Exception:
             out[code] = None
     return out

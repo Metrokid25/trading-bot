@@ -221,6 +221,37 @@ class KISClient:
             "code": code,
             "price": int(_f(out.get("stck_prpr"))),
             "change_rate": _f(out.get("prdy_ctrt")),  # 부호 포함 등락률 %
+            "volume": int(_f(out.get("acml_vol"))),  # 누적 거래량(주)
+            "value": int(_f(out.get("acml_tr_pbmn"))),  # 누적 거래대금(원)
+        }
+
+    async def get_index(self, code: str) -> dict[str, Any]:
+        """국내 업종지수 현재가. code: '0001'(코스피) / '1001'(코스닥).
+
+        inquire-index-price (TR FHPUP02100000), 시장구분 'U'(업종).
+        """
+        await self._market_limiter.acquire()
+        headers = await self._real_headers("FHPUP02100000")
+        params = {"FID_COND_MRKT_DIV_CODE": "U", "FID_INPUT_ISCD": code}
+        r = await self._real_client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-index-price",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        out = r.json().get("output", {}) or {}
+
+        def _f(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            "code": code,
+            "value": _f(out.get("bstp_nmix_prpr")),  # 업종지수 현재가
+            "change": _f(out.get("bstp_nmix_prdy_vrss")),  # 전일대비
+            "change_rate": _f(out.get("bstp_nmix_prdy_ctrt")),  # 전일대비율 %
         }
 
     async def get_minute_candles(self, code: str) -> list[dict[str, Any]]:
