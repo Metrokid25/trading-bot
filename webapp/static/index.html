@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>trading-bot 종목 등록</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171920;
+    --panel-2: #1e2129;
+    --hover: #262a34;
+    --border: #262932;
+    --text: #eaecef;
+    --muted: #8b8f9b;
+    --faint: #6b6f7a;
+    --blue: #3182f6;
+    --up: #f0616d;
+    --down: #4c8dff;
+    --green: #2ac1a0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Apple SD Gothic Neo", "Pretendard", "Malgun Gothic", sans-serif;
+    font-size: 14px; -webkit-font-smoothing: antialiased;
+  }
+  header {
+    padding: 14px 28px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; position: sticky; top: 0;
+    background: rgba(15,17,21,.85); backdrop-filter: blur(8px); z-index: 50;
+  }
+  header .logo { font-weight: 800; font-size: 17px; letter-spacing: -.3px; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header .stat { color: var(--muted); font-size: 13px; }
+  header .stat b { color: var(--text); }
+
+  .wrap {
+    display: grid; grid-template-columns: 360px 1fr 300px; gap: 18px;
+    padding: 22px 28px; max-width: 1500px; margin: 0 auto; align-items: start;
+  }
+  @media (max-width: 1200px) { .wrap { grid-template-columns: 340px 1fr; } .side { display: none; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; }
+  .panel-pad { padding: 20px; }
+  .panel h2 { margin: 0 0 4px; font-size: 16px; letter-spacing: -.2px; }
+  .panel .sub { color: var(--faint); font-size: 12px; margin-bottom: 16px; }
+
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 7px; font-weight: 600; }
+  input[type=text] {
+    width: 100%; padding: 12px 13px; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 11px; color: var(--text); font-size: 14px;
+  }
+  input[type=text]::placeholder { color: var(--faint); }
+  input[type=text]:focus { outline: none; border-color: var(--blue); background: #1b1f29; }
+
+  .search-box { position: relative; }
+  .dropdown {
+    position: absolute; top: 46px; left: 0; right: 0; z-index: 30;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; max-height: 300px; overflow-y: auto; box-shadow: 0 12px 30px rgba(0,0,0,.4);
+  }
+  .dd-item { padding: 11px 13px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+  .dd-item:hover { background: var(--hover); }
+  .dd-item.on { background: #1b2535; }
+  .dd-item .ck {
+    width: 17px; height: 17px; flex: 0 0 17px; border-radius: 5px; border: 1.5px solid #3a4150;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 12px; color: #fff;
+  }
+  .dd-item.on .ck { background: var(--blue); border-color: var(--blue); }
+  .dd-item .nm { font-weight: 500; flex: 1; }
+  .dd-item .code { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .dd-foot {
+    display: flex; justify-content: space-between; align-items: center; padding: 10px 13px;
+    border-top: 1px solid var(--border); color: var(--muted); font-size: 12px;
+    position: sticky; bottom: 0; background: var(--panel-2);
+  }
+  .dd-foot b { color: var(--text); }
+  .dd-foot button {
+    background: var(--blue); color: #fff; border: none; border-radius: 7px;
+    padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; min-height: 8px; }
+  .chip {
+    background: #1d2735; color: #bcd2ff;
+    border: 1px solid #314563; border-radius: 999px; padding: 7px 8px 7px 12px;
+    font-size: 13px; display: flex; gap: 7px; align-items: center;
+  }
+  .chip .code { color: #7f96c2; font-size: 11px; }
+  .chip button { background: none; border: none; color: #8aa3d4; cursor: pointer; font-size: 15px; line-height: 1; padding: 0; }
+  .chip button:hover { color: #fff; }
+
+  button.primary {
+    width: 100%; margin-top: 18px; padding: 13px; background: var(--blue);
+    color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer;
+    transition: filter .12s;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.primary:disabled { background: #20283a; color: #5b6678; cursor: not-allowed; filter: none; }
+  .msg { margin-top: 13px; font-size: 13px; min-height: 18px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--up); }
+
+  /* 현황 */
+  .status-head { display: flex; align-items: center; justify-content: space-between; padding: 20px 20px 6px; }
+  .status-head h2 { margin: 0; font-size: 16px; }
+  .refresh { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 6px 11px; cursor: pointer; font-size: 12px; }
+  .refresh:hover { background: var(--hover); color: var(--text); }
+
+  .sector-block { padding: 6px 8px 4px; }
+  .sector-title {
+    display: flex; align-items: center; gap: 9px; padding: 12px 12px 8px;
+  }
+  .sector-title .name { font-weight: 700; font-size: 14px; }
+  .sector-title .cnt { color: var(--faint); font-size: 12px; }
+  .sector-title .bestbadge {
+    margin-left: auto; font-size: 11px; color: #ffd479; background: #2c2718;
+    border: 1px solid #4a3f1d; border-radius: 6px; padding: 2px 7px;
+  }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { color: var(--muted); font-size: 11px; font-weight: 600; text-align: right; padding: 6px 12px; }
+  th.l { text-align: left; }
+  td { padding: 11px 12px; border-top: 1px solid var(--border); font-size: 14px; }
+  tr.row:hover td { background: var(--panel-2); }
+  td.rank { color: var(--faint); width: 30px; font-variant-numeric: tabular-nums; }
+  td.nm { font-weight: 600; }
+  td.code { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+  td.r { text-align: right; font-variant-numeric: tabular-nums; }
+  td.chg-na { color: var(--faint); }
+  .avatar {
+    display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+    border-radius: 50%; background: linear-gradient(135deg,#2a3140,#1c2230); color: #9fb4d8;
+    font-size: 11px; font-weight: 700; margin-right: 9px; vertical-align: middle;
+  }
+
+  .empty { color: var(--faint); padding: 48px 0; text-align: center; }
+  .empty .big { font-size: 32px; margin-bottom: 10px; }
+
+  /* 사이드 요약 */
+  .side .panel-pad { padding: 18px; }
+  .sumrow { display: flex; align-items: center; gap: 10px; padding: 9px 0; }
+  .sumrow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
+  .sumrow .nm { font-size: 13px; }
+  .sumrow .cnt { margin-left: auto; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: var(--panel-2); border-radius: 4px; margin-top: 4px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--blue); }
+  .side h2 { font-size: 15px; margin: 0 0 14px; }
+  .side .total { font-size: 28px; font-weight: 800; letter-spacing: -.5px; }
+  .side .total small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="logo">📈 trading-bot</span>
+    <span class="tag">종목 등록 · 로컬 전용</span>
+    <span class="spacer"></span>
+    <span class="stat">등록 <b id="hcount">0</b>종목 · <b id="hsectors">0</b>섹터</span>
+  </header>
+
+  <div class="wrap">
+    <!-- 등록 패널 -->
+    <section class="panel panel-pad">
+      <h2>종목 등록</h2>
+      <div class="sub">섹터를 정하고 종목을 검색해 추가하세요</div>
+
+      <label>섹터명</label>
+      <input type="text" id="sector" placeholder="예: 반도체, 2차전지, 조선" />
+
+      <label>종목 검색 (한글명 / 코드)</label>
+      <div class="search-box">
+        <input type="text" id="search" placeholder="삼성전자, 005930 …" autocomplete="off" />
+        <div class="dropdown" id="dropdown" style="display:none"></div>
+      </div>
+
+      <div class="chips" id="chips"></div>
+
+      <button class="primary" id="submit" disabled>등록</button>
+      <div class="msg" id="msg"></div>
+    </section>
+
+    <!-- 현황 패널 -->
+    <section class="panel">
+      <div class="status-head">
+        <h2>등록 현황</h2>
+        <button class="refresh" id="refresh">↻ 새로고침</button>
+      </div>
+      <div id="picks"></div>
+    </section>
+
+    <!-- 사이드 요약 -->
+    <aside class="side">
+      <section class="panel panel-pad">
+        <h2>요약</h2>
+        <div class="total"><span id="stotal">0</span><small>종목</small></div>
+        <div id="sectorbars" style="margin-top:16px"></div>
+      </section>
+    </aside>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let selected = [];
+let searchTimer = null;
+const SECTOR_COLORS = ["#3182f6","#2ac1a0","#f0616d","#f5a623","#9b6cf0","#19b6c9","#e8639b"];
+
+function renderChips() {
+  $("chips").innerHTML = selected.map((s, i) =>
+    `<span class="chip">${esc(s.name)} <span class="code">${s.code}</span>
+       <button onclick="removeChip(${i})">×</button></span>`).join("");
+  updateSubmit();
+}
+function removeChip(i){
+  selected.splice(i,1); renderChips();
+  if ($("dropdown").style.display === "block") renderDropdown();
+}
+function updateSubmit(){ $("submit").disabled = !($("sector").value.trim() && selected.length); }
+function esc(s){ return (s||"").replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&#39;','"':'&quot;'}[c])); }
+function initial(name){ return (name||"?").trim().charAt(0); }
+
+$("sector").addEventListener("input", updateSubmit);
+$("search").addEventListener("input", (e) => {
+  const q = e.target.value.trim();
+  clearTimeout(searchTimer);
+  if (!q){ $("dropdown").style.display="none"; return; }
+  searchTimer = setTimeout(() => doSearch(q), 160);
+});
+
+let lastResults = [];
+async function doSearch(q){
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=10`);
+    lastResults = await res.json();
+    renderDropdown();
+  } catch { $("dropdown").style.display = "none"; }
+}
+function renderDropdown(){
+  if (!lastResults.length){ $("dropdown").style.display="none"; return; }
+  const rows = lastResults.map(it => {
+    const on = selected.some(s => s.code === it.code);
+    return `<div class="dd-item${on?' on':''}" onclick="toggleSelect('${it.code}','${esc(it.name)}')">
+      <span class="ck">${on?'✓':''}</span>
+      <span class="nm">${esc(it.name)}</span><span class="code">${it.code}</span></div>`;
+  }).join("");
+  $("dropdown").innerHTML = rows +
+    `<div class="dd-foot"><span>선택 <b>${selected.length}</b>개</span>
+       <button type="button" onclick="closeDropdown()">완료</button></div>`;
+  $("dropdown").style.display = "block";
+}
+function toggleSelect(code, name){
+  const i = selected.findIndex(s => s.code === code);
+  if (i >= 0) selected.splice(i, 1); else selected.push({ code, name });
+  renderChips();
+  renderDropdown();
+}
+function closeDropdown(){ $("dropdown").style.display = "none"; }
+
+$("submit").addEventListener("click", async () => {
+  const sector = $("sector").value.trim();
+  if (!sector || !selected.length) return;
+  $("submit").disabled = true;
+  $("msg").className = "msg"; $("msg").textContent = "등록 중…";
+  try {
+    const res = await fetch("/api/picks", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ sector_name: sector, stocks: selected }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "등록 실패");
+    $("msg").className = "msg ok";
+    $("msg").textContent = `✅ [${sector}] ${data.added}종목 등록 (총 ${data.total}` +
+      (data.skipped.length ? `, 중복 ${data.skipped.length}` : "") + ")";
+    selected = []; renderChips();
+    loadPicks();
+  } catch (err) {
+    $("msg").className = "msg err"; $("msg").textContent = "❌ " + err.message;
+  } finally { updateSubmit(); }
+});
+
+$("refresh").addEventListener("click", loadPicks);
+
+async function loadPicks(){
+  try {
+    const res = await fetch("/api/picks");
+    const picks = await res.json();
+    // sector → [{name,code,pick_id,expires}]
+    const bySector = {};
+    let total = 0;
+    for (const p of picks) for (const s of p.stocks) {
+      (bySector[s.sector] = bySector[s.sector] || []).push({...s, pick_id: p.pick_id, expires: p.expires_at.slice(0,10)});
+      total++;
+    }
+    const sectors = Object.keys(bySector);
+    $("hcount").textContent = total;
+    $("hsectors").textContent = sectors.length;
+    $("stotal").textContent = total;
+
+    if (!total) {
+      $("picks").innerHTML = `<div class="empty"><div class="big">🗂️</div>아직 등록된 종목이 없습니다.<br>왼쪽에서 섹터와 종목을 추가해보세요.</div>`;
+      $("sectorbars").innerHTML = `<div style="color:var(--faint);font-size:13px">—</div>`;
+      return;
+    }
+
+    $("picks").innerHTML = sectors.map((sec, si) => {
+      const items = bySector[sec];
+      const rows = items.map((s, i) => `
+        <tr class="row">
+          <td class="rank">${i+1}</td>
+          <td class="nm"><span class="avatar">${esc(initial(s.name))}</span>${esc(s.name)}</td>
+          <td class="code">${s.code}</td>
+          <td class="r chg-na">—</td>
+        </tr>`).join("");
+      return `
+        <div class="sector-block">
+          <div class="sector-title">
+            <span class="dot" style="width:9px;height:9px;border-radius:50%;background:${SECTOR_COLORS[si%SECTOR_COLORS.length]}"></span>
+            <span class="name">${esc(sec)}</span>
+            <span class="cnt">${items.length}종목</span>
+          </div>
+          <table>
+            <thead><tr><th class="l" style="width:30px"></th><th class="l">종목</th><th class="l">코드</th><th>등락률</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    }).join("");
+
+    $("sectorbars").innerHTML = sectors.map((sec, si) => {
+      const cnt = bySector[sec].length;
+      const pct = Math.round(cnt / total * 100);
+      const color = SECTOR_COLORS[si % SECTOR_COLORS.length];
+      return `<div>
+        <div class="sumrow"><span class="dot" style="background:${color}"></span>
+          <span class="nm">${esc(sec)}</span><span class="cnt">${cnt}</span></div>
+        <div class="bar"><span style="width:${pct}%;background:${color}"></span></div>
+      </div>`;
+    }).join("");
+  } catch {
+    $("picks").innerHTML = `<div class="empty">현황을 불러오지 못했습니다.</div>`;
+  }
+}
+
+// 드롭다운 내부 클릭은 바깥-클릭-닫기에서 제외. (innerHTML 재생성으로 e.target이
+// detach되면 closest 판정이 깨지므로, 컨테이너에서 전파를 끊어 오닫힘을 막는다.)
+$("dropdown").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".search-box")) $("dropdown").style.display = "none";
+});
+loadPicks();
+</script>
+</body>
+</html>

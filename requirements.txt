@@ -13,3 +13,5 @@ pytz>=2024.1
 apscheduler>=3.10.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
