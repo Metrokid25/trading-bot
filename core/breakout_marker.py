@@ -168,17 +168,18 @@ class BreakoutMarker:
                 f"""
                 SELECT DISTINCT
                     pdt.id,
-                    pma.event_id,
-                    pma.stock_pick_id,
-                    pma.stock_code,
+                    pdt.event_id,
+                    pdt.stock_pick_id,
+                    ss.stock_code,
                     pdt.trading_day,
                     pdt.day_offset
                 FROM pick_daily_tracking pdt
+                JOIN sector_stocks ss ON ss.id = pdt.stock_pick_id
                 JOIN pick_minute_agg pma ON pma.daily_tracking_id = pdt.id
                 WHERE pdt.day_offset = 0
                   AND pma.interval_minutes IN (?, ?)
                   {trading_day_filter}
-                ORDER BY pma.event_id, pma.stock_pick_id
+                ORDER BY pdt.event_id, pdt.stock_pick_id
                 """,
                 tuple(params),
             )
