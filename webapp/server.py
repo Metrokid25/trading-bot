@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from core.kis_api import KISClient
 from core.time_utils import now_kst
 from data.sector_models import SectorPick, SectorStock
 from data.sector_store import SectorStore
@@ -30,12 +31,15 @@ async def lifespan(app: FastAPI):
     store = SectorStore()
     await store.open()
     master = StockMaster()
+    kis = KISClient()
     app.state.store = store
     app.state.master = master
+    app.state.kis = kis
     try:
         yield
     finally:
         await store.close()
+        await kis.close()
 
 
 app = FastAPI(title="trading-bot 종목 등록", lifespan=lifespan)
@@ -48,6 +52,10 @@ def get_store(request: Request) -> SectorStore:
 
 def get_master(request: Request) -> StockMaster:
     return request.app.state.master
+
+
+def get_kis(request: Request) -> KISClient:
+    return request.app.state.kis
 
 
 # ----- 요청/응답 모델 -----
@@ -96,6 +104,23 @@ async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
                 ],
             }
         )
+    return out
+
+
+@app.get("/api/quotes")
+async def quotes(
+    codes: str = "",
+    kis: KISClient = Depends(get_kis),
+) -> dict[str, dict | None]:
+    """종목별 현재가·등락률. codes=콤마구분 6자리코드. 실패 종목은 null."""
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:60]
+    out: dict[str, dict | None] = {}
+    for code in code_list:
+        try:
+            q = await kis.get_quote(code)
+            out[code] = {"price": q["price"], "change_rate": q["change_rate"]}
+        except Exception:
+            out[code] = None
     return out
 
 

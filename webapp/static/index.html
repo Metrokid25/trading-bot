@@ -131,6 +131,8 @@
   td.code { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
   td.r { text-align: right; font-variant-numeric: tabular-nums; }
   td.chg-na { color: var(--faint); }
+  td.chg-up { color: var(--up); font-weight: 600; }
+  td.chg-down { color: var(--down); font-weight: 600; }
   .avatar {
     display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
     border-radius: 50%; background: linear-gradient(135deg,#2a3140,#1c2230); color: #9fb4d8;
@@ -311,7 +313,7 @@ async function loadPicks(){
           <td class="rank">${i+1}</td>
           <td class="nm"><span class="avatar">${esc(initial(s.name))}</span>${esc(s.name)}</td>
           <td class="code">${s.code}</td>
-          <td class="r chg-na">—</td>
+          <td class="r chg-na" data-chg="${s.code}">—</td>
         </tr>`).join("");
       return `
         <div class="sector-block">
@@ -337,9 +339,30 @@ async function loadPicks(){
         <div class="bar"><span style="width:${pct}%;background:${color}"></span></div>
       </div>`;
     }).join("");
+
+    const allCodes = [...new Set(picks.flatMap(p => p.stocks.map(s => s.code)))];
+    fetchQuotes(allCodes);
   } catch {
     $("picks").innerHTML = `<div class="empty">현황을 불러오지 못했습니다.</div>`;
   }
+}
+
+async function fetchQuotes(codes){
+  if (!codes.length) return;
+  try {
+    const res = await fetch(`/api/quotes?codes=${codes.join(",")}`);
+    const data = await res.json();
+    codes.forEach(code => {
+      const q = data[code];
+      document.querySelectorAll(`td[data-chg="${code}"]`).forEach(el => {
+        el.classList.remove("chg-na","chg-up","chg-down");
+        if (!q) { el.textContent = "—"; el.classList.add("chg-na"); return; }
+        const r = q.change_rate;
+        el.textContent = (r > 0 ? "+" : "") + r.toFixed(2) + "%";
+        el.classList.add(r > 0 ? "chg-up" : r < 0 ? "chg-down" : "chg-na");
+      });
+    });
+  } catch {}
 }
 
 // 드롭다운 내부 클릭은 바깥-클릭-닫기에서 제외. (innerHTML 재생성으로 e.target이

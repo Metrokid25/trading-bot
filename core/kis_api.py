@@ -198,6 +198,31 @@ class KISClient:
         r.raise_for_status()
         return int(r.json()["output"]["stck_prpr"])
 
+    async def get_quote(self, code: str) -> dict[str, Any]:
+        """현재가 + 전일대비 등락률(%) 조회. inquire-price output 파싱."""
+        await self._market_limiter.acquire()
+        headers = await self._real_headers("FHKST01010100")
+        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+        r = await self._real_client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-price",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        out = r.json().get("output", {}) or {}
+
+        def _f(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            "code": code,
+            "price": int(_f(out.get("stck_prpr"))),
+            "change_rate": _f(out.get("prdy_ctrt")),  # 부호 포함 등락률 %
+        }
+
     async def get_minute_candles(self, code: str) -> list[dict[str, Any]]:
         """당일 1분봉 30개 조회 (현재 시각 기준 과거 방향).
 

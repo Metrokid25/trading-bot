@@ -6,7 +6,19 @@ import pytest_asyncio
 from httpx import ASGITransport
 
 from data.sector_store import SectorStore
-from webapp.server import app, get_master, get_store
+from webapp.server import app, get_kis, get_master, get_store
+
+
+class FakeKis:
+    """네트워크 없는 결정적 시세 (KIS 실호출 회피)."""
+
+    _Q = {"005930": (75000, 1.5), "000660": (130000, -2.3)}
+
+    async def get_quote(self, code: str):
+        if code not in self._Q:
+            raise RuntimeError("no data")
+        price, rate = self._Q[code]
+        return {"code": code, "price": price, "change_rate": rate}
 
 
 class FakeMaster:
@@ -38,6 +50,7 @@ async def client(tmp_path):
     master = FakeMaster()
     app.dependency_overrides[get_store] = lambda: store
     app.dependency_overrides[get_master] = lambda: master
+    app.dependency_overrides[get_kis] = lambda: FakeKis()
 
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -60,6 +73,16 @@ async def test_search_empty_query_returns_empty(client):
     res = await client.get("/api/search", params={"q": ""})
     assert res.status_code == 200
     assert res.json() == []
+
+
+@pytest.mark.asyncio
+async def test_quotes_returns_price_and_change(client):
+    res = await client.get("/api/quotes", params={"codes": "005930,000660,999999"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["005930"] == {"price": 75000, "change_rate": 1.5}
+    assert data["000660"]["change_rate"] == -2.3
+    assert data["999999"] is None  # 조회 실패 종목은 null
 
 
 @pytest.mark.asyncio
