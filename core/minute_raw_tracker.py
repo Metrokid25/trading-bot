@@ -27,7 +27,7 @@ class MinuteCollectResult(Enum):
 
 class MinuteCandleClient(Protocol):
     async def get_minute_candles_at(
-        self, code: str, hhmmss: str, past_data: bool = True
+        self, code: str, hhmmss: str, past_data: bool = True, market_code: str = "J"
     ) -> list[dict[str, Any]]:
         ...
 
@@ -66,9 +66,27 @@ def _parse_optional_int(value: Any) -> int | None:
 
 
 class MinuteRawTracker:
-    def __init__(self, db_path: str, kis_client: MinuteCandleClient) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        kis_client: MinuteCandleClient,
+        *,
+        market_code: str = "J",
+        floor_hour: int = 9,
+    ) -> None:
+        """D+0 분봉 수집기.
+
+        market_code: KIS 분봉 조회 시장코드. 기본 "J"(KRX 정규장). NXT 장전
+            (08:00~09:00) 포함 수집은 "UN"(통합) 또는 "NX"(NXT) 사용.
+        floor_hour: 과거 방향 페이징을 멈출 시(hour) 하한. 기본 9 → 09:00까지만.
+            NXT 장전까지 받으려면 8 → 08:00까지 페이징. 0~23 범위만 허용.
+        """
+        if not 0 <= floor_hour <= 23:
+            raise ValueError(f"floor_hour must be in 0..23, got {floor_hour}")
         self.db_path = db_path
         self.kis_client = kis_client
+        self.market_code = market_code
+        self.floor_hour = floor_hour
 
     async def list_d0_targets(
         self, trading_day: str | None = None
@@ -190,13 +208,20 @@ class MinuteRawTracker:
         end_hhmmss: str = "153000",
         max_pages: int = 20,
         sleep_sec: float = 0.0,
+        market_code: str | None = None,
+        floor_hour: int | None = None,
     ) -> list[MinuteRawBar]:
+        # market_code/floor_hour: None이면 인스턴스 설정 사용. 단건 테스트·예외
+        # 수집용 per-call override. 정규 진입점(collect_d0_*)은 인스턴스 설정을
+        # 그대로 쓰므로 NXT 수집은 생성자에서 market_code="UN"/floor_hour=8로 지정.
+        market_code = self.market_code if market_code is None else market_code
+        floor_hour = self.floor_hour if floor_hour is None else floor_hour
         collected: dict[str, MinuteRawBar] = {}
         hhmmss = end_hhmmss
 
         for _ in range(max_pages):
             rows = await self.kis_client.get_minute_candles_at(
-                stock_code, hhmmss, past_data=True
+                stock_code, hhmmss, past_data=True, market_code=market_code
             )
             if not rows:
                 break
@@ -231,7 +256,7 @@ class MinuteRawTracker:
                 break
 
             next_dt = oldest_dt - timedelta(seconds=1)
-            if next_dt.hour < 9:
+            if next_dt.hour < floor_hour:
                 break
             hhmmss = next_dt.strftime("%H%M%S")
             if sleep_sec > 0:

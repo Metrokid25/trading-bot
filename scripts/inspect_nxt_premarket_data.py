@@ -146,10 +146,25 @@ def _agg_builder_findings() -> list[tuple[int, str]]:
     return findings
 
 
-def _agg_supports_08(findings: list[tuple[int, str]]) -> bool:
-    has_0900_anchor = any("hour=9" in line and "minute=0" in line for _, line in findings)
-    has_pre_session_skip = any("ts < session_start" in line for _, line in findings)
-    return not (has_0900_anchor and has_pre_session_skip)
+def _agg_supports_08() -> bool:
+    """집계기가 08:00 버킷을 실제로 생성하는지 동작으로 확인.
+
+    소스 텍스트 패턴 매칭이 아니라 MinuteAggBuilder를 session_start_hour=8로
+    인스턴스화해 08:00 raw 봉이 08-hour 버킷으로 묶이는지 직접 검증한다.
+    (read-only: :memory: + 순수 in-memory 집계, DB/파일/네트워크 부작용 없음)
+    """
+    try:
+        from core.minute_agg_builder import MinuteAggBuilder, MinuteRawRow
+
+        builder = MinuteAggBuilder(":memory:", session_start_hour=8)
+        bars = builder.build_agg_bars(
+            [MinuteRawRow("2026-01-02T08:00:00", 1.0, 1.0, 1.0, 1.0, 1, None)],
+            3,
+            trading_day="2026-01-02",
+        )
+        return any(bar.bucket_start.endswith("T08:00:00") for bar in bars)
+    except Exception:
+        return False
 
 
 def inspect_db(db_path: str | Path, trading_day: str | None = None) -> InspectionResult:
@@ -306,7 +321,7 @@ def inspect_db(db_path: str | Path, trading_day: str | None = None) -> Inspectio
         premarket_ohlcv=premarket_ohlcv,
         agg_08_bucket_count=agg_08_bucket_count,
         agg_builder_findings=findings,
-        agg_supports_08=_agg_supports_08(findings),
+        agg_supports_08=_agg_supports_08(),
     )
 
 

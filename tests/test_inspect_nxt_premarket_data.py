@@ -251,7 +251,9 @@ def test_legacy_bar_time_schema_does_not_crash(tmp_path: Path):
     assert result.trading_day_raw_rows == 1
     assert result.premarket_rows == 0
     assert "MIGRATIONS_MISSING" in result.verdicts
-    assert "NXT_AGG_NEEDS_CHANGE" in result.verdicts
+    # B2 수정(minute_agg_builder 세션 앵커 파라미터화) 이후, 집계기는 08:00
+    # 버킷을 지원하므로 인스펙터가 SUPPORTS 로 판정한다.
+    assert "NXT_AGG_SUPPORTS_08_BUCKETS" in result.verdicts
     assert "pick_minute_raw schema: legacy_bar_time" in report
 
 

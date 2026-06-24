@@ -363,6 +363,37 @@ def test_bucket_boundaries():
     ]
 
 
+def test_nxt_premarket_anchor_buckets_08_and_keeps_0900_aligned():
+    """session_start_hour=8: 08:00 장전 3분봉 생성 + 09:00 경계 정렬 유지."""
+    builder = MinuteAggBuilder(":memory:", session_start_hour=8)
+    rows = [
+        MinuteRawRow("2026-05-06T08:00:00", 1, 1, 1, 1, 1, None),
+        MinuteRawRow("2026-05-06T08:01:00", 1, 1, 1, 1, 1, None),
+        MinuteRawRow("2026-05-06T08:02:00", 1, 1, 1, 1, 1, None),
+        MinuteRawRow("2026-05-06T09:00:00", 1, 1, 1, 1, 1, None),
+    ]
+
+    bars = builder.build_agg_bars(rows, 3)
+
+    starts = [bar.bucket_start for bar in bars]
+    # 장전 08:00 버킷이 생성되고, 09:00은 60분=3의 배수라 깨끗한 버킷 경계로 정렬.
+    assert "2026-05-06T08:00:00" in starts
+    assert "2026-05-06T09:00:00" in starts
+
+
+def test_default_anchor_still_skips_premarket():
+    """기본(09:00 앵커): 08:xx 장전 분봉은 버려지고 09:00만 집계된다."""
+    builder = MinuteAggBuilder(":memory:")
+    rows = [
+        MinuteRawRow("2026-05-06T08:30:00", 1, 1, 1, 1, 1, None),
+        MinuteRawRow("2026-05-06T09:00:00", 1, 1, 1, 1, 1, None),
+    ]
+
+    bars = builder.build_agg_bars(rows, 3)
+
+    assert [bar.bucket_start for bar in bars] == ["2026-05-06T09:00:00"]
+
+
 def test_value_null_handling():
     builder = MinuteAggBuilder(":memory:")
     all_null = builder.build_agg_bars(

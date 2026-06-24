@@ -83,8 +83,23 @@ def _normalize_intervals(intervals: tuple[int, ...]) -> tuple[int, ...]:
 
 
 class MinuteAggBuilder:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        session_start_hour: int = 9,
+        session_start_minute: int = 0,
+    ) -> None:
+        """N분봉 집계기.
+
+        session_start_hour/minute: 버킷 정렬 기준 세션 시작 시각. 기본 09:00.
+            이 시각 이전 분봉은 버려진다. NXT 장전(08:00~09:00)을 3/5분봉으로
+            집계하려면 session_start_hour=8. 08:00~09:00은 60분이라 3·5분 모두
+            정수 배수 → 정규장(09:00) 버킷 경계도 그대로 정렬된다.
+        """
         self.db_path = db_path
+        self.session_start_hour = session_start_hour
+        self.session_start_minute = session_start_minute
 
     async def list_d0_targets(
         self, trading_day: str | None = None
@@ -188,9 +203,8 @@ class MinuteAggBuilder:
             for row in rows
         ]
 
-    @staticmethod
     def _bucket_bounds(
-        minute_time: str, interval_minutes: int, trading_day: str | None = None
+        self, minute_time: str, interval_minutes: int, trading_day: str | None = None
     ) -> tuple[str, str, datetime] | None:
         try:
             ts = datetime.fromisoformat(minute_time)
@@ -200,7 +214,12 @@ class MinuteAggBuilder:
         if trading_day is not None and ts.date().isoformat() != trading_day:
             return None
 
-        session_start = ts.replace(hour=9, minute=0, second=0, microsecond=0)
+        session_start = ts.replace(
+            hour=self.session_start_hour,
+            minute=self.session_start_minute,
+            second=0,
+            microsecond=0,
+        )
         if ts < session_start:
             return None
 

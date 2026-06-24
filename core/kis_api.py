@@ -225,18 +225,22 @@ class KISClient:
         return r.json().get("output2", [])
 
     async def get_minute_candles_at(
-        self, code: str, hhmmss: str, past_data: bool = True
+        self, code: str, hhmmss: str, past_data: bool = True, market_code: str = "J"
     ) -> list[dict[str, Any]]:
         """특정 시각 기준 과거 방향으로 분봉 30개 반환 (당일 내).
 
         KIS 주식당일분봉조회는 `FID_INPUT_HOUR_1` 에 HHMMSS(6자리)를 주면
         그 시각 기준 이전 30개 분봉을 돌려준다. 페이지네이션에 사용.
+
+        market_code: FID_COND_MRKT_DIV_CODE. 기본 "J"(KRX 정규장). NXT 장전
+        (08:00~09:00)을 받으려면 "NX"(NXT) 또는 "UN"(통합)을 넘긴다. "J"는
+        장전 시각을 무시하고 정규장 데이터만 돌려준다(프로브로 확인).
         """
         await self._market_limiter.acquire()
         headers = await self._real_headers("FHKST03010200")
         params = {
             "FID_ETC_CLS_CODE": "",
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": market_code,
             "FID_INPUT_ISCD": code,
             "FID_INPUT_HOUR_1": hhmmss,
             "FID_PW_DATA_INCU_YN": "Y" if past_data else "N",

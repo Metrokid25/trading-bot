@@ -332,6 +332,53 @@ async def test_fetch_minute_raw_parses_filters_malformed_and_dedupes():
 
 
 @pytest.mark.asyncio
+async def test_nxt_mode_passes_market_code_and_pages_into_premarket():
+    """NXT 모드: market_code 전달 + 08:00 장전까지 페이징."""
+    client = MagicMock()
+    client.get_minute_candles_at = AsyncMock(
+        side_effect=[
+            [_kis_row("20260506", "085900"), _kis_row("20260506", "085800")],
+            [_kis_row("20260506", "084000"), _kis_row("20260506", "083900")],
+            [_kis_row("20260506", "080100"), _kis_row("20260506", "080000")],
+        ]
+    )
+    tracker = MinuteRawTracker(":memory:", client, market_code="UN", floor_hour=8)
+
+    bars = await tracker.fetch_minute_raw_for_day("005930", "2026-05-06")
+
+    # 모든 호출에 market_code="UN" 이 전달되어야 한다.
+    # 08:00 도달 시 next_dt(07:59:59).hour < 8 → 3회 호출 후 페이징 종료.
+    assert client.get_minute_candles_at.await_count == 3
+    for call in client.get_minute_candles_at.await_args_list:
+        assert call.kwargs["market_code"] == "UN"
+
+    # 08:00 장전 분봉이 수집되어야 한다 (floor_hour=8 덕분에 페이징 계속).
+    minute_times = [bar.minute_time for bar in bars]
+    assert "2026-05-06T08:00:00" in minute_times
+    assert "2026-05-06T08:59:00" in minute_times
+
+
+@pytest.mark.asyncio
+async def test_default_mode_stops_at_0900_and_uses_j_market_code():
+    """기본 모드: market_code="J", 09:00 이전으로는 페이징하지 않는다."""
+    client = MagicMock()
+    client.get_minute_candles_at = AsyncMock(
+        side_effect=[[_kis_row("20260506", "090100"), _kis_row("20260506", "090000")], []]
+    )
+    tracker = MinuteRawTracker(":memory:", client)
+
+    bars = await tracker.fetch_minute_raw_for_day("005930", "2026-05-06")
+
+    assert client.get_minute_candles_at.await_args_list[0].kwargs["market_code"] == "J"
+    # 09:00 도달 후 next_dt(08:59:59).hour < 9 → 추가 페이징 없이 1회 호출로 종료.
+    assert client.get_minute_candles_at.await_count == 1
+    assert [bar.minute_time for bar in bars] == [
+        "2026-05-06T09:00:00",
+        "2026-05-06T09:01:00",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_collect_replaces_existing_rows_on_success(db_path: str):
     conn = _connect(db_path)
     stock_pick_id = _seed_pick(conn, "005930")
