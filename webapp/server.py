@@ -70,6 +70,15 @@ class RegisterIn(BaseModel):
     stocks: list[StockIn] = Field(min_length=1)
 
 
+class RemoveStockIn(BaseModel):
+    sector_name: str = Field(min_length=1)
+    stock_code: str = Field(min_length=1)
+
+
+class RemoveSectorIn(BaseModel):
+    sector_name: str = Field(min_length=1)
+
+
 # ----- API -----
 @app.get("/api/search")
 async def search(
@@ -195,6 +204,30 @@ async def register(
         "total": result.total_count,
         "skipped": [s.stock_name for s in result.skipped_stocks],
     }
+
+
+@app.post("/api/picks/remove-stock")
+async def remove_stock(
+    body: RemoveStockIn,
+    store: SectorStore = Depends(get_store),
+) -> dict:
+    """섹터에서 특정 종목 제거. 빈 픽은 자동 archive."""
+    result = await store.remove_stock_from_sector(body.sector_name, body.stock_code)
+    if not result["removed_from_picks"]:
+        raise HTTPException(status_code=404, detail="해당 종목을 찾을 수 없습니다")
+    return result
+
+
+@app.post("/api/picks/remove-sector")
+async def remove_sector(
+    body: RemoveSectorIn,
+    store: SectorStore = Depends(get_store),
+) -> dict:
+    """섹터 전체 제거(종목 DELETE). 빈 픽은 자동 archive."""
+    result = await store.archive_sector(body.sector_name)
+    if not result["affected_picks"]:
+        raise HTTPException(status_code=404, detail="해당 섹터를 찾을 수 없습니다")
+    return result
 
 
 # ----- 정적 프론트 -----

@@ -144,6 +144,11 @@
   td.chg-na { color: var(--faint); }
   td.chg-up { color: var(--up); font-weight: 600; }
   td.chg-down { color: var(--down); font-weight: 600; }
+  td.del-cell { text-align: right; width: 34px; }
+  .del { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 17px; line-height: 1; padding: 2px 7px; border-radius: 6px; }
+  .del:hover { color: var(--up); background: #2a1e22; }
+  .sector-del { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--faint); border-radius: 7px; padding: 3px 10px; font-size: 11px; cursor: pointer; }
+  .sector-del:hover { color: var(--up); border-color: #5a3138; }
   .avatar {
     display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
     border-radius: 50%; background: linear-gradient(135deg,#2a3140,#1c2230); color: #9fb4d8;
@@ -297,6 +302,30 @@ $("submit").addEventListener("click", async () => {
 
 $("refresh").addEventListener("click", () => { loadIndices(); loadPicks(); });
 
+async function removeStock(sector, code){
+  if (!confirm(`${code} 을(를) [${sector}]에서 제거할까요?`)) return;
+  try {
+    const res = await fetch("/api/picks/remove-stock", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ sector_name: sector, stock_code: code }),
+    });
+    if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "제거 실패"); }
+    loadPicks();
+  } catch (e) { alert("❌ " + e.message); }
+}
+
+async function removeSector(sector){
+  if (!confirm(`[${sector}] 섹터 전체를 제거할까요? (소속 종목 모두 삭제)`)) return;
+  try {
+    const res = await fetch("/api/picks/remove-sector", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ sector_name: sector }),
+    });
+    if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "제거 실패"); }
+    loadPicks();
+  } catch (e) { alert("❌ " + e.message); }
+}
+
 async function loadPicks(){
   try {
     const res = await fetch("/api/picks");
@@ -330,6 +359,7 @@ async function loadPicks(){
           <td class="r chg-na" data-chg="${s.code}">—</td>
           <td class="r" data-q="value-${s.code}">—</td>
           <td class="r" data-q="vol-${s.code}">—</td>
+          <td class="del-cell"><button class="del" title="제거" onclick="removeStock('${esc(sec)}','${s.code}')">×</button></td>
         </tr>`).join("");
       return `
         <div class="sector-block">
@@ -337,11 +367,12 @@ async function loadPicks(){
             <span class="dot" style="width:9px;height:9px;border-radius:50%;background:${SECTOR_COLORS[si%SECTOR_COLORS.length]}"></span>
             <span class="name">${esc(sec)}</span>
             <span class="cnt">${items.length}종목</span>
+            <button class="sector-del" onclick="removeSector('${esc(sec)}')">섹터 삭제</button>
           </div>
           <table>
             <thead><tr>
               <th class="l" style="width:30px"></th><th class="l">종목</th><th class="l">코드</th>
-              <th>현재가</th><th>등락률</th><th>거래대금</th><th>거래량</th>
+              <th>현재가</th><th>등락률</th><th>거래대금</th><th>거래량</th><th></th>
             </tr></thead>
             <tbody>${rows}</tbody>
           </table>

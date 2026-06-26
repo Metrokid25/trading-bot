@@ -139,6 +139,55 @@ async def test_register_and_list_roundtrip(client):
 
 
 @pytest.mark.asyncio
+async def test_remove_stock(client):
+    await client.post(
+        "/api/picks",
+        json={"sector_name": "반도체", "stocks": [{"code": "005930"}, {"code": "000660"}]},
+    )
+    res = await client.post(
+        "/api/picks/remove-stock",
+        json={"sector_name": "반도체", "stock_code": "005930"},
+    )
+    assert res.status_code == 200
+    assert res.json()["removed_from_picks"]
+
+    picks = (await client.get("/api/picks")).json()
+    codes = {s["code"] for p in picks for s in p["stocks"]}
+    assert codes == {"000660"}  # 005930 제거됨
+
+
+@pytest.mark.asyncio
+async def test_remove_stock_unknown_returns_404(client):
+    res = await client.post(
+        "/api/picks/remove-stock",
+        json={"sector_name": "없는섹터", "stock_code": "005930"},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_remove_sector(client):
+    await client.post(
+        "/api/picks",
+        json={"sector_name": "반도체", "stocks": [{"code": "005930"}, {"code": "000660"}]},
+    )
+    await client.post(
+        "/api/picks",
+        json={"sector_name": "2차전지", "stocks": [{"code": "042700"}]},
+    )
+    res = await client.post(
+        "/api/picks/remove-sector",
+        json={"sector_name": "반도체"},
+    )
+    assert res.status_code == 200
+    assert res.json()["affected_picks"]
+
+    picks = (await client.get("/api/picks")).json()
+    sectors = {s["sector"] for p in picks for s in p["stocks"]}
+    assert sectors == {"2차전지"}  # 반도체 섹터 통째로 제거됨
+
+
+@pytest.mark.asyncio
 async def test_register_dedupes_same_code(client):
     res = await client.post(
         "/api/picks",
