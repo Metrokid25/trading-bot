@@ -300,7 +300,7 @@ $("submit").addEventListener("click", async () => {
   } finally { updateSubmit(); }
 });
 
-$("refresh").addEventListener("click", () => { loadIndices(); loadPicks(); });
+$("refresh").addEventListener("click", () => { loadIndexBar(); loadPicks(); });
 
 async function removeStock(sector, code){
   if (!confirm(`${code} 을(를) [${sector}]에서 제거할까요?`)) return;
@@ -426,27 +426,31 @@ async function fetchQuotes(codes){
 // 드롭다운 내부 클릭은 바깥-클릭-닫기에서 제외. (innerHTML 재생성으로 e.target이
 // detach되면 closest 판정이 깨지므로, 컨테이너에서 전파를 끊어 오닫힘을 막는다.)
 $("dropdown").addEventListener("click", (e) => e.stopPropagation());
-async function loadIndices(){
-  try {
-    const res = await fetch("/api/indices");
-    const items = await res.json();
-    $("indexbar").innerHTML = items.map(it => {
-      if (it.value == null) return `<div class="ix"><span class="ixn">${esc(it.name)}</span><span class="ixv">—</span></div>`;
-      const r = it.change_rate, cls = r > 0 ? "chg-up" : r < 0 ? "chg-down" : "";
-      const v = it.value.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
-      return `<div class="ix">
-        <span class="ixn">${esc(it.name)}</span>
-        <span class="ixv">${v}</span>
-        <span class="ixc ${cls}">${r>0?"+":""}${it.change.toFixed(2)} (${r>0?"+":""}${r.toFixed(2)}%)</span>
-      </div>`;
-    }).join("");
-  } catch {}
+function renderIx(it){
+  if (it.value == null) return `<div class="ix"><span class="ixn">${esc(it.name)}</span><span class="ixv">—</span></div>`;
+  const r = it.change_rate ?? 0, cls = r > 0 ? "chg-up" : r < 0 ? "chg-down" : "";
+  const v = it.value.toLocaleString(undefined, {maximumFractionDigits:2});
+  const chg = (it.change != null)
+    ? `${r>0?"+":""}${it.change.toLocaleString(undefined,{maximumFractionDigits:2})} ` : "";
+  return `<div class="ix">
+    <span class="ixn">${esc(it.name)}</span>
+    <span class="ixv">${v}</span>
+    <span class="ixc ${cls}">${chg}(${r>0?"+":""}${r.toFixed(2)}%)</span>
+  </div>`;
+}
+
+async function loadIndexBar(){
+  const [idx, mkt] = await Promise.all([
+    fetch("/api/indices").then(r=>r.json()).catch(()=>[]),
+    fetch("/api/markets").then(r=>r.json()).catch(()=>[]),
+  ]);
+  $("indexbar").innerHTML = [...idx, ...mkt].map(renderIx).join("");
 }
 
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".search-box")) $("dropdown").style.display = "none";
 });
-loadIndices();
+loadIndexBar();
 loadPicks();
 </script>
 </body>

@@ -6,7 +6,24 @@ import pytest_asyncio
 from httpx import ASGITransport
 
 from data.sector_store import SectorStore
-from webapp.server import app, get_kis, get_master, get_store
+from webapp.server import app, get_http, get_kis, get_master, get_store
+
+
+def _markets_handler(request: httpx.Request) -> httpx.Response:
+    """Yahoo/업비트 외부 호출을 가짜 응답으로 대체."""
+    url = str(request.url)
+    if "upbit" in url:
+        return httpx.Response(200, json=[{
+            "trade_price": 90_000_000.0,
+            "signed_change_rate": -0.0011,
+            "signed_change_price": -100_000.0,
+        }])
+    return httpx.Response(200, json={
+        "chart": {"result": [{"meta": {
+            "regularMarketPrice": 25266.94,
+            "chartPreviousClose": 25358.60,
+        }}]}
+    })
 
 
 class FakeKis:
@@ -65,6 +82,8 @@ async def client(tmp_path):
     app.dependency_overrides[get_store] = lambda: store
     app.dependency_overrides[get_master] = lambda: master
     app.dependency_overrides[get_kis] = lambda: FakeKis()
+    mock_http = httpx.AsyncClient(transport=httpx.MockTransport(_markets_handler))
+    app.dependency_overrides[get_http] = lambda: mock_http
 
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -72,6 +91,7 @@ async def client(tmp_path):
 
     app.dependency_overrides.clear()
     await store.close()
+    await mock_http.aclose()
 
 
 @pytest.mark.asyncio
@@ -99,6 +119,20 @@ async def test_indices_returns_kospi_kosdaq(client):
     kospi = data[0]
     assert kospi["value"] == 8471.02
     assert kospi["change_rate"] == 3.26
+
+
+@pytest.mark.asyncio
+async def test_markets_returns_overseas_and_btc(client):
+    res = await client.get("/api/markets")
+    assert res.status_code == 200
+    data = res.json()
+    assert [d["name"] for d in data] == ["나스닥", "S&P500", "환율", "비트코인"]
+    nasdaq = data[0]
+    assert nasdaq["value"] == 25266.94
+    assert nasdaq["change_rate"] < 0  # 25266.94 < 25358.60
+    btc = data[-1]
+    assert btc["value"] == 90_000_000.0
+    assert round(btc["change_rate"], 2) == -0.11  # -0.0011 * 100
 
 
 @pytest.mark.asyncio

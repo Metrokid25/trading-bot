@@ -12,6 +12,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,14 +33,17 @@ async def lifespan(app: FastAPI):
     await store.open()
     master = StockMaster()
     kis = KISClient()
+    http = httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"})
     app.state.store = store
     app.state.master = master
     app.state.kis = kis
+    app.state.http = http
     try:
         yield
     finally:
         await store.close()
         await kis.close()
+        await http.aclose()
 
 
 app = FastAPI(title="trading-bot 종목 등록", lifespan=lifespan)
@@ -56,6 +60,10 @@ def get_master(request: Request) -> StockMaster:
 
 def get_kis(request: Request) -> KISClient:
     return request.app.state.kis
+
+
+def get_http(request: Request) -> httpx.AsyncClient:
+    return request.app.state.http
 
 
 # ----- 요청/응답 모델 -----
@@ -134,6 +142,56 @@ async def indices(kis: KISClient = Depends(get_kis)) -> list[dict]:
             })
         except Exception:
             out.append({"name": name, "value": None, "change": None, "change_rate": None})
+    return out
+
+
+# Yahoo Finance(비공식) 심볼: 나스닥종합 / S&P500 / 원달러환율
+_YAHOO = [("^IXIC", "나스닥"), ("^GSPC", "S&P500"), ("KRW=X", "환율")]
+
+
+def _yahoo_to_market(name: str, meta: dict) -> dict:
+    price = meta.get("regularMarketPrice")
+    prev = meta.get("chartPreviousClose")
+    if price is None:
+        return {"name": name, "value": None, "change": None, "change_rate": None}
+    change = (price - prev) if prev else 0.0
+    rate = ((price - prev) / prev * 100) if prev else 0.0
+    return {"name": name, "value": price, "change": change, "change_rate": rate}
+
+
+def _upbit_to_market(name: str, row: dict) -> dict:
+    price = row.get("trade_price")
+    if price is None:
+        return {"name": name, "value": None, "change": None, "change_rate": None}
+    return {
+        "name": name,
+        "value": price,
+        "change": row.get("signed_change_price"),
+        "change_rate": (row.get("signed_change_rate") or 0) * 100,
+    }
+
+
+@app.get("/api/markets")
+async def markets(http: httpx.AsyncClient = Depends(get_http)) -> list[dict]:
+    """해외지수·환율·비트코인. Yahoo Finance + 업비트. 실패 항목은 값 null."""
+    out: list[dict] = []
+    for symbol, name in _YAHOO:
+        try:
+            r = await http.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                params={"interval": "1d", "range": "1d"},
+            )
+            meta = r.json()["chart"]["result"][0]["meta"]
+            out.append(_yahoo_to_market(name, meta))
+        except Exception:
+            out.append({"name": name, "value": None, "change": None, "change_rate": None})
+    try:
+        r = await http.get(
+            "https://api.upbit.com/v1/ticker", params={"markets": "KRW-BTC"}
+        )
+        out.append(_upbit_to_market("비트코인", r.json()[0]))
+    except Exception:
+        out.append({"name": "비트코인", "value": None, "change": None, "change_rate": None})
     return out
 
 
