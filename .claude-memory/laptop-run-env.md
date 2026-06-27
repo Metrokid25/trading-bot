@@ -13,3 +13,5 @@ Windows 콘솔에서 한글/이모지 출력이 cp949로 깨지므로 출력이 
 
 **Why:** venv는 다른 PC에서 만들어져 동기화된 것이라 시스템 python 버전과 다르다. 잘못된 인터프리터로 실행하면 의존성 누락 에러가 난다.
 **How to apply:** `PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe main.py` 형태로 실행. 관련 [[trading-bot-secrets-setup]].
+
+로컬 웹 대시보드(FastAPI, 토스 스타일 종목 등록/삭제)는 `webapp/`에 있고 다음으로 실행: `./.venv/Scripts/python.exe -m uvicorn webapp.server:app --host 127.0.0.1 --port 8000` → 브라우저 http://127.0.0.1:8000 . fastapi/uvicorn/pandas_market_calendars 의존성은 2026-06-27 노트북 venv에 설치 완료.

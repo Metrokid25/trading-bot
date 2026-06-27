@@ -155,6 +155,26 @@
     font-size: 11px; font-weight: 700; margin-right: 9px; vertical-align: middle;
   }
 
+  tr.row { cursor: pointer; }
+  tr.row.open td { background: var(--panel-2); }
+  td.nm .caret { color: var(--faint); font-size: 10px; margin-left: 6px; transition: transform .15s; display: inline-block; }
+  tr.row.open td.nm .caret { transform: rotate(90deg); color: var(--blue); }
+
+  tr.chart-row > td { padding: 0; border-top: none; background: var(--panel-2); }
+  .chart-wrap { padding: 10px 14px 16px; }
+  .chart-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .chart-toggle button {
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 7px; padding: 4px 12px; font-size: 12px; cursor: pointer; font-weight: 600;
+  }
+  .chart-toggle button.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .chart-toggle .ct-title { margin-left: auto; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .chart-canvas { width: 100%; height: 200px; display: block; }
+  .chart-msg { color: var(--faint); font-size: 12px; padding: 24px 0; text-align: center; }
+
+  td.spark-cell { width: 132px; padding: 4px 12px; }
+  canvas.spark { width: 120px; height: 38px; display: block; }
+
   .empty { color: var(--faint); padding: 48px 0; text-align: center; }
   .empty .big { font-size: 32px; margin-bottom: 10px; }
 
@@ -351,16 +371,17 @@ async function loadPicks(){
     $("picks").innerHTML = sectors.map((sec, si) => {
       const items = bySector[sec];
       const rows = items.map((s, i) => `
-        <tr class="row">
+        <tr class="row" onclick="toggleChart(this,'${s.code}','${esc(s.name)}')">
           <td class="rank">${i+1}</td>
-          <td class="nm"><span class="avatar">${esc(initial(s.name))}</span>${esc(s.name)}</td>
-          <td class="code">${s.code}</td>
+          <td class="nm"><span class="avatar">${esc(initial(s.name))}</span>${esc(s.name)}<span class="caret">▶</span></td>
           <td class="r" data-q="price-${s.code}">—</td>
-          <td class="r chg-na" data-chg="${s.code}">—</td>
           <td class="r" data-q="value-${s.code}">—</td>
           <td class="r" data-q="vol-${s.code}">—</td>
-          <td class="del-cell"><button class="del" title="제거" onclick="removeStock('${esc(sec)}','${s.code}')">×</button></td>
-        </tr>`).join("");
+          <td class="r chg-na" data-chg="${s.code}">—</td>
+          <td class="spark-cell"><canvas class="spark" data-spark="${s.code}"></canvas></td>
+          <td class="del-cell"><button class="del" title="제거" onclick="event.stopPropagation();removeStock('${esc(sec)}','${s.code}')">×</button></td>
+        </tr>
+        <tr class="chart-row" style="display:none"><td colspan="8"></td></tr>`).join("");
       return `
         <div class="sector-block">
           <div class="sector-title">
@@ -371,8 +392,8 @@ async function loadPicks(){
           </div>
           <table>
             <thead><tr>
-              <th class="l" style="width:30px"></th><th class="l">종목</th><th class="l">코드</th>
-              <th>현재가</th><th>등락률</th><th>거래대금</th><th>거래량</th><th></th>
+              <th class="l" style="width:30px"></th><th class="l">종목</th>
+              <th>현재가</th><th>거래대금</th><th>거래량</th><th>등락률</th><th class="l">차트</th><th></th>
             </tr></thead>
             <tbody>${rows}</tbody>
           </table>
@@ -392,6 +413,7 @@ async function loadPicks(){
 
     const allCodes = [...new Set(picks.flatMap(p => p.stocks.map(s => s.code)))];
     fetchQuotes(allCodes);
+    loadMiniCharts(allCodes);
   } catch {
     $("picks").innerHTML = `<div class="empty">현황을 불러오지 못했습니다.</div>`;
   }
@@ -426,6 +448,153 @@ async function fetchQuotes(codes){
 // 드롭다운 내부 클릭은 바깥-클릭-닫기에서 제외. (innerHTML 재생성으로 e.target이
 // detach되면 closest 판정이 깨지므로, 컨테이너에서 전파를 끊어 오닫힘을 막는다.)
 $("dropdown").addEventListener("click", (e) => e.stopPropagation());
+
+// ----- 봉차트 -----
+function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#888"; }
+
+let dailyCache = {};  // code -> 일봉 candles (미니/펼침 차트 공용)
+
+// 행별 가로 미니 일봉차트
+async function loadMiniCharts(codes){
+  if (!codes.length) return;
+  try {
+    const res = await fetch(`/api/candles-batch?codes=${codes.join(",")}&tf=daily`);
+    const data = await res.json();
+    const map = data.candles || {};
+    codes.forEach(code => {
+      dailyCache[code] = map[code] || [];
+      document.querySelectorAll(`canvas.spark[data-spark="${code}"]`).forEach(cv => {
+        if (dailyCache[code].length) drawMini(cv, dailyCache[code]);
+      });
+    });
+  } catch {}
+}
+
+// 최신 일봉 1개를 가로로 누인 캔들: 꼬리(저가~고가) 선 + 시가~종가 각진 몸통
+function drawMini(canvas, candles){
+  if (!candles.length) return;
+  const d = candles[candles.length - 1];
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 120, cssH = canvas.clientHeight || 38;
+  canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, cssW, cssH);
+
+  const pad = 4, lo = d.l, range = (d.h - d.l) || 1;
+  const x = (p) => pad + (p - lo) / range * (cssW - pad * 2);
+  const cy = Math.round(cssH / 2) + 0.5;  // 0.5 보정으로 선 또렷하게
+  const col = d.c >= d.o ? getCSS("--up") : getCSS("--down");
+
+  // 꼬리: 저가~고가 가는 선 (몸통 밖으로 양끝 노출)
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(x(d.l), cy); ctx.lineTo(x(d.h), cy); ctx.stroke();
+
+  // 몸통: 시가~종가 각진 사각형
+  const bx1 = x(Math.min(d.o, d.c)), bx2 = x(Math.max(d.o, d.c));
+  ctx.fillStyle = col;
+  ctx.fillRect(Math.round(bx1), cy - 7, Math.max(Math.round(bx2 - bx1), 2), 14);
+}
+
+// 행 클릭 → 상세 차트 펼침
+
+function toggleChart(rowEl, code, name){
+  const chartRow = rowEl.nextElementSibling;
+  if (!chartRow || !chartRow.classList.contains("chart-row")) return;
+  if (chartRow.style.display !== "none"){
+    chartRow.style.display = "none"; rowEl.classList.remove("open"); return;
+  }
+  rowEl.classList.add("open");
+  chartRow.style.display = "";
+  const td = chartRow.firstElementChild;
+  if (td.dataset.built) return;
+  td.dataset.built = "1";
+  td.innerHTML = `
+    <div class="chart-wrap">
+      <div class="chart-toggle">
+        <button class="on" data-tf="daily">일봉</button>
+        <button data-tf="minute">분봉</button>
+        <span class="ct-title">${esc(name)} · ${code}</span>
+      </div>
+      <canvas class="chart-canvas"></canvas>
+      <div class="chart-msg" style="display:none"></div>
+    </div>`;
+  const btns = td.querySelectorAll(".chart-toggle button");
+  btns.forEach(b => b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    btns.forEach(x => x.classList.remove("on")); b.classList.add("on");
+    loadChart(td, code, b.dataset.tf);
+  }));
+  loadChart(td, code, "daily");
+}
+
+async function loadChart(td, code, tf){
+  const canvas = td.querySelector(".chart-canvas");
+  const msg = td.querySelector(".chart-msg");
+  msg.style.display = "block"; msg.textContent = "불러오는 중…"; canvas.style.display = "none";
+  try {
+    let candles;
+    if (tf === "daily" && dailyCache[code] && dailyCache[code].length){
+      candles = dailyCache[code];  // 미니차트가 받아둔 일봉 재사용
+    } else {
+      const res = await fetch(`/api/candles?code=${code}&tf=${tf}`);
+      const data = await res.json();
+      candles = data.candles || [];
+      if (tf === "daily") dailyCache[code] = candles;
+    }
+    if (!candles.length){ msg.textContent = "차트 데이터가 없습니다."; return; }
+    msg.style.display = "none"; canvas.style.display = "block";
+    drawCandles(canvas, candles, tf);
+  } catch { msg.textContent = "차트를 불러오지 못했습니다."; }
+}
+
+function drawCandles(canvas, candles, tf){
+  const data = tf === "daily" ? candles.slice(-60) : candles;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600, cssH = canvas.clientHeight || 200;
+  canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr); ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 4, padR = 54, padT = 8, volH = 34, gap = 8;
+  const priceH = cssH - padT - volH - gap, priceTop = padT;
+  const volTop = priceTop + priceH + gap, volBot = cssH;
+
+  let hi = -Infinity, lo = Infinity, vmax = 0;
+  for (const d of data){ hi = Math.max(hi, d.h); lo = Math.min(lo, d.l); vmax = Math.max(vmax, d.v); }
+  if (hi === lo){ hi += 1; lo -= 1; }
+  const plotW = cssW - padL - padR, n = data.length, step = plotW / n;
+  const bw = Math.max(1, Math.min(step * 0.7, 14));
+  const yP = (p) => priceTop + (hi - p) / (hi - lo) * priceH;
+
+  const upC = getCSS("--up"), downC = getCSS("--down");
+  ctx.font = "10px sans-serif"; ctx.textAlign = "left";
+
+  ctx.strokeStyle = getCSS("--border"); ctx.fillStyle = getCSS("--faint"); ctx.lineWidth = 1;
+  [hi, (hi + lo) / 2, lo].forEach(p => {
+    const y = yP(p);
+    ctx.globalAlpha = .5; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillText(Math.round(p).toLocaleString(), cssW - padR + 5, y + 3);
+  });
+
+  for (let i = 0; i < n; i++){
+    const d = data[i], cx = padL + step * i + step / 2;
+    const col = d.c >= d.o ? upC : downC;
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, yP(d.h)); ctx.lineTo(cx, yP(d.l)); ctx.stroke();
+    const yo = yP(d.o), yc = yP(d.c), top = Math.min(yo, yc), h = Math.max(1, Math.abs(yc - yo));
+    ctx.fillRect(cx - bw / 2, top, bw, h);
+    if (vmax > 0){
+      const vh = (d.v / vmax) * (volBot - volTop);
+      ctx.globalAlpha = .4; ctx.fillRect(cx - bw / 2, volBot - vh, bw, vh); ctx.globalAlpha = 1;
+    }
+  }
+
+  const last = data[n - 1].c, ly = yP(last);
+  ctx.strokeStyle = getCSS("--blue"); ctx.setLineDash([3, 3]); ctx.globalAlpha = .7;
+  ctx.beginPath(); ctx.moveTo(padL, ly); ctx.lineTo(cssW - padR, ly); ctx.stroke();
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+  ctx.fillStyle = getCSS("--blue"); ctx.fillText(last.toLocaleString(), cssW - padR + 5, ly + 3);
+}
+
 function renderIx(it){
   if (it.value == null) return `<div class="ix"><span class="ixn">${esc(it.name)}</span><span class="ixv">—</span></div>`;
   const r = it.change_rate ?? 0, cls = r > 0 ? "chg-up" : r < 0 ? "chg-down" : "";

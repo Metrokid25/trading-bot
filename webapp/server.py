@@ -10,6 +10,7 @@ KIS 시세/매매·텔레그램 발송은 건드리지 않고, 종목 검색(Sto
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -25,6 +26,13 @@ from data.sector_store import SectorStore
 from data.stock_master import StockMaster
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _to_int(v: object) -> int | None:
+    try:
+        return int(float(v))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 @asynccontextmanager
@@ -159,16 +167,20 @@ def _yahoo_to_market(name: str, meta: dict) -> dict:
     return {"name": name, "value": price, "change": change, "change_rate": rate}
 
 
-def _upbit_to_market(name: str, row: dict) -> dict:
-    price = row.get("trade_price")
+def _binance_to_market(name: str, row: dict) -> dict:
+    """바이낸스 24h ticker → 달러 가격."""
+    price = row.get("lastPrice")
     if price is None:
         return {"name": name, "value": None, "change": None, "change_rate": None}
-    return {
-        "name": name,
-        "value": price,
-        "change": row.get("signed_change_price"),
-        "change_rate": (row.get("signed_change_rate") or 0) * 100,
-    }
+    try:
+        return {
+            "name": name,
+            "value": float(price),
+            "change": float(row.get("priceChange") or 0),
+            "change_rate": float(row.get("priceChangePercent") or 0),
+        }
+    except (TypeError, ValueError):
+        return {"name": name, "value": None, "change": None, "change_rate": None}
 
 
 @app.get("/api/markets")
@@ -187,9 +199,9 @@ async def markets(http: httpx.AsyncClient = Depends(get_http)) -> list[dict]:
             out.append({"name": name, "value": None, "change": None, "change_rate": None})
     try:
         r = await http.get(
-            "https://api.upbit.com/v1/ticker", params={"markets": "KRW-BTC"}
+            "https://api.binance.com/api/v3/ticker/24hr", params={"symbol": "BTCUSDT"}
         )
-        out.append(_upbit_to_market("비트코인", r.json()[0]))
+        out.append(_binance_to_market("비트코인", r.json()))
     except Exception:
         out.append({"name": "비트코인", "value": None, "change": None, "change_rate": None})
     return out
@@ -215,6 +227,76 @@ async def quotes(
         except Exception:
             out[code] = None
     return out
+
+
+async def _fetch_candles(kis: KISClient, code: str, tf: str) -> list[dict]:
+    """단일 종목 봉 조회+파싱. 시간 오름차순. 실패 시 빈 리스트."""
+    out: list[dict] = []
+    try:
+        if tf == "minute":
+            raw = await kis.get_minute_candles(code)
+            for row in raw:
+                c = _to_int(row.get("stck_prpr"))
+                if c is None:
+                    continue
+                out.append({
+                    "t": row.get("stck_cntg_hour", ""),
+                    "o": _to_int(row.get("stck_oprc")) or c,
+                    "h": _to_int(row.get("stck_hgpr")) or c,
+                    "l": _to_int(row.get("stck_lwpr")) or c,
+                    "c": c,
+                    "v": _to_int(row.get("cntg_vol")) or 0,
+                })
+            out.reverse()  # KIS는 최신→과거. 차트는 과거→최신.
+        else:
+            end = now_kst()
+            start = end - timedelta(days=120)
+            raw = await kis.get_daily_candles(
+                code, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), "D"
+            )
+            for row in raw:
+                c = _to_int(row.get("stck_clpr"))
+                if c is None:
+                    continue
+                out.append({
+                    "t": row.get("stck_bsop_date", ""),
+                    "o": _to_int(row.get("stck_oprc")) or c,
+                    "h": _to_int(row.get("stck_hgpr")) or c,
+                    "l": _to_int(row.get("stck_lwpr")) or c,
+                    "c": c,
+                    "v": _to_int(row.get("acml_vol")) or 0,
+                })
+            out.sort(key=lambda x: x["t"])
+    except Exception:
+        out = []
+    return out
+
+
+@app.get("/api/candles")
+async def candles(
+    code: str = "",
+    tf: str = "daily",
+    kis: KISClient = Depends(get_kis),
+) -> dict:
+    """봉차트 데이터. tf=daily(일봉 ~최근120일) | minute(당일 1분봉)."""
+    code = code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="code가 필요합니다")
+    return {"code": code, "tf": tf, "candles": await _fetch_candles(kis, code, tf)}
+
+
+@app.get("/api/candles-batch")
+async def candles_batch(
+    codes: str = "",
+    tf: str = "daily",
+    kis: KISClient = Depends(get_kis),
+) -> dict:
+    """여러 종목 봉을 한 번에. 행별 미니차트용. {code: candles[]}."""
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:60]
+    out: dict[str, list[dict]] = {}
+    for code in code_list:
+        out[code] = await _fetch_candles(kis, code, tf)
+    return {"tf": tf, "candles": out}
 
 
 @app.post("/api/picks")

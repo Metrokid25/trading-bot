@@ -10,14 +10,14 @@ from webapp.server import app, get_http, get_kis, get_master, get_store
 
 
 def _markets_handler(request: httpx.Request) -> httpx.Response:
-    """Yahoo/업비트 외부 호출을 가짜 응답으로 대체."""
+    """Yahoo/바이낸스 외부 호출을 가짜 응답으로 대체."""
     url = str(request.url)
-    if "upbit" in url:
-        return httpx.Response(200, json=[{
-            "trade_price": 90_000_000.0,
-            "signed_change_rate": -0.0011,
-            "signed_change_price": -100_000.0,
-        }])
+    if "binance" in url:
+        return httpx.Response(200, json={
+            "lastPrice": "64000.50",
+            "priceChange": "-700.00",
+            "priceChangePercent": "-1.08",
+        })
     return httpx.Response(200, json={
         "chart": {"result": [{"meta": {
             "regularMarketPrice": 25266.94,
@@ -50,6 +50,23 @@ class FakeKis:
             raise RuntimeError("no data")
         value, change, rate = self._IDX[code]
         return {"code": code, "value": value, "change": change, "change_rate": rate}
+
+    async def get_daily_candles(self, code: str, start: str, end: str, period: str = "D"):
+        # KIS는 최신→과거 순으로 준다. 서버가 오름차순 정렬하는지 검증하려고 역순 제공.
+        return [
+            {"stck_bsop_date": "20260102", "stck_oprc": "100", "stck_hgpr": "110",
+             "stck_lwpr": "95", "stck_clpr": "105", "acml_vol": "1000"},
+            {"stck_bsop_date": "20260101", "stck_oprc": "90", "stck_hgpr": "100",
+             "stck_lwpr": "88", "stck_clpr": "98", "acml_vol": "800"},
+        ]
+
+    async def get_minute_candles(self, code: str):
+        return [
+            {"stck_cntg_hour": "100100", "stck_oprc": "100", "stck_hgpr": "101",
+             "stck_lwpr": "99", "stck_prpr": "100", "cntg_vol": "50"},
+            {"stck_cntg_hour": "100000", "stck_oprc": "99", "stck_hgpr": "100",
+             "stck_lwpr": "98", "stck_prpr": "99", "cntg_vol": "40"},
+        ]
 
 
 class FakeMaster:
@@ -131,8 +148,8 @@ async def test_markets_returns_overseas_and_btc(client):
     assert nasdaq["value"] == 25266.94
     assert nasdaq["change_rate"] < 0  # 25266.94 < 25358.60
     btc = data[-1]
-    assert btc["value"] == 90_000_000.0
-    assert round(btc["change_rate"], 2) == -0.11  # -0.0011 * 100
+    assert btc["value"] == 64000.50  # 바이낸스 BTCUSDT 달러가
+    assert btc["change_rate"] == -1.08
 
 
 @pytest.mark.asyncio
@@ -146,6 +163,42 @@ async def test_quotes_returns_price_and_change(client):
     }
     assert data["000660"]["change_rate"] == -2.3
     assert data["999999"] is None  # 조회 실패 종목은 null
+
+
+@pytest.mark.asyncio
+async def test_candles_daily_sorted_ascending(client):
+    res = await client.get("/api/candles", params={"code": "005930", "tf": "daily"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["tf"] == "daily"
+    assert [c["t"] for c in data["candles"]] == ["20260101", "20260102"]
+    assert data["candles"][0] == {
+        "t": "20260101", "o": 90, "h": 100, "l": 88, "c": 98, "v": 800,
+    }
+
+
+@pytest.mark.asyncio
+async def test_candles_minute_ascending(client):
+    res = await client.get("/api/candles", params={"code": "005930", "tf": "minute"})
+    assert res.status_code == 200
+    data = res.json()
+    # KIS 최신→과거를 서버가 뒤집어 과거→최신으로
+    assert [c["t"] for c in data["candles"]] == ["100000", "100100"]
+
+
+@pytest.mark.asyncio
+async def test_candles_missing_code_returns_400(client):
+    res = await client.get("/api/candles", params={"code": ""})
+    assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_candles_batch_returns_per_code(client):
+    res = await client.get("/api/candles-batch", params={"codes": "005930,000660", "tf": "daily"})
+    assert res.status_code == 200
+    data = res.json()
+    assert set(data["candles"].keys()) == {"005930", "000660"}
+    assert [c["t"] for c in data["candles"]["005930"]] == ["20260101", "20260102"]
 
 
 @pytest.mark.asyncio
