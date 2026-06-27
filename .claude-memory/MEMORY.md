@@ -6,3 +6,4 @@
 - [Git push main manual](git-push-main-manual.md) — main 직접 push는 auto-mode가 막음, 사용자가 직접 push
 - [Trading bot purpose](trading-bot-purpose.md) — 섹터쏠림+수급 단타봇, 풀백 재폭발 전략, 현재 데이터 누적 단계
 - [Data accumulation machine](data-accumulation-machine.md) — 데이터 적립은 노트북에서 (db/trading.db가 정식 누적 DB)
+- [Workflow rules](workflow-rules.md) — 표준 규칙(리뷰 전 커밋·기기 동기화·문서 최신화)은 CLAUDE.md에 명문화

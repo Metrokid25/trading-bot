@@ -682,3 +682,28 @@ D3 시작 전 형이 결정해야 할 항목:
 Phase 2.5 작업 5번: 분봉 raw 수집 (pick_minute_raw)
 - D5 (재시도 정책 + 영구 실패 마킹)를 작업 5번 또는 별도 선행 단계로 처리 여부 결정 필요
 - 작업 6번 (분봉 집계), 작업 7번 (폭발 마킹) 대기 중
+
+---
+
+## 2026-06-27 노트북 환경 이관 + 수집 파이프라인 조립
+
+### 환경/운영
+- **데이터 적립 기기 = 노트북 확정** (PC 상시 가동 불가). `db/trading.db`가 정식 누적 DB (gitignore라 PC와 미동기화, 분봉은 백필 불가).
+- 노트북 venv는 **Python 3.14** → `./.venv/Scripts/python.exe`로 실행. 콘솔 출력엔 `PYTHONIOENCODING=utf-8`.
+- `.env`는 노트북에서 새로 세팅 (KIS PAPER + REAL 시세 + 텔레그램). `KIS_HTS_ID`는 미사용.
+- **표준 작업 규칙을 `CLAUDE.md`에 명문화** (매 세션 자동 로드 + git 동기화): ① 커밋 전 독립 리뷰 ② 기기 동기화 프로토콜(시작 시 pull / 종료 전 push) ③ 마디마다 문서 최신화. PC↔노트북 충돌 방지가 목적.
+- AI 메모리는 `.claude-memory/`를 junction으로 git 동기화 (`.claude-memory/SYNC_SETUP.md`).
+
+### 코드 — 수집 파이프라인 조립 (commit dd49909)
+- **진단**: Phase 2.5 분봉 모듈(raw/agg/breakout/pullback/sector_strength)이 부품만 있고 스케줄러 미연결. `ensure_tracking_rows`(픽 이벤트 → 추적행 21개)를 **아무도 호출 안 함** = 핵심 누락.
+- **`core/pipeline_runner.py` 신규**: 추적행 생성 → 일봉 → 분봉 raw(NXT 장전 08:00 포함, market_code=UN/floor_hour=8) → 3분봉 집계 → 돌파 마킹 → 풀백 dry-run. 각 단계 best-effort.
+- **`main_tracker.py`**: 매일 16:00 `full_pipeline_job` 실행으로 변경.
+- 마이그레이션 m001~m009 노트북 DB 적용 완료.
+- 코드리뷰 반영: `daily_collection_scheduler.py` loguru `%s/%d`→`{}` 포맷 버그 수정.
+- 테스트: 통합 3건 추가, 전체 **262 passed, 1 skipped**.
+
+### 알려진 후속 (미결)
+- 마이그레이션 전 등록된 픽(웹 4개)은 `sector_pick_events` 없어 추적 안 됨 → **재등록 필요**.
+- 추적행 생성을 **픽 등록 시점**으로 올리면 "16:00 이후 등록 시 그날 누락" 갭 해소 (altitude 개선).
+- 파이프라인 해피패스(실데이터 raw→집계 체인) 통합 테스트 보강 여지 (현재는 모듈별 개별 테스트로 커버).
+- 웹앱(`webapp/`)은 일시 중단 — 봉차트/미니 가로캔들/비트코인 달러화까지 완료(commit f7debcb).
