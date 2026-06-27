@@ -1,7 +1,9 @@
-"""Phase 2.5 일일 수집 스케줄러 진입점.
+"""Phase 2.5 데이터 수집 스케줄러 진입점.
 
 python main_tracker.py 로 실행하면:
- - 매일 16:00 KST에 pick_daily_tracking의 pending 행을 KIS에서 수집
+ - 매일 16:00 KST에 통합 파이프라인 1회 실행:
+   추적행 생성 → 일봉 수집 → 분봉 raw(NXT 장전 포함) → 3분봉 집계
+   → 돌파 마킹 → 풀백 감지(dry-run)
  - sector_detector 알림 봇(main.py)과 독립 프로세스로 동작
 Ctrl+C 로 종료.
 """
@@ -15,9 +17,8 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
 from config import settings
-from core.daily_collection_scheduler import daily_collection_job
-from core.daily_tracker import DailyTracker
 from core.kis_api import KISClient
+from core.pipeline_runner import full_pipeline_job
 
 
 async def run() -> None:
@@ -30,22 +31,21 @@ async def run() -> None:
         encoding="utf-8",
     )
 
-    logger.info("=== Phase 2.5 Tracker 시작 (DB=%s) ===", settings.DB_PATH)
+    logger.info("=== Phase 2.5 Tracker 시작 (DB={}) ===", settings.DB_PATH)
 
     kis = KISClient()
-    tracker = DailyTracker(str(settings.DB_PATH), kis)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        daily_collection_job,
+        full_pipeline_job,
         CronTrigger(hour=16, minute=0, timezone="Asia/Seoul"),
-        args=[tracker, kis],
-        id="daily_collection",
-        name="일일 수집",
+        args=[str(settings.DB_PATH), kis],
+        id="full_pipeline",
+        name="통합 수집 파이프라인",
         misfire_grace_time=300,
     )
     scheduler.start()
-    logger.info("스케줄러 시작 — 매일 16:00 KST 실행")
+    logger.info("스케줄러 시작 — 매일 16:00 KST 통합 파이프라인 실행")
 
     try:
         await asyncio.Event().wait()

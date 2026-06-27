@@ -40,7 +40,7 @@ async def run_daily_collection(
         )
         targets = await cur.fetchall()
 
-    logger.info("[D4] daily collection started, targets=%d", len(targets))
+    logger.info("[D4] daily collection started, targets={}", len(targets))
 
     success_count = 0
     skipped_count = 0
@@ -57,7 +57,7 @@ async def run_daily_collection(
             recheck_row = await recheck_cur.fetchone()
         if recheck_row is None or recheck_row[0] != "pending":
             logger.info(
-                "[D4] row skipped (pre-check) — id=%d status=%s",
+                "[D4] row skipped (pre-check) — id={} status={}",
                 pdt_id, recheck_row[0] if recheck_row else "deleted",
             )
             skipped_count += 1
@@ -71,19 +71,19 @@ async def run_daily_collection(
             elapsed = time.monotonic() - row_start
             if result == CollectResult.SUCCESS:
                 logger.info(
-                    "[D4] event_id=%d ticker=%s trading_day=%s result=success elapsed=%.1fs",
+                    "[D4] event_id={} ticker={} trading_day={} result=success elapsed={:.1f}s",
                     event_id, ticker, trading_day, elapsed,
                 )
                 success_count += 1
             elif result == CollectResult.SKIPPED_NOT_PENDING:
                 logger.info(
-                    "[D4] row skipped (race) — event_id=%d ticker=%s trading_day=%s",
+                    "[D4] row skipped (race) — event_id={} ticker={} trading_day={}",
                     event_id, ticker, trading_day,
                 )
                 skipped_count += 1
             else:
                 logger.warning(
-                    "[D4] event_id=%d ticker=%s trading_day=%s result=failed elapsed=%.1fs",
+                    "[D4] event_id={} ticker={} trading_day={} result=failed elapsed={:.1f}s",
                     event_id, ticker, trading_day, elapsed,
                 )
                 failed_count += 1
@@ -91,7 +91,7 @@ async def run_daily_collection(
         except Exception as exc:
             elapsed = time.monotonic() - row_start
             logger.warning(
-                "[D4] event_id=%d ticker=%s trading_day=%s result=failed elapsed=%.1fs error=%s",
+                "[D4] event_id={} ticker={} trading_day={} result=failed elapsed={:.1f}s error={}",
                 event_id, ticker, trading_day, elapsed, exc,
             )
             failed_count += 1
@@ -102,7 +102,7 @@ async def run_daily_collection(
     total_elapsed = time.monotonic() - job_start
     failed_note = f", failed_list={failed_list}" if failed_list else ""
     logger.info(
-        "[D4] daily collection finished, success=%d, skipped=%d, failed=%d, elapsed=%.1fs%s",
+        "[D4] daily collection finished, success={}, skipped={}, failed={}, elapsed={:.1f}s{}",
         success_count, skipped_count, failed_count, total_elapsed, failed_note,
     )
     return {"success": success_count, "skipped": skipped_count, "failed": failed_count}
@@ -113,10 +113,10 @@ async def daily_collection_job(tracker: DailyTracker, kis_client) -> None:
     try:
         await kis_client._ensure_real_token()
     except Exception as exc:
-        logger.error("[D4] KIS 토큰 갱신 실패 — 수집 중단: %s", exc)
+        logger.error("[D4] KIS 토큰 갱신 실패 — 수집 중단: {}", exc)
         raise
 
     try:
         await run_daily_collection(tracker)
     except Exception as exc:
-        logger.error("[D4] daily_collection_job 예외: %s", exc)
+        logger.error("[D4] daily_collection_job 예외: {}", exc)
