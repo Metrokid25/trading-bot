@@ -40,6 +40,12 @@ class Settings(BaseSettings):
 
     KIS_HTS_ID: str = ""
 
+    # --- 토스증권 Open API (백테스트용 과거 분봉 소스) ---
+    # OAuth2 client_credentials. client_id=c_..., client_secret=s_...
+    TOSS_CLIENT_ID: str = ""
+    TOSS_CLIENT_SECRET: str = ""
+    TOSS_BASE_URL: str = "https://openapi.tossinvest.com"
+
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
