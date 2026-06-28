@@ -163,14 +163,15 @@ def _resample_3m(bars: list[Bar]) -> list[Bar]:
 
 def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
                     *, pre_surge: float, pullback_min: float, support_tol: float,
-                    trail: float, **_ignore) -> Trade | None:
-    """저점 지지 + 재폭등 돌파 진입 (당일 스캘핑).
+                    tp_levels: tuple[float, ...], stop_pct: float, **_ignore) -> Trade | None:
+    """저점 지지 + 재폭등 돌파 진입 + 분할 익절 청산 (당일 스캘핑).
 
     ① 프리장 급등(전일종가 대비 +pre_surge%) 게이트.
     ② 아침 고점에서 pullback_min% 이상 눌림 발생.
     ③ 저점 지지(눌림 저점을 support_tol% 넘게 깨지 않음).
-    ④ 재폭등 돌파(3분봉 종가가 MA5 위 + 직전봉 고가 돌파)에서 진입.
-    청산: 지지 이탈(눌림 저점) 손절 / 고점대비 trail% 트레일링 / EOD.
+    ④ 재폭등: 눌림 직전 아침고점을 종가로 재돌파 → 진입.
+    청산: tp_levels 각 구간에서 1/N 분할 익절(+10%≈정적VI 근사). 첫 익절 후
+          본절(진입가) 회귀 시 잔량 전량 청산. 손절 진입가 -stop_pct%.
     """
     pre = [b for b in day_bars if PRE_START <= b.ts.time() < PRE_END and b.volume > 0]
     reg = [b for b in day_bars if REG_OPEN <= b.ts.time() <= REG_CLOSE]
@@ -207,19 +208,34 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     if entry is None or entry <= 0:
         return None
 
-    high_since = entry
-    exit_px, reason = bars3[-1].close, "EOD"
+    # ----- 분할 익절 청산 -----
+    n = len(tp_levels)                       # 분할 수 (기본 5)
+    tps = [entry * (1 + lv) for lv in tp_levels]
+    fills: list[float] = []                  # 체결가(각 1/n)
+    stop = entry * (1 - stop_pct)            # 초기 손절 -stop_pct%
+    armed = False                            # 첫 익절 후 본절 보호 가동
+    tp_i = 0
+    stop_kind = "SL"                         # 손절 라벨(첫 익절 후 'BE')
+    exit_kind = "EOD"                         # 잔량 청산 사유
     for b in bars3[entry_i + 1:]:
-        high_since = max(high_since, b.high)
-        if b.low <= pullback_low:                       # 지지 이탈 = 손절
-            exit_px, reason = int(pullback_low), "SL"
+        if b.low <= stop:                    # 손절/본절 이탈 → 잔량 전량
+            fills += [stop] * (n - len(fills))
+            exit_kind = stop_kind
             break
-        if b.low <= high_since * (1 - trail):            # 트레일링
-            exit_px, reason = round(high_since * (1 - trail)), "TRAIL"
+        while tp_i < n and b.high >= tps[tp_i]:   # 한 봉에 여러 구간 통과 가능
+            fills.append(tps[tp_i])
+            tp_i += 1
+            if not armed:                    # 첫 익절 → 손절을 본절로 상향
+                armed, stop, stop_kind = True, float(entry), "BE"
+        if len(fills) >= n:
             break
+    if len(fills) < n:                       # 미체결 잔량 → 종가 청산
+        fills += [bars3[-1].close] * (n - len(fills))
 
+    exit_avg = sum(fills) / n
+    reason = f"{tp_i}TP" + (f"/{exit_kind}" if tp_i < n else "")
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
-                 int(entry), int(exit_px), reason, (exit_px - entry) / entry)
+                 int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
 
 
 _EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2}
@@ -307,7 +323,9 @@ def main() -> None:
                     help="v1=눌림 무조건매수 / v2=지지+재폭등 돌파매수(기본)")
     ap.add_argument("--pullback-min", type=float, default=3.0, help="[v2] 아침고점 대비 눌림 최소(퍼센트)")
     ap.add_argument("--support-tol", type=float, default=0.5, help="[v2] 지지 이탈 허용(퍼센트)")
-    ap.add_argument("--trail", type=float, default=3.0, help="[v2] 고점대비 트레일링(퍼센트)")
+    ap.add_argument("--tp-levels", default="5,10,15,20,25",
+                    help="[v2] 분할 익절 구간 CSV(퍼센트). 둘째 구간 10 은 정적VI 근사")
+    ap.add_argument("--stop", type=float, default=4.0, help="[v2] 손절(진입가 대비 퍼센트)")
     ap.add_argument("--codes", help="대상 종목코드 CSV (지정 시 이 종목만; 미지정이면 등록 전체)")
     args = ap.parse_args()
 
@@ -318,10 +336,12 @@ def main() -> None:
                       tp=args.tp / 100, sl=args.sl / 100)
         rule = f"프리장+{args.pre_surge}% / 폭락-{args.drop}% / TP+{args.tp}% / SL-{args.sl}%"
     else:
+        tp_levels = tuple(float(x) / 100 for x in args.tp_levels.split(",") if x.strip())
         params = dict(pre_surge=args.pre_surge / 100, pullback_min=args.pullback_min / 100,
-                      support_tol=args.support_tol / 100, trail=args.trail / 100)
+                      support_tol=args.support_tol / 100, tp_levels=tp_levels,
+                      stop_pct=args.stop / 100)
         rule = (f"프리장+{args.pre_surge}% / 눌림-{args.pullback_min}% / "
-                f"지지tol {args.support_tol}% / 트레일 {args.trail}%")
+                f"분할익절 {args.tp_levels}% / 손절-{args.stop}%")
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
     universe = _stock_universe(codes)
