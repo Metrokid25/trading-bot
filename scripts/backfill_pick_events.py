@@ -88,7 +88,9 @@ def _query(db_path: str, sql: str) -> list[tuple]:
 def _backup(db_path: str) -> str:
     """VACUUM INTO 로 일관된 스냅샷 백업을 만든다(라이브 파일 복사보다 안전)."""
     src = Path(db_path)
-    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
+    # 마이크로초까지 포함 — VACUUM INTO 는 대상 파일이 이미 있으면 거부하므로
+    # 같은 초 재실행 충돌을 피한다.
+    stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
     dst = src.with_name(f"{src.name}.backup_{stamp}")
     con = sqlite3.connect(db_path)
     try:
@@ -146,6 +148,18 @@ async def backfill(db_path: str, *, dry_run: bool) -> int:
         created = await ensure_all_tracking_rows(tracker)
     finally:
         await store.close()
+
+    # 검증: ensure_all_tracking_rows 는 per-event 예외를 삼키므로(락 경합 등) 성공처럼
+    # 보일 수 있다. 추적행이 여전히 비어 있는 활성 이벤트가 남았는지 다시 확인해
+    # 침묵 실패를 드러낸다.
+    remaining = _query(db_path, _ORPHAN_EVENT_SQL)
+    if remaining:
+        print(f"[backfill] 경고: 추적행이 비어 있는 활성 이벤트 {len(remaining)}개 남음 — 재실행 필요:")
+        for event_id, sector_name, _pd in remaining:
+            print(f"  - event_id={event_id} sector={sector_name!r}")
+        print(f"[backfill] 부분 완료: 이벤트 {len(missing)}개 생성, 추적행 {created}개 신규. "
+              "미완료 이벤트 존재 — 재실행으로 자가치유 가능.")
+        raise SystemExit(1)
 
     print(f"[backfill] 완료: 이벤트 {len(missing)}개 생성, 추적행 {created}개 신규 생성.")
     return created
