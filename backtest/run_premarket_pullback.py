@@ -179,15 +179,20 @@ def _gate_and_resample(day_bars: list[Bar], prev_close: int,
 
 def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
                     *, pre_surge: float, pullback_min: float, support_tol: float,
-                    tp_levels: tuple[float, ...], stop_pct: float, **_ignore) -> Trade | None:
-    """저점 지지 + 재폭등 돌파 진입 + 분할 익절 청산 (당일 스캘핑).
+                    tp_levels: tuple[float, ...], stop_pct: float,
+                    consol_bars: int = 3, **_ignore) -> Trade | None:
+    """저점 지지 + 다지기 + 재폭등 돌파 진입 + 분할 익절 청산 (당일 스캘핑).
 
     ① 프리장 급등(전일종가 대비 +pre_surge%) 게이트.
     ② 아침 고점에서 pullback_min% 이상 눌림 발생.
-    ③ 저점 지지(눌림 저점을 support_tol% 넘게 깨지 않음).
+    ③ 저점 지지: 눌림 저점을 support_tol% 넘게 깨지 않고 consol_bars봉 이상
+       다짐(깨지면 저점 하향 + 다지기 카운트 리셋).
     ④ 재폭등: 눌림 직전 아침고점을 종가로 재돌파 → 진입.
+       다지기 봉수를 채우기 전에 재돌파가 먼저 나오면 추격하지 않고 구조를
+       버린 뒤 다음 눌림을 기다린다(추격 금지).
     청산: tp_levels 각 구간에서 1/N 분할 익절(+10%≈정적VI 근사). 첫 익절 후
           본절(진입가) 회귀 시 잔량 전량 청산. 손절 진입가 -stop_pct%.
+    consol_bars=0 이면 구(舊) v2 와 동일(다지기 무조건 통과).
     """
     gated = _gate_and_resample(day_bars, prev_close, pre_surge)
     if gated is None:
@@ -196,7 +201,8 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
 
     day_high = float(pre_high)        # 아침 고점(프리장 고점부터 누적)
     breakout_level: float | None = None   # 눌림 직전 고점 = 재돌파 기준선
-    pullback_low: float | None = None     # 지지 저점(구조적 손절선)
+    pullback_low: float | None = None     # 지지 저점
+    hold = 0                              # 지지 유지(다지기) 봉수
     entry = None
     entry_i = -1
     for i, b in enumerate(bars3):
@@ -207,13 +213,23 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
             if b.low <= prev_high * (1 - pullback_min):
                 pullback_low = float(b.low)
                 breakout_level = prev_high
+                hold = 0
             continue
-        # ③ 다지기: 지지 저점 추적(이탈 시 저점 하향)
-        pullback_low = b.low if b.low < pullback_low * (1 - support_tol) else min(pullback_low, b.low)
-        # ④ 재폭등: 눌림 직전 고점을 종가로 재돌파 → 진입
-        if breakout_level is not None and b.close > breakout_level:
-            entry, entry_i = b.close, i
-            break
+        # ③ 지지 이탈 → 저점 하향 + 다지기 리셋
+        if b.low < pullback_low * (1 - support_tol):
+            pullback_low = float(b.low)
+            hold = 0
+            continue
+        # ④ 재폭등: 아침고점 종가 재돌파 (직전까지 다지기 consol_bars봉 이상)
+        if b.close > breakout_level:
+            if hold >= consol_bars:
+                entry, entry_i = float(b.close), i
+                break
+            # 다지기 미완 재돌파 = 기회 소멸 → 새 눌림 대기 (추격 금지)
+            pullback_low, breakout_level = None, None
+            continue
+        pullback_low = min(pullback_low, b.low)
+        hold += 1
     if entry is None or entry <= 0:
         return None
 
@@ -441,8 +457,9 @@ def main() -> None:
     ap.add_argument("--stop", type=float, default=4.0, help="[v2/v3] 손절(진입가 대비 퍼센트)")
     ap.add_argument("--waist", type=float, default=0.5,
                     help="[v3] 허리 필터: 급등폭 대비 이탈 무효 비율(0=끄기). 근거 74834")
-    ap.add_argument("--consol-bars", type=int, default=2,
-                    help="[v3] 진바닥 확인 최소 다지기 3분봉 수. 근거 85534(음봉 두세개)/52205")
+    ap.add_argument("--consol-bars", type=int, default=3,
+                    help="[v2/v3] 지지 확인 최소 다지기 3분봉 수(0=v2 구버전 동작). "
+                         "근거 85534(음봉 두세개)/52205")
     ap.add_argument("--vol-dryup", type=float, default=1.0,
                     help="[v3] 다지기/하락 구간 평균거래량 비율 상한. 근거 29606/49434")
     ap.add_argument("--vol-confirm", type=float, default=2.0,
@@ -462,15 +479,15 @@ def main() -> None:
             raise SystemExit("--tp-levels 가 비었음 — 예: --tp-levels 5,10,15")
         params = dict(pre_surge=args.pre_surge / 100, pullback_min=args.pullback_min / 100,
                       support_tol=args.support_tol / 100, tp_levels=tp_levels,
-                      stop_pct=args.stop / 100)
+                      stop_pct=args.stop / 100, consol_bars=args.consol_bars)
         rule = (f"프리장+{args.pre_surge}% / 눌림-{args.pullback_min}% / "
-                f"분할익절 {args.tp_levels}% / 손절-{args.stop}%")
+                f"다지기{args.consol_bars}봉 / 분할익절 {args.tp_levels}% / 손절-{args.stop}%")
         if args.mode == "v3":
-            params.update(waist_ratio=args.waist, consol_bars=args.consol_bars,
+            params.update(waist_ratio=args.waist,
                           vol_dryup_max=args.vol_dryup,
                           vol_confirm_ratio=args.vol_confirm)
-            rule += (f" / 허리{args.waist} / 다지기{args.consol_bars}봉 / "
-                     f"마름≤{args.vol_dryup} / 실림≥{args.vol_confirm}x")
+            rule += (f" / 허리{args.waist} / 마름≤{args.vol_dryup} / "
+                     f"실림≥{args.vol_confirm}x")
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
     universe = _stock_universe(codes)
