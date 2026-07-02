@@ -277,6 +277,8 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
                     tp_levels: tuple[float, ...], stop_pct: float,
                     waist_ratio: float, consol_bars: int,
                     vol_dryup_max: float, vol_confirm_ratio: float,
+                    pullback_frac: float = 0.0, max_surge: float = 0.0,
+                    entry_until: time | None = None,
                     **_ignore) -> Trade | None:
     """아카이브(굿머닝 카페) 근거 기반 매수타점 — 진바닥 확인 후 '무릎' 진입.
 
@@ -307,11 +309,23 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
          "이 거래량이 양봉가래량이다 이것이 중요하지요"(114614).
          단 진입 종가가 아침고점(재돌파 기준선) 이상이면 추격이므로 스킵(162616).
       청산: v2 와 동일한 분할 익절 + 구조적 손절(지지 저점 이탈, 89144).
+
+    선택 필터 (2026-07-03 깔때기 진단 기반):
+      - pullback_frac>0: 눌림 등록을 고정 pullback_min% 대신 급등폭 비례
+        되돌림(등록시점 고점~전일종가 상승폭의 frac)으로. 허리(waist)도 같은
+        상승폭 기준으로 계산 — 고정 3% 눌림이 작은 급등(+6.4% 미만)에서
+        허리와 수학적으로 양립 불가한 결함 수정. 허리 비례 사고는 74834.
+      - max_surge>0: 프리장 급등 상한(탈진 컷). 6월 23종목에서 +12%↑ 일관
+        실패(승률 17%)로 검증된 필터.
+      - entry_until: 진입 마감 시각. 늦은 진입은 첫 익절까지 시간 부족
+        (6월 진입 11건 중 5건이 12시 이후 → 전부 0TP 부근 청산). 데이터 근거.
     """
     gated = _gate_and_resample(day_bars, prev_close, pre_surge)
     if gated is None:
         return None
     pre_high, bars3 = gated
+    if max_surge > 0 and (pre_high - prev_close) / prev_close > max_surge:
+        return None                       # 탈진 컷
 
     waist = prev_close + waist_ratio * (pre_high - prev_close)  # ③ 허리(74834)
     day_high = float(pre_high)
@@ -325,12 +339,18 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     for i, b in enumerate(bars3):
         prev_high = day_high
         day_high = max(day_high, b.high)
-        # ② 눌림 최초 등록 (v2 동일)
+        # ② 눌림 최초 등록: 고정 pullback_min% 또는 급등폭 비례(pullback_frac)
         if pullback_low is None:
-            if b.low <= prev_high * (1 - pullback_min):
+            if pullback_frac > 0:
+                trigger = prev_high - pullback_frac * (prev_high - prev_close)
+            else:
+                trigger = prev_high * (1 - pullback_min)
+            if b.low <= trigger:
                 pullback_low = float(b.low)
                 breakout_level = prev_high
                 down_vols = [b.volume]
+                if pullback_frac > 0:   # 허리도 같은 상승폭 기준으로 재계산
+                    waist = prev_close + waist_ratio * (breakout_level - prev_close)
             continue
         # ③ 허리 이탈 → 급등 구조 무효 (74834)
         if waist_ratio > 0 and b.low < waist:
@@ -350,7 +370,8 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
                     and b.close > b.open                              # 양봉(114614)
                     and b.close > consol_high                         # 되치기(29102)
                     and b.volume >= vol_confirm_ratio * consol_avg    # 실림(30602)
-                    and b.close < breakout_level):                    # 추격금지(162616)
+                    and b.close < breakout_level                      # 추격금지(162616)
+                    and (entry_until is None or b.ts.time() <= entry_until)):
                 entry, entry_i = float(b.close), i
                 break
         # ④ 다지기 누적
@@ -369,6 +390,15 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
 _EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2, "v3": evaluate_day_v3}
 
 
+def _prev_close(days: dict[date, list[Bar]], ordered: list[date], i: int) -> int:
+    """전일 종가 = 직전 거래일의 정규장 마지막 종가."""
+    for pd in reversed(ordered[:i]):
+        prev_reg = [b for b in days[pd] if REG_OPEN <= b.ts.time() <= REG_CLOSE]
+        if prev_reg:
+            return prev_reg[-1].close
+    return 0
+
+
 def backtest_symbol(con, symbol, name, start, end, *, mode="v2", **params) -> list[Trade]:
     evaluator = _EVALUATORS[mode]
     days = _by_day(_load_bars(con, symbol))
@@ -377,17 +407,50 @@ def backtest_symbol(con, symbol, name, start, end, *, mode="v2", **params) -> li
     for i, d in enumerate(ordered):
         if not (start <= d <= end):
             continue
-        # 전일 종가 = 직전 거래일의 정규장 마지막 종가
-        prev_close = 0
-        for pd in reversed(ordered[:i]):
-            prev_reg = [b for b in days[pd] if REG_OPEN <= b.ts.time() <= REG_CLOSE]
-            if prev_reg:
-                prev_close = prev_reg[-1].close
-                break
-        t = evaluator(symbol, name, days[d], prev_close, **params)
+        t = evaluator(symbol, name, days[d], _prev_close(days, ordered, i), **params)
         if t:
             trades.append(t)
     return trades
+
+
+def _leader_filter(con, trades: list[Trade], universe: list[tuple[str, str]],
+                   start: date, end: date, pre_surge: float,
+                   max_surge: float = 0.0) -> list[Trade]:
+    """섹터 대장주 필터: 그날 섹터 내 프리장 급등 1등 종목의 트레이드만 유지.
+
+    (형 제안 필터 — 섹터 쏠림에서 팔로워 제거. 섹터 태그 없는 종목은 통과)
+    """
+    scon = sqlite3.connect(settings.DB_PATH)
+    sector = dict(scon.execute(
+        "SELECT stock_code, sector_name FROM sector_stocks WHERE tracking_status='active'"))
+    scon.close()
+
+    best: dict[tuple[date, str], tuple[float, str]] = {}   # (day, sector) → (surge, code)
+    for code, _name in universe:
+        if code not in sector:
+            continue
+        days = _by_day(_load_bars(con, code))
+        ordered = sorted(days)
+        for i, d in enumerate(ordered):
+            if not (start <= d <= end):
+                continue
+            pc = _prev_close(days, ordered, i)
+            if pc <= 0:
+                continue
+            pre = [b for b in days[d] if PRE_START <= b.ts.time() < PRE_END and b.volume > 0]
+            if not pre:
+                continue
+            surge = (max(b.high for b in pre) - pc) / pc
+            if surge < pre_surge:
+                continue
+            if max_surge > 0 and surge > max_surge:
+                continue                # 과열 종목은 대장 후보에서도 제외
+            key = (d, sector[code])
+            if key not in best or surge > best[key][0]:
+                best[key] = (surge, code)
+    leaders = {(d, c) for (d, _s), (_sg, c) in best.items()}
+    return [t for t in trades
+            if t.symbol not in sector or (t.day, t.symbol) in leaders]
 
 
 # ---------------- 리포트 ----------------
@@ -464,6 +527,14 @@ def main() -> None:
                     help="[v3] 다지기/하락 구간 평균거래량 비율 상한. 근거 29606/49434")
     ap.add_argument("--vol-confirm", type=float, default=2.0,
                     help="[v3] 진입봉 거래량 ≥ 다지기 평균 × 이 값. 근거 30602/114614")
+    ap.add_argument("--pullback-frac", type=float, default=0.0,
+                    help="[v3] 눌림 등록을 급등폭 비례 되돌림으로(예 0.33). 0=고정 --pullback-min")
+    ap.add_argument("--max-surge", type=float, default=0.0,
+                    help="[v3] 프리장 급등 상한 퍼센트(탈진 컷, 예 12). 0=끄기")
+    ap.add_argument("--entry-until", default="",
+                    help="[v3] 진입 마감 시각 HH:MM(이후 진입 금지). 빈값=끄기")
+    ap.add_argument("--leader-only", action="store_true",
+                    help="섹터 대장주(그날 섹터 내 프리장 급등 1등)만 유지")
     ap.add_argument("--codes", help="대상 종목코드 CSV (지정 시 이 종목만; 미지정이면 등록 전체)")
     args = ap.parse_args()
 
@@ -483,11 +554,21 @@ def main() -> None:
         rule = (f"프리장+{args.pre_surge}% / 눌림-{args.pullback_min}% / "
                 f"다지기{args.consol_bars}봉 / 분할익절 {args.tp_levels}% / 손절-{args.stop}%")
         if args.mode == "v3":
+            entry_until = time.fromisoformat(args.entry_until) if args.entry_until else None
             params.update(waist_ratio=args.waist,
                           vol_dryup_max=args.vol_dryup,
-                          vol_confirm_ratio=args.vol_confirm)
+                          vol_confirm_ratio=args.vol_confirm,
+                          pullback_frac=args.pullback_frac,
+                          max_surge=args.max_surge / 100,
+                          entry_until=entry_until)
             rule += (f" / 허리{args.waist} / 마름≤{args.vol_dryup} / "
                      f"실림≥{args.vol_confirm}x")
+            if args.pullback_frac:
+                rule += f" / 눌림=급등의{args.pullback_frac}"
+            if args.max_surge:
+                rule += f" / 과열컷{args.max_surge}%"
+            if args.entry_until:
+                rule += f" / 진입~{args.entry_until}"
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
     universe = _stock_universe(codes)
@@ -501,6 +582,11 @@ def main() -> None:
         for code, name in universe:
             _ensure_cached(con, client, code, fetch_start, end)
             all_trades.extend(backtest_symbol(con, code, name, start, end, mode=args.mode, **params))
+    if args.leader_only:
+        n_before = len(all_trades)
+        all_trades = _leader_filter(con, all_trades, universe, start, end,
+                                    args.pre_surge / 100, args.max_surge / 100)
+        print(f"[leader-only] 팔로워 제거: {n_before} → {len(all_trades)}건")
     con.close()
 
     _report(all_trades)
