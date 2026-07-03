@@ -241,11 +241,14 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
 
 def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
                 tp_levels: tuple[float, ...], stop_pct: float,
-                stop_floor: float = 0.0) -> tuple[float, str, int]:
-    """v2/v3 공용 분할 익절 청산. (평균청산가, 사유, 익절구간수) 반환.
+                stop_floor: float = 0.0,
+                trail_pct: float = 0.0) -> tuple[float, str, int]:
+    """v2/v3/acc 공용 분할 익절 청산. (평균청산가, 사유, 익절구간수) 반환.
 
     stop_floor: 구조적 손절선(지지 저점 이탈가). 0 이면 미사용.
     스승님: 지지선이 "무너지면 가차없이 정리해야 하겠지요" (article 89144)
+    trail_pct: 첫 익절 후 고점 대비 -trail_pct 로 손절선 상향(꼭지 근처 잔량
+    청산, 사유 'TR'). 0 이면 미사용 — v2/v3 는 기본 끔.
     """
     n = len(tp_levels)
     tps = [entry * (1 + lv) for lv in tp_levels]
@@ -267,10 +270,121 @@ def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
                 armed, stop, stop_kind = True, float(entry), "BE"
         if len(fills) >= n:
             break
+        if armed and trail_pct > 0:
+            trail = b.high * (1 - trail_pct)
+            if trail > stop:
+                stop, stop_kind = trail, "TR"
     if len(fills) < n:
         fills += [bars3[-1].close] * (n - len(fills))
     reason = f"{tp_i}TP" + (f"/{exit_kind}" if tp_i < n else "")
     return sum(fills) / n, reason, tp_i
+
+
+def evaluate_day_acc(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
+                     *, pre_surge: float, pullback_min: float, support_tol: float,
+                     entry_bands: tuple[float, ...], stop_pct: float,
+                     tp_levels: tuple[float, ...], trail_pct: float = 0.0,
+                     consol_bars: int = 0, **_ignore) -> Trade | None:
+    """저점 분할 매집 + 재폭등 분할 익절 (형 실매매 방식 — PC 세션 구현).
+
+    v2와 게이트·눌림·청산은 같고 진입만 뒤집는다:
+      v2 = 재돌파에서 1회 매수(어깨) / acc = 지지선 근처에서 분할 매집(무릎 아래).
+    v3(무릎 진입)와도 다르다 — v3 는 반등 확인 후 시장가 1회, acc 는 확인 전
+    지지선에 지정가 여러 장을 깔아 평단을 낮춘다(미체결 리스크와 맞바꿈).
+
+    ① 프리장 급등 게이트.
+    ② 눌림 발생 + 지지 저점 형성.
+    ③ 다지기 확인: 저점이 consol_bars 봉 동안 -support_tol 넘게 깨지지 않아야
+       매집 개시(떨어지는 칼날 회피). 다지는 중 깨지면 새 저점으로 카운트 리셋.
+    ④ 매집: 지지선 기준 entry_bands(%) 레벨에 분할 지정가. 봉 저가가 닿으면 체결.
+    ⑤ 손절: 매집 중 지지선 -stop_pct 이탈 → 체결분 전량.
+    ⑥ 청산: 재돌파 후 평균진입가 기준 분할 익절. 첫 익절 후 trail_pct>0 이면
+       트레일링 스탑(고점 대비 -trail_pct)으로 잔량을 꼭지 근처에서 청산.
+    """
+    gated = _gate_and_resample(day_bars, prev_close, pre_surge)
+    if gated is None:
+        return None
+    pre_high, bars3 = gated
+
+    day_high = float(pre_high)
+    breakout_level: float | None = None
+    pullback_low: float | None = None
+    buy_levels: list[float] = []     # 미체결 매수 레벨(높은→낮은)
+    fills: list[float] = []          # 체결가(각 1/N)
+    stop_line: float | None = None
+    entry_done_i = -1                # 재돌파(매집 종료) 봉 인덱스
+    consol = 0                       # 지지 다지기 카운트(저점 유지 봉 수)
+
+    for i, b in enumerate(bars3):
+        prev_high = day_high
+        day_high = max(day_high, b.high)
+
+        # ② 눌림 최초 등록
+        if pullback_low is None:
+            if b.low <= prev_high * (1 - pullback_min):
+                pullback_low = float(b.low)
+                breakout_level = prev_high
+            continue
+
+        # --- 지난 봉까지 세팅된 주문/손절선만 이번 봉에서 작동(룩어헤드 금지) ---
+
+        # ④ 매집: 봉 저가가 닿은 미체결 레벨 체결. 손절 판정보다 먼저 —
+        #    지정가는 전부 손절선 위라 하락 경로상 손절 전에 반드시 먼저 닿는다.
+        if buy_levels:
+            still: list[float] = []
+            for lv in buy_levels:
+                if b.low <= lv:
+                    fills.append(lv)
+                else:
+                    still.append(lv)
+            buy_levels = still
+
+        # ⑤ 손절: 보유 중 지지선 이탈(같은 봉 체결분 포함 — 보수적으로 손절 우선)
+        if fills and stop_line is not None and b.low <= stop_line:
+            avg_entry = sum(fills) / len(fills)
+            return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
+                         int(round(avg_entry)), int(round(stop_line)), "SL",
+                         (stop_line - avg_entry) / avg_entry)
+
+        # ⑥ 재돌파 → 매집 종료, 청산 단계로
+        if breakout_level is not None and fills and b.close > breakout_level:
+            entry_done_i = i
+            break
+
+        # --- 현재 봉을 반영한 구조 갱신(세팅된 주문은 다음 봉부터 유효) ---
+
+        # ③ 다지기: 지지 유지면 카운트++, 저점 깨지면 새 저점으로 리셋
+        if b.low < pullback_low * (1 - support_tol):
+            pullback_low = float(b.low)
+            consol = 0
+            if not fills:                 # 아직 매집 전이면 매수 레벨도 리셋
+                buy_levels = []
+                stop_line = None
+        else:
+            pullback_low = min(pullback_low, b.low)
+            consol += 1
+
+        # ③ 다지기 확인(consol_bars 봉 유지) 후 매수 레벨 1회 세팅(지지 기준)
+        if consol >= consol_bars and not buy_levels and not fills:
+            support = pullback_low
+            buy_levels = sorted((support * (1 + x / 100) for x in entry_bands), reverse=True)
+            stop_line = support * (1 - stop_pct)
+
+    if not fills:
+        return None  # 한 번도 매집 못함
+
+    avg_entry = sum(fills) / len(fills)
+    if entry_done_i < 0:                      # 재돌파 없이 끝 → 종가 청산
+        exit_px = float(bars3[-1].close)
+        return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
+                     int(round(avg_entry)), int(round(exit_px)), "EOD",
+                     (exit_px - avg_entry) / avg_entry)
+
+    exit_avg, reason, _ = _split_exit(bars3, entry_done_i, avg_entry, tp_levels,
+                                      stop_pct, trail_pct=trail_pct)
+    return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
+                 int(round(avg_entry)), int(round(exit_avg)), reason,
+                 (exit_avg - avg_entry) / avg_entry)
 
 
 def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
@@ -573,7 +687,7 @@ def evaluate_day_v4(symbol: str, name: str, day_bars: list[Bar], prev_close: int
 
 
 _EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2, "v3": evaluate_day_v3,
-               "v4": evaluate_day_v4}
+               "v4": evaluate_day_v4, "acc": evaluate_day_acc}
 
 
 def _prev_stats(days: dict[date, list[Bar]], ordered: list[date], i: int) -> tuple[int, int]:
@@ -645,6 +759,30 @@ def _leader_filter(con, trades: list[Trade], universe: list[tuple[str, str]],
             if t.symbol not in sector or (t.day, t.symbol) in leaders]
 
 
+# ---------------- 종목 선별(그날 강한 놈 위주) ----------------
+
+def _select_top_n(trades: list[Trade], n: int) -> list[Trade]:
+    """같은 날 진입 신호 중 강도(프리장 급등률) 상위 n종목만 채택. n<=0 이면 전체.
+
+    그날 여러 종목이 신호를 줄 때 다 사지 않고 가장 센 놈만 골라, 약세날 동시
+    손절(=MDD 주범)을 줄이고 강한 종목에 집중한다.
+    """
+    if n <= 0:
+        return trades
+    by_day: dict[date, list[Trade]] = {}
+    for t in trades:
+        by_day.setdefault(t.day, []).append(t)
+    out: list[Trade] = []
+    for day in sorted(by_day):
+        ranked = sorted(
+            by_day[day],
+            key=lambda t: (t.pre_high - t.prev_close) / t.prev_close if t.prev_close else 0.0,
+            reverse=True,
+        )
+        out.extend(ranked[:n])
+    return out
+
+
 # ---------------- 리포트 ----------------
 
 def _stock_universe(codes: list[str] | None = None) -> list[tuple[str, str]]:
@@ -702,10 +840,11 @@ def main() -> None:
     ap.add_argument("--drop", type=float, default=3.0, help="[v1] 9:00~9:30 폭락 임계(퍼센트)")
     ap.add_argument("--tp", type=float, default=5.0, help="[v1] 익절(퍼센트)")
     ap.add_argument("--sl", type=float, default=3.0, help="[v1] 손절(퍼센트)")
-    ap.add_argument("--mode", choices=["v1", "v2", "v3", "v4"], default="v2",
+    ap.add_argument("--mode", choices=["v1", "v2", "v3", "v4", "acc"], default="v2",
                     help="v1=눌림 무조건매수 / v2=지지+재폭등 돌파매수(기본) / "
                          "v3=진바닥 확인 후 무릎 진입(아카이브 근거) / "
-                         "v4=v3+선발대·바닥신호·거래량 조기청산(아카이브 조합)")
+                         "v4=v3+선발대·바닥신호·거래량 조기청산(아카이브 조합) / "
+                         "acc=지지선 분할매집 지정가(형 실매매 방식)")
     ap.add_argument("--pullback-min", type=float, default=3.0, help="[v2/v3] 아침고점 대비 눌림 최소(퍼센트)")
     ap.add_argument("--support-tol", type=float, default=0.5, help="[v2/v3] 지지 이탈 허용(퍼센트)")
     ap.add_argument("--tp-levels", default="5,10,15,20,25",
@@ -734,6 +873,13 @@ def main() -> None:
                     help="[v4] 아래꼬리 최소 비율(봉 전체 대비). 근거 69581/68486(방향), 값은 임의")
     ap.add_argument("--vol-exit", type=float, default=1.3,
                     help="[v4] 오후 누적거래량/전일 비율 조기청산(0=끄기). 근거 49434")
+    ap.add_argument("--entry-bands", default="1,0,-1",
+                    help="[acc] 지지선 기준 분할 매수 레벨 CSV(퍼센트). "
+                         "예 '1,0,-1'=지지+1%%/지지/지지-1%%")
+    ap.add_argument("--trail", type=float, default=5.0,
+                    help="[acc] 트레일링 스탑(첫 익절 후 고점 대비 퍼센트, 0=끄기)")
+    ap.add_argument("--top-n", type=int, default=0,
+                    help="그날 강도(프리장 급등률) 상위 N종목만 진입. 0=전체(선별 안 함)")
     ap.add_argument("--codes", help="대상 종목코드 CSV (지정 시 이 종목만; 미지정이면 등록 전체)")
     args = ap.parse_args()
 
@@ -773,6 +919,12 @@ def main() -> None:
                           vol_exit_ratio=args.vol_exit)
             rule += (f" / 선발대{args.scout_frac} / 꼬리≥{args.wick_min} / "
                      f"VOL청산{args.vol_exit}x")
+        if args.mode == "acc":
+            entry_bands = tuple(float(x) for x in args.entry_bands.split(",") if x.strip())
+            if not entry_bands:
+                raise SystemExit("--entry-bands 가 비었음 — 예: --entry-bands 1,0,-1")
+            params.update(entry_bands=entry_bands, trail_pct=args.trail / 100)
+            rule += f" / 매집[{args.entry_bands}]% / 트레일-{args.trail}%"
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
     universe = _stock_universe(codes)
@@ -792,6 +944,11 @@ def main() -> None:
                                     args.pre_surge / 100, args.max_surge / 100)
         print(f"[leader-only] 팔로워 제거: {n_before} → {len(all_trades)}건")
     con.close()
+
+    if args.top_n > 0:
+        n_before = len(all_trades)
+        all_trades = _select_top_n(all_trades, args.top_n)
+        print(f"[top-n] 강도 상위 {args.top_n}종목/일: {n_before} → {len(all_trades)}건")
 
     _report(all_trades)
 
