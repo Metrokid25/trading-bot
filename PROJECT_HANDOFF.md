@@ -875,3 +875,15 @@ Phase 2.5 작업 5번: 분봉 raw 수집 (pick_minute_raw)
 
 ### 검증
 - `pytest`: **269 passed, 1 skipped** (acc 신규 7건 포함, 기존 262 회귀 없음).
+
+### 유니버스 동기화 (같은 세션 후속)
+- PC DB 실측: active 21종목 반도체 1섹터(6/25 웹 등록 pick 18) — 노트북 50종목과 불일치.
+- `scripts/register_mentor_june_picks.py` PC 실행 완료 → 멘토 27종목(6섹터) 등록됨.
+- **`scripts/sync_universe.py` 신설**: `--export` 로 active 유니버스를
+  `universe_snapshot.json`(git 동기화)으로 내보내고 `--import` 로 멱등 반영.
+  import 는 섹터 내 "다른 활성 픽" 보유 종목도 걸러 픽 간 중복(트래커 이중
+  수집)을 방지. PC 에서 export→import 왕복 스모크 통과(전부 스킵 확인).
+- **노트북 TODO**: `--export` 1회 실행 → commit+push. 그 뒤 PC 에서 pull →
+  `--import` 하면 MLCC/양자암호/전력설비 등 원래 세트까지 일치.
+- 알려진 잔재: PC pick 21(반도체)에 스모크 테스트로 pick 18 중복 16행이 들어감.
+  유니버스(DISTINCT)에는 무영향, PC 는 적립 기기 아님 — 정리 여부는 형 판단.
