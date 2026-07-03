@@ -102,7 +102,8 @@ def _by_day(bars: list[Bar]) -> dict[date, list[Bar]]:
 
 
 def evaluate_day(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
-                 *, pre_surge: float, drop: float, tp: float, sl: float) -> Trade | None:
+                 *, pre_surge: float, drop: float, tp: float, sl: float,
+                 **_ignore) -> Trade | None:
     pre = [b for b in day_bars if PRE_START <= b.ts.time() < PRE_END]
     reg = [b for b in day_bars if REG_OPEN <= b.ts.time() <= REG_CLOSE]
     if not reg or prev_close <= 0:
@@ -387,16 +388,206 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
                  int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
 
 
-_EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2, "v3": evaluate_day_v3}
+def _ladder_exit_v4(bars3: list[Bar], start_i: int, avg_cost: float,
+                    tp_levels: tuple[float, ...], stop_pct: float, stop_floor: float,
+                    prev_vol: int, vol_exit_ratio: float,
+                    vol_exit_after: time) -> tuple[float, str]:
+    """v4 청산: 분할 익절 + 본절 + 구조적 손절 + 거래량 130% 조기 청산(49434).
+
+    "오후장에서 거래량이 전일 거래량의 130%를 넘어서고 양봉을 만들지 못한다,
+     이런경우 차익실현에 대한 매물출회 압력이 확대되고 있는중이다"(49434)
+    → 오후(vol_exit_after~)에 당일 누적 거래량 ≥ vol_exit_ratio × 전일 총량이고
+      그 봉이 음봉이면 잔량을 그 봉 종가에 청산(reason 'VOL').
+    """
+    n = len(tp_levels)
+    tps = [avg_cost * (1 + lv) for lv in tp_levels]
+    fills: list[float] = []
+    stop = max(avg_cost * (1 - stop_pct), stop_floor)
+    armed = False
+    tp_i = 0
+    stop_kind = "SL"
+    exit_kind = "EOD"
+    cum_vol = sum(b.volume for b in bars3[:start_i + 1])
+    for b in bars3[start_i + 1:]:
+        cum_vol += b.volume
+        if b.low <= stop:
+            fills += [stop] * (n - len(fills))
+            exit_kind = stop_kind
+            break
+        while tp_i < n and b.high >= tps[tp_i]:
+            fills.append(tps[tp_i])
+            tp_i += 1
+            if not armed:
+                armed, stop, stop_kind = True, float(avg_cost), "BE"
+        if len(fills) >= n:
+            break
+        if (vol_exit_ratio > 0 and prev_vol > 0 and b.ts.time() >= vol_exit_after
+                and cum_vol >= vol_exit_ratio * prev_vol and b.close < b.open):
+            fills += [float(b.close)] * (n - len(fills))
+            exit_kind = "VOL"
+            break
+    if len(fills) < n:
+        fills += [float(bars3[-1].close)] * (n - len(fills))
+    reason = f"{tp_i}TP" + (f"/{exit_kind}" if tp_i < n else "")
+    return sum(fills) / n, reason
+
+
+def evaluate_day_v4(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
+                    *, pre_surge: float, pullback_min: float, support_tol: float,
+                    tp_levels: tuple[float, ...], stop_pct: float,
+                    waist_ratio: float, consol_bars: int,
+                    vol_dryup_max: float, vol_confirm_ratio: float,
+                    pullback_frac: float = 0.0, max_surge: float = 0.0,
+                    entry_until: time | None = None,
+                    scout_frac: float = 0.2, wick_min: float = 0.5,
+                    vol_exit_ratio: float = 1.3, prev_vol: int = 0,
+                    **_ignore) -> Trade | None:
+    """v3 + 아카이브 조합 확장: 선발대 2단 진입 + 바닥 신호 + 거래량 조기 청산.
+
+    v3 대비 추가 규칙과 근거 (mentor.db article_id):
+      ⑥ 선발대(scout) 진입: 다지기 중 바닥 신호가 나오면 scout_frac 만큼 먼저
+         진입, 무릎 확인 시 잔량 진입 —
+         "선발대로 나서는 분할매수 비중은 통상 20% 미만이 적당"(53601),
+         "왜 매수하지 않고 선발대를 보내나? 기술적 반등일수 잇기 때문"(69581),
+         "선발대를 보내서 향후 주가 방향을 체크 합니다, 연후 수급이 들어오면
+          추매하도록 하겟습니다"(54546).
+         바닥 신호 = 쌍바닥(저점 존 2회 이상 터치 후 지지) 또는 아래꼬리봉:
+         "저점 인근에서 쌍바닥을 한번더 만들어야 상승추세의 동력을 얻게된다"(92522),
+         "쌍바닥을 만든 이후 아래꼬리를 달아서 올릴 때 … 관심을 가질수 있는
+          자리"(69581), "바닥을 다지고 아래꼬리를 단다, 이런 경우 내일은 반등을
+          모색할수 있다"(68486), "아래꼬리가 매매공방이 일어나고 있는데 매수세가
+          강하다"(68828).
+         (아래꼬리 '길게'의 정량값 wick_min=0.5 는 임의 — 아카이브는 방향만)
+      ⑦ 거래량 조기 청산: _ladder_exit_v4 참조(49434). EOD 본전 물림 축소 목적.
+      선발대 후 지지 이탈 시 선발대만 구조적 손절(89144) — 무릎 미확인 손실은
+      scout_frac 비중으로 제한. 수익률은 투입 비중 가중(미투입분 0%).
+    """
+    gated = _gate_and_resample(day_bars, prev_close, pre_surge)
+    if gated is None:
+        return None
+    pre_high, bars3 = gated
+    if max_surge > 0 and (pre_high - prev_close) / prev_close > max_surge:
+        return None
+
+    waist = prev_close + waist_ratio * (pre_high - prev_close)
+    day_high = float(pre_high)
+    breakout_level: float | None = None
+    pullback_low: float | None = None
+    down_vols: list[int] = []
+    consol_vols: list[int] = []
+    consol_high: float | None = None
+    touches = 0                      # 저점 존 터치 횟수(쌍바닥 판정, 반등 후 재시험만 카운트)
+    left_zone = False                # 마지막 터치 후 존을 벗어났는가
+    scout_px: float | None = None    # 선발대 체결가
+    scout_i = -1
+    entry_px: float | None = None    # 본대(무릎) 체결가
+    entry_i = -1
+    scout_stopped = False
+    for i, b in enumerate(bars3):
+        prev_high = day_high
+        day_high = max(day_high, b.high)
+        if pullback_low is None:
+            if pullback_frac > 0:
+                trigger = prev_high - pullback_frac * (prev_high - prev_close)
+            else:
+                trigger = prev_high * (1 - pullback_min)
+            if b.low <= trigger:
+                pullback_low = float(b.low)
+                breakout_level = prev_high
+                down_vols = [b.volume]
+                touches, left_zone = 1, False
+                if pullback_frac > 0:
+                    waist = prev_close + waist_ratio * (breakout_level - prev_close)
+            continue
+        if waist_ratio > 0 and b.low < waist:
+            if scout_px is not None:              # 구조(허리) 붕괴 → 선발대 정리
+                scout_stopped = True              # (선발대는 허리 붕괴에서만 손절;
+            break                                 #  잔노이즈 이탈은 흥정 지속, 53601)
+        if b.low < pullback_low * (1 - support_tol):
+            pullback_low = float(b.low)           # 지지 이탈 → 저점 하향 재무장
+            down_vols += consol_vols + [b.volume]  # (선발대는 유지)
+            consol_vols, consol_high = [], None
+            touches, left_zone = 1, False
+            continue
+        in_zone = b.low <= pullback_low * (1 + support_tol)
+        if in_zone:
+            if left_zone:               # 반등 후 재시험만 새 터치로 인정(92522)
+                touches += 1
+            left_zone = False
+        else:
+            left_zone = True
+        # ⑤ 본대(무릎) 진입 판정 — v3 과 동일 조건
+        if consol_high is not None and len(consol_vols) >= consol_bars:
+            consol_avg = sum(consol_vols) / len(consol_vols)
+            down_avg = sum(down_vols) / len(down_vols)
+            if (consol_avg > 0
+                    and consol_avg <= vol_dryup_max * down_avg
+                    and b.close > b.open
+                    and b.close > consol_high
+                    and b.volume >= vol_confirm_ratio * consol_avg
+                    and b.close < breakout_level
+                    and (entry_until is None or b.ts.time() <= entry_until)):
+                entry_px, entry_i = float(b.close), i
+                break
+        # ⑥ 선발대: 거래량 마름(29606) + [쌍바닥 재시험(92522) 또는 아래꼬리(69581)]
+        if scout_px is None and scout_frac > 0 and len(consol_vols) >= 2:
+            consol_avg_s = sum(consol_vols) / len(consol_vols)
+            down_avg_s = sum(down_vols) / len(down_vols)
+            dryup_ok = 0 < consol_avg_s <= vol_dryup_max * down_avg_s
+            rng = b.high - b.low
+            hammer = (in_zone and rng > 0
+                      and (min(b.open, b.close) - b.low) >= wick_min * rng)
+            dbl_bottom = touches >= 2 and b.close >= b.open
+            if (dryup_ok and (hammer or dbl_bottom)
+                    and (entry_until is None or b.ts.time() <= entry_until)):
+                scout_px, scout_i = float(b.close), i
+        consol_vols.append(b.volume)
+        consol_high = b.high if consol_high is None else max(consol_high, b.high)
+
+    if entry_px is None and scout_px is None:
+        return None
+    stop_floor = (pullback_low or 0.0) * (1 - support_tol)
+
+    if scout_stopped:                             # 선발대만 물리고 허리 붕괴
+        ret = scout_frac * (waist - scout_px) / scout_px
+        return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
+                     int(scout_px), int(round(waist)), "0TP/SL(s)", ret)
+
+    if entry_px is not None and scout_px is not None:      # 선발대+본대
+        w_s, w_m = scout_frac, 1 - scout_frac
+        avg_cost = w_s * scout_px + w_m * entry_px
+        invested = 1.0
+        start_i = entry_i
+        tag = ""
+    elif entry_px is not None:                              # 본대 단독(v3 동일)
+        avg_cost, invested, start_i, tag = entry_px, 1.0, entry_i, ""
+    else:                                                   # 선발대 단독(무릎 미확인)
+        avg_cost, invested, start_i, tag = scout_px, scout_frac, scout_i, "(s)"
+
+    exit_avg, reason = _ladder_exit_v4(bars3, start_i, avg_cost, tp_levels,
+                                       stop_pct, stop_floor, prev_vol,
+                                       vol_exit_ratio, time(12, 0))
+    ret = invested * (exit_avg - avg_cost) / avg_cost
+    return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
+                 int(round(avg_cost)), int(round(exit_avg)), reason + tag, ret)
+
+
+_EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2, "v3": evaluate_day_v3,
+               "v4": evaluate_day_v4}
+
+
+def _prev_stats(days: dict[date, list[Bar]], ordered: list[date], i: int) -> tuple[int, int]:
+    """직전 거래일 정규장의 (마지막 종가, 총 거래량)."""
+    for pd in reversed(ordered[:i]):
+        prev_reg = [b for b in days[pd] if REG_OPEN <= b.ts.time() <= REG_CLOSE]
+        if prev_reg:
+            return prev_reg[-1].close, sum(b.volume for b in prev_reg)
+    return 0, 0
 
 
 def _prev_close(days: dict[date, list[Bar]], ordered: list[date], i: int) -> int:
     """전일 종가 = 직전 거래일의 정규장 마지막 종가."""
-    for pd in reversed(ordered[:i]):
-        prev_reg = [b for b in days[pd] if REG_OPEN <= b.ts.time() <= REG_CLOSE]
-        if prev_reg:
-            return prev_reg[-1].close
-    return 0
+    return _prev_stats(days, ordered, i)[0]
 
 
 def backtest_symbol(con, symbol, name, start, end, *, mode="v2", **params) -> list[Trade]:
@@ -407,7 +598,8 @@ def backtest_symbol(con, symbol, name, start, end, *, mode="v2", **params) -> li
     for i, d in enumerate(ordered):
         if not (start <= d <= end):
             continue
-        t = evaluator(symbol, name, days[d], _prev_close(days, ordered, i), **params)
+        pc, pv = _prev_stats(days, ordered, i)
+        t = evaluator(symbol, name, days[d], pc, prev_vol=pv, **params)
         if t:
             trades.append(t)
     return trades
@@ -510,9 +702,10 @@ def main() -> None:
     ap.add_argument("--drop", type=float, default=3.0, help="[v1] 9:00~9:30 폭락 임계(퍼센트)")
     ap.add_argument("--tp", type=float, default=5.0, help="[v1] 익절(퍼센트)")
     ap.add_argument("--sl", type=float, default=3.0, help="[v1] 손절(퍼센트)")
-    ap.add_argument("--mode", choices=["v1", "v2", "v3"], default="v2",
+    ap.add_argument("--mode", choices=["v1", "v2", "v3", "v4"], default="v2",
                     help="v1=눌림 무조건매수 / v2=지지+재폭등 돌파매수(기본) / "
-                         "v3=진바닥 확인 후 무릎 진입(아카이브 근거)")
+                         "v3=진바닥 확인 후 무릎 진입(아카이브 근거) / "
+                         "v4=v3+선발대·바닥신호·거래량 조기청산(아카이브 조합)")
     ap.add_argument("--pullback-min", type=float, default=3.0, help="[v2/v3] 아침고점 대비 눌림 최소(퍼센트)")
     ap.add_argument("--support-tol", type=float, default=0.5, help="[v2/v3] 지지 이탈 허용(퍼센트)")
     ap.add_argument("--tp-levels", default="5,10,15,20,25",
@@ -535,6 +728,12 @@ def main() -> None:
                     help="[v3] 진입 마감 시각 HH:MM(이후 진입 금지). 빈값=끄기")
     ap.add_argument("--leader-only", action="store_true",
                     help="섹터 대장주(그날 섹터 내 프리장 급등 1등)만 유지")
+    ap.add_argument("--scout-frac", type=float, default=0.2,
+                    help="[v4] 선발대 비중(0=끄기). 근거 53601(20%% 미만)")
+    ap.add_argument("--wick-min", type=float, default=0.5,
+                    help="[v4] 아래꼬리 최소 비율(봉 전체 대비). 근거 69581/68486(방향), 값은 임의")
+    ap.add_argument("--vol-exit", type=float, default=1.3,
+                    help="[v4] 오후 누적거래량/전일 비율 조기청산(0=끄기). 근거 49434")
     ap.add_argument("--codes", help="대상 종목코드 CSV (지정 시 이 종목만; 미지정이면 등록 전체)")
     args = ap.parse_args()
 
@@ -553,7 +752,7 @@ def main() -> None:
                       stop_pct=args.stop / 100, consol_bars=args.consol_bars)
         rule = (f"프리장+{args.pre_surge}% / 눌림-{args.pullback_min}% / "
                 f"다지기{args.consol_bars}봉 / 분할익절 {args.tp_levels}% / 손절-{args.stop}%")
-        if args.mode == "v3":
+        if args.mode in ("v3", "v4"):
             entry_until = time.fromisoformat(args.entry_until) if args.entry_until else None
             params.update(waist_ratio=args.waist,
                           vol_dryup_max=args.vol_dryup,
@@ -569,6 +768,11 @@ def main() -> None:
                 rule += f" / 과열컷{args.max_surge}%"
             if args.entry_until:
                 rule += f" / 진입~{args.entry_until}"
+        if args.mode == "v4":
+            params.update(scout_frac=args.scout_frac, wick_min=args.wick_min,
+                          vol_exit_ratio=args.vol_exit)
+            rule += (f" / 선발대{args.scout_frac} / 꼬리≥{args.wick_min} / "
+                     f"VOL청산{args.vol_exit}x")
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
     universe = _stock_universe(codes)
