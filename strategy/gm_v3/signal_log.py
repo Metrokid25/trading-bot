@@ -15,7 +15,14 @@ from strategy.gm_v3.models import Signal
 
 def log_signals(db_path: str | Path, signals: list[Signal], *,
                 run_id: str, source: str = "backtest") -> int:
-    """시그널 목록을 적재하고 신규 삽입 행 수를 반환."""
+    """시그널 목록을 적재하고 신규 삽입 행 수를 반환.
+
+    주의: 같은 run_id 재적재는 무시(멱등)되므로, config 를 바꿔 재실행할 땐
+    새 run_id 를 써야 한다 — weight/price 변경은 기존 행에 반영되지 않음.
+    """
+    if not run_id:
+        raise ValueError("run_id 필수 — 빈 값/None 이면 멱등 dedup 이 깨짐 "
+                         "(SQLite UNIQUE 는 NULL 을 서로 다른 값으로 취급)")
     if not signals:
         return 0
     con = sqlite3.connect(db_path)

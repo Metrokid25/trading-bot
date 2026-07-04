@@ -105,7 +105,9 @@ def simulate(code: str, bars: list[DailyBar], cfg: GmV3Config, *,
         if sells:
             top = sells[0]
             if top.rule == "R10":
-                do_sell(top.price, 1.0, "R10", bar.day)   # 당일 스탑 체결
+                # 당일 스탑 체결. 갭하락으로 시가가 이미 스탑 아래면 시가 체결
+                # (스탑 주문은 시가보다 좋게 체결될 수 없음 — 리뷰 HIGH 반영)
+                do_sell(min(bar.open, top.price), 1.0, "R10", bar.day)
             elif fill_mode == "close":
                 do_sell(bar.close, top.weight, top.rule, bar.day)
             else:

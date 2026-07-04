@@ -186,6 +186,10 @@ def evaluate_day(state: StockState, bar: DailyBar,
     if state.watch is not None and not surge_today:
         w = state.watch
         w.age += 1
+        if bar.high > w.watermark:      # 신고가 → 기준 갱신 + 눌림 구조 리셋
+            w.watermark = bar.high
+            w.zone_reached = False
+            w.pullback_vols.clear()
         dd = bar.close / w.watermark - 1
         if dd <= -cfg.r4_pullback_max_pct or w.age > cfg.r4_watch_expiry_days:
             state.watch = None          # 너무 깊은 눌림/만료 → 구조 무효
@@ -193,7 +197,8 @@ def evaluate_day(state: StockState, bar: DailyBar,
             if dd <= -cfg.r4_pullback_min_pct:
                 w.zone_reached = True
             rebreak = (w.zone_reached and w.pullback_vols
-                       and bar.close > prev.high)
+                       and bar.close > prev.high
+                       and bar.close < w.watermark)   # 고점 위 추격 금지
             if rebreak and cfg.r4_enabled and not entry_blocked:
                 avg_pb_vol = sum(w.pullback_vols) / len(w.pullback_vols)
                 if avg_pb_vol > 0 and bar.volume >= cfg.r4_vol_mult * avg_pb_vol:
@@ -207,7 +212,9 @@ def evaluate_day(state: StockState, bar: DailyBar,
                 w.pullback_vols.append(bar.volume)
 
     # R1 무릎 매수: 확정 피벗 고점 종가 첫 돌파 (+ R2 보수 필터)
-    if cfg.r1_enabled and not entry_blocked:
+    # 같은 봉에서 R4 가 이미 매수했으면 스킵 — 동일봉 이중 진입(선발대 0.4) 방지
+    already_bought = any(s.type == SignalType.BUY for s in out)
+    if cfg.r1_enabled and not entry_blocked and not already_bought:
         pivot = _latest_confirmed_pivot(state, cfg)
         if pivot is not None:
             p_i, p_high = pivot

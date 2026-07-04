@@ -79,9 +79,11 @@ class StockState:
             self.position = Position(entry_avg=price, invested=weight,
                                      opened_on=day, peak=price)
         else:
+            # invested 는 자본 비중 → 주수 = w/p, 평단은 조화평균:
+            # avg = Σw / Σ(wᵢ/pᵢ)  (산술평균이면 수익률 회계가 왜곡됨)
             p = self.position
             total = p.invested + weight
-            p.entry_avg = (p.entry_avg * p.invested + price * weight) / total
+            p.entry_avg = total / (p.invested / p.entry_avg + weight / price)
             p.invested = total
 
     def apply_sell(self, frac: float) -> None:

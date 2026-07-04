@@ -54,6 +54,28 @@ def test_r10_stop_fills_same_day_at_trigger():
     assert abs(t.realized - expect) < 1e-9
 
 
+def test_r10_gap_down_fills_at_open_not_stop():
+    """갭하락으로 시가가 스탑 아래면 시가 체결 — 스탑 가격 낙관 체결 금지."""
+    rows = BASE + [(11150, 11300, 11100, 11250, 100),   # 시가 11150 매수
+                   (10200, 10250, 10000, 10100, 100)]   # 시가 10200 < 스탑 10704
+    trades, _ = simulate("X", make_bars(rows), CFG)
+    assert len(trades) == 1
+    expect = (10200 / 11150 - 1) * CFG.r6_scout_weight  # 시가 기준 -1.70%
+    assert abs(trades[0].realized - expect) < 1e-9
+
+
+def test_apply_buy_harmonic_average_accounting():
+    """자본 비중 매수의 평단은 조화평균 — 0.2@100 + 0.2@200 전량 200 매도 = +20%."""
+    from datetime import date as Date
+    from strategy.gm_v3.models import StockState
+    st = StockState(code="X")
+    st.apply_buy(100.0, 0.2, Date(2026, 1, 5))
+    st.apply_buy(200.0, 0.2, Date(2026, 1, 6))
+    pos = st.position
+    realized = (200.0 / pos.entry_avg - 1) * pos.invested
+    assert abs(realized - 0.2) < 1e-9                   # 산술평균이면 +13.3%로 왜곡
+
+
 def test_act_window_excludes_warmup_signals():
     rows = BASE + [(11150, 11300, 11100, 11250, 100)]
     bars = make_bars(rows)

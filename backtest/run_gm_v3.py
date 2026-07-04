@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import sys
 import uuid
+import zlib
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -69,8 +70,11 @@ def _report(trades: list[PaperTrade], names: dict[str, str],
             peak = max(peak, eq)
             mdd = min(mdd, eq / peak - 1)
         print(f"트레이드 {n}건 | 승률 {len(wins)/n*100:.1f}% "
-              f"| 평균실현 {avg*100:+.2f}% | 누적(복리) {(eq-1)*100:+.1f}% "
+              f"| 평균실현 {avg*100:+.2f}% "
+              f"| 누적(순차복리·동시보유 미반영) {(eq-1)*100:+.1f}% "
               f"| MDD {mdd*100:.1f}%")
+        print("※ 누적/MDD 는 트레이드를 청산일 순으로 직렬 복리한 참고치 — "
+              "동시 보유가 겹치면 포트폴리오 지표가 아님 (기존 v1~v4 리포트 동일 관례)")
     else:
         print("완결 트레이드 0건")
     for kind, items in gaps.items():
@@ -126,7 +130,9 @@ def main() -> None:
             else:
                 gaps["KIS 보충 실패"].append(code)
         if args.synth_pad > 0 and len(bars) < args.synth_pad + 60:
-            bars = synth_pad(bars, args.synth_pad, seed=hash(code) % 10 ** 6)
+            # zlib.crc32: 프로세스 간 결정적 시드 (hash() 는 PYTHONHASHSEED 염분)
+            bars = synth_pad(bars, args.synth_pad,
+                             seed=zlib.crc32(code.encode()))
             gaps["합성 패딩 사용(더미)"].append(code)
         trades, sigs = simulate(code, bars, cfg, fill_mode=args.fill,
                                 act_from=start, act_to=end)
