@@ -19,12 +19,18 @@ from strategy.gm_v3.models import DailyBar
 from strategy.gm_v3.synth import make_random_walk
 
 TOSS_CACHE_DB = Path(__file__).resolve().parent.parent.parent / "db" / "toss_candles.db"
+_PRE_OPEN = time(8, 0)          # NXT 프리마켓 시작
 _REG_OPEN, _REG_CLOSE = time(9, 0), time(15, 30)
 
 
-def load_daily_from_toss(code: str,
-                         cache_db: Path = TOSS_CACHE_DB) -> list[DailyBar]:
-    """토스 1분봉 캐시에서 정규장 일봉 합성. 캐시에 없는 종목은 빈 리스트."""
+def load_daily_from_toss(code: str, cache_db: Path = TOSS_CACHE_DB, *,
+                         include_premarket: bool = False) -> list[DailyBar]:
+    """토스 1분봉 캐시에서 일봉 합성. 캐시에 없는 종목은 빈 리스트.
+
+    include_premarket=True 면 NXT 프리마켓(08:00~)부터 포함 — 시가 = 프리장
+    첫 체결가, 고저가/거래량에 프리장 반영(종가는 동일하게 15:30).
+    체결 가정 주의: 페이퍼의 '다음날 시가'가 프리장 08:00 체결이 된다.
+    """
     if not Path(cache_db).exists():
         return []
     con = sqlite3.connect(cache_db)
@@ -33,11 +39,14 @@ def load_daily_from_toss(code: str,
         "WHERE symbol=? ORDER BY ts", (code,)).fetchall()
     con.close()
 
+    start_t = _PRE_OPEN if include_premarket else _REG_OPEN
     days: dict[Date, list] = {}
     for ts, o, h, l, c, v in rows:
         dt = datetime.fromisoformat(ts)
-        if not (_REG_OPEN <= dt.time() <= _REG_CLOSE):
+        if not (start_t <= dt.time() <= _REG_CLOSE):
             continue
+        if v <= 0 and dt.time() < _REG_OPEN:
+            continue                     # 프리장 무체결 호가봉 제외
         d = dt.date()
         g = days.get(d)
         if g is None:

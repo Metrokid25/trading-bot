@@ -92,6 +92,8 @@ def main() -> None:
                     default="next_open", help="체결 가정 (기본 다음날 시가)")
     ap.add_argument("--r2", action="store_true",
                     help="R2 보수 필터(정배열 5>20>60) 켜기")
+    ap.add_argument("--pre", action="store_true",
+                    help="NXT 프리마켓(08:00~) 포함 일봉 — 시가/고저/거래량에 반영")
     ap.add_argument("--kis-backfill", type=int, default=0,
                     help="KIS 과거 일봉 N거래일 보충(60일선 워밍업). 0=끔")
     ap.add_argument("--synth-pad", type=int, default=0,
@@ -110,7 +112,8 @@ def main() -> None:
         raise SystemExit("active sector_stocks 없음 — 웹앱/스크립트로 등록 후 실행")
     run_id = args.run_id or f"gm3_{args.start}_{args.end}_{uuid.uuid4().hex[:6]}"
     print(f"[gm_v3] {len(universe)}종목 | {start}~{end} | fill={args.fill} "
-          f"| R2={'on' if args.r2 else 'off'} | run_id={run_id}")
+          f"| R2={'on' if args.r2 else 'off'} "
+          f"| 세션={'프리+정규' if args.pre else '정규만'} | run_id={run_id}")
 
     names = dict(universe)
     all_trades: list[PaperTrade] = []
@@ -118,7 +121,7 @@ def main() -> None:
     gaps: dict[str, list[str]] = {"토스캐시 없음(스킵)": [],
                                   "KIS 보충 실패": [], "합성 패딩 사용(더미)": []}
     for code, _name in universe:
-        bars = load_daily_from_toss(code)
+        bars = load_daily_from_toss(code, include_premarket=args.pre)
         if not bars:
             gaps["토스캐시 없음(스킵)"].append(code)
             continue
