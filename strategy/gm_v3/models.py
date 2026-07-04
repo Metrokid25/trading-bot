@@ -1,0 +1,94 @@
+"""gm_v3 데이터 모델 — 일봉, 시그널, 종목별 상태.
+
+엔진은 종목당 StockState 하나를 유지하며 evaluate_day() 가 봉마다 갱신한다.
+포지션 체결(open/add/close)은 러너 책임 — 엔진은 시그널만 낸다 (절대 제약 3항).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date as Date
+from enum import Enum
+
+
+@dataclass(frozen=True, slots=True)
+class DailyBar:
+    day: Date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class SignalType(str, Enum):
+    BUY = "BUY"      # 진입 (weight = 목표 비중 대비 투입 비율)
+    SELL = "SELL"    # 청산 (weight = 보유 대비 청산 비율, 1.0 = 전량)
+    WATCH = "WATCH"  # R3 급등 → 눌림 대기 등록 (정보성)
+    MARK = "MARK"    # R5 거래량 마름 분할매수 후보 마킹 (정보성, 매수 아님)
+    HOLD = "HOLD"    # R11 홀딩 플래그 발동 (정보성)
+
+
+#: SELL 시그널 우선순위 (숫자 낮을수록 먼저 적용; 러너가 사용)
+SELL_PRIORITY = {"R10": 0, "R9": 1, "R7": 2, "R8": 3}
+
+
+@dataclass(frozen=True, slots=True)
+class Signal:
+    day: Date
+    stock_code: str
+    type: SignalType
+    rule: str                 # 'R1' ~ 'R12'
+    weight: float             # BUY: 투입 비중 / SELL: 청산 비율 / 정보성: 0
+    price: float              # 참조 가격(종가) 또는 트리거 가격(R10 손절선)
+    reason: dict = field(default_factory=dict)   # 근거 수치 (로깅용)
+
+
+@dataclass(slots=True)
+class Position:
+    """페이퍼 포지션 뷰 — 러너가 체결 후 갱신."""
+    entry_avg: float          # 평균 진입가
+    invested: float           # 목표 비중 대비 투입률 (0~1)
+    opened_on: Date
+    peak: float = 0.0         # 보유 중 최고가 (엔진이 매 봉 갱신)
+    r8_done: bool = False     # R8 목표가 분할매도 1회 소진 여부
+
+
+@dataclass(slots=True)
+class WatchState:
+    """R3 급등 → R4 눌림 대기 상태."""
+    started_on: Date
+    watermark: float                       # 급등 이후 최고가
+    zone_reached: bool = False             # 눌림이 -min% 존에 도달했는가
+    pullback_vols: list[float] = field(default_factory=list)
+    age: int = 0                           # 등록 후 경과 거래일
+
+
+@dataclass(slots=True)
+class StockState:
+    """종목별 엔진 상태. bars 는 evaluate_day 가 append."""
+    code: str
+    bars: list[DailyBar] = field(default_factory=list)
+    position: Position | None = None
+    watch: WatchState | None = None
+    hold_until: int = -1      # R11: 이 bar 인덱스까지 R7 유예
+    used_pivot_i: int = -1    # R1 이 소비한 피벗 인덱스 (같은 피벗 재발화 방지)
+
+    # ---- 러너용 체결 헬퍼 (페이퍼 전용) ----
+    def apply_buy(self, price: float, weight: float, day: Date) -> None:
+        if self.position is None:
+            self.position = Position(entry_avg=price, invested=weight,
+                                     opened_on=day, peak=price)
+        else:
+            p = self.position
+            total = p.invested + weight
+            p.entry_avg = (p.entry_avg * p.invested + price * weight) / total
+            p.invested = total
+
+    def apply_sell(self, frac: float) -> None:
+        if self.position is None:
+            return
+        if frac >= 1.0 or self.position.invested <= 0:
+            self.position = None
+            self.hold_until = -1
+        else:
+            self.position.invested *= (1.0 - frac)
