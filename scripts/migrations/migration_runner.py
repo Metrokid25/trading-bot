@@ -122,6 +122,7 @@ if __name__ == "__main__":
         m007_phase25_minute_raw_rebuild,
         m008_phase25_minute_agg,
         m009_phase25_breakout_marks,
+        m010_gm_v3_signals,
     )
 
     run_migrations(
@@ -136,6 +137,7 @@ if __name__ == "__main__":
             m007_phase25_minute_raw_rebuild,
             m008_phase25_minute_agg,
             m009_phase25_breakout_marks,
+            m010_gm_v3_signals,
         ],
         backup=True,
     )
