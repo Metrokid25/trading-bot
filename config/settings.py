@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     TOSS_CLIENT_ID: str = ""
     TOSS_CLIENT_SECRET: str = ""
     TOSS_BASE_URL: str = "https://openapi.tossinvest.com"
+    # 고정 IP 출구용 프록시 (토스 IP 화이트리스트 대응). 예: socks5://127.0.0.1:1080
+    # 비우면 직접 연결. 회사 테더링 등 유동 IP 환경에서 SSH 터널과 함께 사용.
+    TOSS_PROXY: str = ""
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = ""

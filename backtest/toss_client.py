@@ -68,7 +68,10 @@ class TossClient:
     """동기 httpx 기반 토스 캔들 클라이언트. 토큰은 1회 발급 후 재사용."""
 
     def __init__(self, *, throttle_sec: float = 0.25) -> None:
-        self._client = httpx.Client(base_url=settings.TOSS_BASE_URL, timeout=20.0)
+        # TOSS_PROXY 설정 시 토스 호출만 고정 IP 출구(SSH 터널 등)로 라우팅.
+        proxy = settings.TOSS_PROXY or None
+        self._client = httpx.Client(base_url=settings.TOSS_BASE_URL, timeout=20.0,
+                                    proxy=proxy)
         self._token: str | None = None
         self._throttle = throttle_sec
 

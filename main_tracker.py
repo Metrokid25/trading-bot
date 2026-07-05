@@ -19,6 +19,7 @@ from loguru import logger
 from config import settings
 from core.kis_api import KISClient
 from core.pipeline_runner import full_pipeline_job
+from strategy.paper_runner import paper_job
 
 
 async def run() -> None:
@@ -35,17 +36,24 @@ async def run() -> None:
 
     kis = KISClient()
 
+    async def daily_16h_job() -> None:
+        """수집 파이프라인 → 모의투자 기록 (각각 best-effort, 순차)."""
+        try:
+            await full_pipeline_job(str(settings.DB_PATH), kis)
+        except Exception as exc:
+            logger.error("[16h] 파이프라인 실패 — 페이퍼 기록은 계속: {}", exc)
+        await paper_job()   # 내부에서 예외 흡수
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        full_pipeline_job,
+        daily_16h_job,
         CronTrigger(hour=16, minute=0, timezone="Asia/Seoul"),
-        args=[str(settings.DB_PATH), kis],
         id="full_pipeline",
-        name="통합 수집 파이프라인",
+        name="통합 수집 파이프라인 + 모의투자 기록",
         misfire_grace_time=300,
     )
     scheduler.start()
-    logger.info("스케줄러 시작 — 매일 16:00 KST 통합 파이프라인 실행")
+    logger.info("스케줄러 시작 — 매일 16:00 KST 파이프라인 + 페이퍼 기록")
 
     try:
         await asyncio.Event().wait()
