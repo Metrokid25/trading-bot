@@ -64,6 +64,7 @@ from config import settings  # noqa: E402
 from core.market_calendar import is_trading_day  # noqa: E402
 from core.market_schedule import next_action  # noqa: E402
 from core.time_utils import now_kst, to_db_iso  # noqa: E402
+from strategy.paper_notify import notify_events  # noqa: E402
 from strategy.gm_v3.config import GmV3Config  # noqa: E402
 from strategy.gm_v3.data_source import (  # noqa: E402
     kis_backfill_daily, load_daily_from_toss,
@@ -141,6 +142,12 @@ def paper_conn() -> sqlite3.Connection:
     # 라이브 전환 마이그레이션: 레짐 스플라이스 가드 + 임시/확정 구분
     _ensure_column(con, "paper_daily", "regime", "TEXT DEFAULT ''")
     _ensure_column(con, "paper_daily", "finalized", "INTEGER DEFAULT 0")
+    # 텔레그램 팩트 알림 중복 차단 (5분 재기록/재시작에도 이벤트당 1회)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_notified ("
+        " key TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL,"
+        " sent_at TEXT NOT NULL)"
+    )
     return con
 
 
@@ -316,7 +323,8 @@ def run_v2_for_day(day: date, universe) -> list[dict]:
             out.append({"code": code, "name": name, "sector": sector,
                         "day": t.day, "ret_gross": t.ret,
                         "ret_net": t.ret - 2 * COST_PER_SIDE,
-                        "detail": t.reason})
+                        "entry": t.entry, "exit": t.exit,   # 알림용 진입/청산가
+                        "reason": t.reason, "detail": t.reason})
     cache.close()
     return out
 
@@ -574,6 +582,13 @@ def record_day(day: date) -> dict:
     summary["finalized"] = finalized
 
     con.commit()
+
+    # 5) 텔레그램 팩트 알림 (확정분만, best-effort — 예외 전파 안 함)
+    try:
+        notify_events(con, day, finalized, leader_rows, gm3_rows, summary)
+    except Exception as exc:
+        logger.error("[paper] 알림 단계 예외(무시): {}", exc)
+
     con.close()
     logger.info("[paper] {} 기록 완료(finalized={}): {}", day, finalized, summary)
     return summary
