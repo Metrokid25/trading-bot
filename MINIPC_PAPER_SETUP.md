@@ -54,13 +54,15 @@ curl.exe -s https://api.ipify.org   # 미니PC 공인 IP 확인
 `403 {"error":"access_denied","error_description":"IP address not allowed"}` 가
 나므로 그때 재등록.
 
-### 2-4. trading.db 스키마 (선택이지만 권장)
+### 2-4. trading.db 스키마 (필수 — 2026-07-06 운영 전환 후)
 ```powershell
 $env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe scripts\migrations\migration_runner.py
 ```
-- 페이퍼 자체는 trading.db 를 안 쓰지만(유니버스는 `universe_snapshot.json`),
-  `main_tracker.py` 의 수집 파이프라인 단계가 스키마 없으면 에러 로그를 뿜는다
-  (best-effort 라 페이퍼 기록은 계속됨). 깔끔하게 하려면 1회 실행.
+- **(2026-07-06 A안 전환) 페이퍼 유니버스 = 이 기기 trading.db 라이브 조회.**
+  동결 스냅샷(universe_snapshot.json)은 더 이상 사용하지 않는다.
+- **픽 등록/교체는 반드시 미니PC 웹앱에서** — trading.db 는 gitignore(기기 로컬)라
+  노트북 웹앱에 등록한 픽은 여기 오지 않는다 (sync_universe --import 는 7일
+  만료 픽을 만들 뿐이라 상시 운영 경로가 아님).
 
 ### 2-5. 토스 연결 검증
 ```powershell
@@ -81,19 +83,20 @@ $env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe -m strategy.paper_runner
 
 ---
 
-## 3. 상주 가동 (매일 자동)
+## 3. 상주 가동 (매일 자동) — 2026-07-06 확정 구성: 두 프로세스
 
-### 방식 A — main_tracker 상주 (권장)
 ```powershell
+# ① 수집 파이프라인 (매일 16:00, Phase 2.5 분봉 적립 — 페이퍼 기록 안 함)
 $env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe main_tracker.py
+# ② 모의투자 상주 (KST 타임테이블: 08~16시 5분 주기, 23~06시 중단)
+$env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe -m strategy.paper_runner --market-schedule
 ```
-- 매일 16:00 KST: 수집 파이프라인(best-effort) → **페이퍼 기록** 자동 실행.
-- 미니PC 절전 금지(전원 옵션에서 꺼둠). 재부팅 시 자동 시작하려면 작업
-  스케줄러에 "로그온 시" 위 명령 등록.
-
-### 방식 B — 작업 스케줄러로 페이퍼만
-매 거래일 20:10 에 `-m strategy.paper_runner` 실행 등록 (20:05 이후면 애프터
-포함 완전한 하루가 캐시에 확정됨).
+- 페이퍼 기록은 ②가 전담한다. main_tracker 에 paper_job 을 같이 돌리면 16:00 에
+  paper.db 이중 기록자 충돌 (2026-07-06 독립 리뷰 F5) — 코드에서 제거됨.
+- 장중 기록은 임시(finalized=0), **20:05 이후 사이클이 확정치(finalized=1)**.
+  결측 거래일·미확정 일자는 다음 기록 때 자동 소급/재확정된다(record_upto).
+- 미니PC 절전 금지(전원 옵션에서 꺼둠). 재부팅 자동 시작은 시작프로그램 폴더의
+  `trading-bot-paper.vbs` (두 프로세스 모두 기동).
 
 ### 일상 확인
 ```powershell
@@ -111,11 +114,12 @@ $env:PYTHONIOENCODING='utf-8'; .venv\Scripts\python.exe -m strategy.paper_runner
 | v2 | 프리장(NXT 08:00~08:50) 급등 → 눌림 지지·다지기 → 아침고점 재돌파 진입, 5분할 익절+본절보호+손절 -4% (당일 스캘핑, 3분봉) |
 | v2_leader | v2 + 주도섹터 필터(신호일 d-1 기준 최근 5거래일 수익률 1위 섹터만) |
 | gm_v3 | 멘토 룰엔진 R1~R12 (일봉 스윙, 다음날 시가 체결, 매일 전체 리플레이=멱등) |
-| bench_bh | **동결 유니버스**(universe_snapshot.json, 9섹터 50종목) 동일가중 buy&hold — 알파 판정 기준선 |
+| bench_bh | **당일 라이브 유니버스** 동일가중 무비용 기준선 — 연속 등록 종목은 전일종가→당일종가(오버나이트 포함), 신규 편입은 당일 시가→종가. 일수익 직렬 체인 |
 
-명시 가정(paper_meta 에 스탬프됨): 비용 0.25%/편도, gm_v3 미청산 포지션은
-MTM(EOR)로 equity 반영·실청산 집계 제외, 벤치마크 첫날 무봉 종목 영구 제외,
-애프터 급변/프리장 갭 규칙 미반영(보수적).
+명시 가정(paper_meta 에 스탬프됨, regime=live_universe_v1): 비용 0.25%/편도,
+gm_v3 미청산 포지션은 MTM(EOR)로 equity 반영·실청산 집계 제외, gm_v3 리플레이는
+과거 제외 종목도 제외일까지 포함(생존편향 차단), 결측일 소급 시 현재 라이브
+유니버스 사용, 애프터 급변/프리장 갭 규칙 미반영(보수적).
 
 데이터 흐름: 토스 Open API 1분봉(과거 1년+, NXT 프리장 실체결 포함 — KIS/
 트뷰/크레온은 불가한 유일 소스) → `db/toss_candles.db` 캐시(증분) → 전략 판정

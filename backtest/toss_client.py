@@ -185,3 +185,29 @@ class TossClient:
                 time.sleep(self._throttle)
 
         return sorted(out.values(), key=lambda b: b.ts)
+
+    def fetch_1m_since(self, symbol: str, since: datetime) -> list[Bar]:
+        """since 이후(미포함)~현재의 1분봉을 오름차순으로 반환 (증분 수집용).
+
+        최신 시각을 커서로 과거 방향 페이징하며 since 에 닿으면 멈춘다.
+        상주 루프가 5분마다 당일 전체를 재다운로드하지 않도록 하는 tail fetch —
+        직전 수집 이후 분량(보통 1페이지 이하)만 받는다.
+        """
+        cursor = datetime.now(KST) + timedelta(minutes=2)
+        out: dict[datetime, Bar] = {}
+
+        while True:
+            bars = self._get_candles(symbol, "1m", _MAX_COUNT, cursor.isoformat())
+            if not bars:
+                break
+            oldest = min(b.ts for b in bars)
+            for b in bars:
+                if b.ts > since:
+                    out[b.ts] = b
+            if oldest <= since:
+                break
+            cursor = oldest
+            if self._throttle:
+                time.sleep(self._throttle)
+
+        return sorted(out.values(), key=lambda b: b.ts)
