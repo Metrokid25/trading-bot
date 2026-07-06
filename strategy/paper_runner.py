@@ -715,6 +715,10 @@ def run_market_schedule_loop() -> None:
 
 
 def main() -> None:
+    # 상주(hidden 프로세스) 로그 소실 방지 — 파일 싱크 추가 (main.py/main_tracker 와 동일 패턴)
+    logger.add(settings.LOG_DIR / "paper_{time:YYYYMMDD}.log",
+               level=settings.LOG_LEVEL, rotation="1 day", encoding="utf-8")
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--init", metavar="YYYY-MM-DD", help="paper_start 설정(1회)")
     ap.add_argument("--day", metavar="YYYY-MM-DD", help="기록할 날짜(기본 오늘)")
