@@ -17,6 +17,8 @@ POST 하므로 폴링 소비자 충돌이 없다(발송 전용).
 from __future__ import annotations
 
 import sqlite3
+import time as _time
+from datetime import timedelta
 
 import httpx
 from loguru import logger
@@ -24,28 +26,60 @@ from loguru import logger
 from config import settings
 from core.time_utils import now_kst, to_db_iso
 
-DAILY_CAP = 40   # 하루 개별 트레이드 알림 상한 (요약 제외)
+DAILY_CAP = 40         # 하루 개별 트레이드 알림 상한 (요약 제외)
+RETENTION_DAYS = 90    # paper_notified 보관 일수 (무한증가 방지)
+_SEND_ATTEMPTS = 3     # 전송 재시도 (429/5xx/네트워크) — 한 호출 내에서만
+
+_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    # 모듈 수명 클라이언트 재사용 (매 알림마다 새 TLS 핸드셰이크 방지).
+    global _client
+    if _client is None:
+        _client = httpx.Client(timeout=8.0)
+    return _client
 
 
 def _send(text: str) -> bool:
+    """텔레그램 sendMessage — 한 호출 내 짧은 재시도만. 실패 시 False.
+
+    호출측(notify_events)은 '전송 시도 = 마킹'(mark-before-send)이라 여기서
+    False 를 반환해도 다음 사이클에 재발송하지 않는다(재시도 폭풍·중복 방지).
+    일시 장애는 아래 in-call 재시도(429/5xx/네트워크)로 흡수한다.
+    """
     tok = settings.TELEGRAM_BOT_TOKEN
     chat = settings.TELEGRAM_CHAT_ID
     if not tok or ":" not in tok or "your_bot_token" in tok.lower() or not chat:
         logger.warning("[paper][tg] 토큰/채널 미설정 — 알림 스킵")
         return False
-    try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
-            timeout=10.0,
-        )
-        if r.status_code == 200:
-            return True
-        logger.error("[paper][tg] 발송 실패 HTTP {}: {}", r.status_code, r.text[:200])
-        return False
-    except Exception as exc:
-        logger.error("[paper][tg] 발송 예외: {}", exc)
-        return False
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+    payload = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    for attempt in range(_SEND_ATTEMPTS):
+        try:
+            r = _get_client().post(url, json=payload)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429 or r.status_code >= 500:
+                # 레이트리밋/서버오류만 재시도 (retry_after 있으면 상한 5s)
+                wait = 1.0 * (attempt + 1)
+                try:
+                    wait = min(float(r.json().get("parameters", {})
+                                     .get("retry_after", wait)), 5.0)
+                except Exception:
+                    pass
+                if attempt < _SEND_ATTEMPTS - 1:
+                    _time.sleep(wait)
+                    continue
+            logger.error("[paper][tg] 발송 실패 HTTP {}: {}", r.status_code, r.text[:200])
+            return False
+        except Exception as exc:
+            if attempt < _SEND_ATTEMPTS - 1:
+                _time.sleep(0.6 * (attempt + 1))
+                continue
+            logger.error("[paper][tg] 발송 예외: {}", exc)
+            return False
+    return False
 
 
 def _reason_kr(reason: str) -> str:
@@ -110,11 +144,26 @@ def notify_events(con, day, finalized: int, leader_rows: list[dict],
         return 0
     try:
         day_s = day.isoformat()
+        # 오래된 알림 이력 프루닝 (무한증가 방지)
+        con.execute("DELETE FROM paper_notified WHERE day < ?",
+                    ((now_kst().date() - timedelta(days=RETENTION_DAYS)).isoformat(),))
+        con.commit()
+
         sent = 0
         capped = con.execute(
             "SELECT COUNT(*) FROM paper_notified WHERE day=? AND kind IN ('trade','gm3exit')",
             (day_s,),
         ).fetchone()[0]
+
+        def _emit(key: str, kind: str, text: str) -> None:
+            """mark-before-send: 시도 전에 마킹해 재시도 폭풍·중복 전송을 차단한다
+            (at-most-once). 일시 장애는 _send 의 in-call 재시도로 흡수."""
+            nonlocal sent
+            _mark_sent(con, key, day, kind)
+            if _send(text):
+                sent += 1
+            else:
+                logger.warning("[paper][tg] 발송 실패(마킹됨·재발송 안 함): {}", key)
 
         # 1) 주도주(v2_leader) 트레이드 — 진입가 + 익절/손절 + 수익률
         for r in leader_rows:
@@ -124,31 +173,25 @@ def notify_events(con, day, finalized: int, leader_rows: list[dict],
             if capped >= DAILY_CAP:
                 logger.warning("[paper][tg] 일일 상한({}) 도달 — 트레이드 알림 억제", DAILY_CAP)
                 break
-            if _send(_fmt_trade(day, r)):
-                _mark_sent(con, key, day, "trade")
-                sent += 1
-                capped += 1
+            _emit(key, "trade", _fmt_trade(day, r))
+            capped += 1
 
-        # 2) gm_v3 오늘 실현 청산 (EOR 제외)
+        # 2) gm_v3 오늘 실현 청산 (EOR 제외). closed_on 은 date/str 혼용 방어로 [:10] 비교.
         for r in gm3_rows:
-            if r.get("eor") or str(r.get("closed_on")) != day_s:
+            if r.get("eor") or str(r.get("closed_on"))[:10] != day_s:
                 continue
             key = f"gm3exit:{r['code']}:{day_s}"
             if _already_sent(con, key):
                 continue
             if capped >= DAILY_CAP:
                 break
-            if _send(_fmt_gm3_exit(r)):
-                _mark_sent(con, key, day, "gm3exit")
-                sent += 1
-                capped += 1
+            _emit(key, "gm3exit", _fmt_gm3_exit(r))
+            capped += 1
 
         # 3) 당일 요약 (하루 1회, 상한과 무관)
         skey = f"summary:{day_s}"
         if not _already_sent(con, skey):
-            if _send(_fmt_summary(day, finalized, summary)):
-                _mark_sent(con, skey, day, "summary")
-                sent += 1
+            _emit(skey, "summary", _fmt_summary(day, finalized, summary))
 
         if sent:
             logger.info("[paper][tg] {} 알림 {}건 발송", day, sent)

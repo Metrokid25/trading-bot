@@ -84,6 +84,20 @@ def test_daily_cap(con, sent, monkeypatch):
     assert any("페이퍼 마감" in t for t in sent)   # 요약은 상한과 무관
 
 
+def test_send_failure_marks_and_no_retry(con, monkeypatch):
+    """전송 실패해도 마킹 → 다음 사이클에 재발송 안 함 (재시도 폭풍/중복 차단)."""
+    calls: list[str] = []
+    monkeypatch.setattr(paper_notify, "_send",
+                        lambda text: (calls.append(text), False)[1])  # 항상 실패
+    rows = [_trade("005930", "삼성전자")]
+    notify_events(con, DAY, 1, rows, [], SUMMARY)
+    first_calls = len(calls)
+    assert first_calls >= 1                       # 시도는 함
+    # 재실행 — 이미 마킹돼 재시도 안 함
+    notify_events(con, DAY, 1, rows, [], SUMMARY)
+    assert len(calls) == first_calls              # 추가 시도 0 = 폭풍 없음
+
+
 def test_reason_kr_mapping():
     assert _reason_kr("SL") == "🛑손절"
     assert _reason_kr("2TP/BE") == "🎯익절"

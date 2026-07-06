@@ -583,11 +583,9 @@ def record_day(day: date) -> dict:
 
     con.commit()
 
-    # 5) 텔레그램 팩트 알림 (확정분만, best-effort — 예외 전파 안 함)
-    try:
-        notify_events(con, day, finalized, leader_rows, gm3_rows, summary)
-    except Exception as exc:
-        logger.error("[paper] 알림 단계 예외(무시): {}", exc)
+    # 5) 텔레그램 팩트 알림 (확정분만). notify_events 자체가 예외를 삼키므로
+    #    별도 방어 불필요 — 절대 record_day 를 깨지 않는다.
+    notify_events(con, day, finalized, leader_rows, gm3_rows, summary)
 
     con.close()
     logger.info("[paper] {} 기록 완료(finalized={}): {}", day, finalized, summary)
