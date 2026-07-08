@@ -5,7 +5,9 @@ from datetime import date
 import pytest
 
 from strategy import paper_notify
-from strategy.paper_notify import notify_events, _fmt_trade, _fmt_summary, _reason_kr
+from strategy.paper_notify import (
+    notify_events, _fmt_trade, _fmt_summary, _reason_kr, fmt_outperf,
+)
 
 DAY = date(2026, 7, 6)
 
@@ -102,6 +104,39 @@ def test_reason_kr_mapping():
     assert _reason_kr("SL") == "🛑손절"
     assert _reason_kr("2TP/BE") == "🎯익절"
     assert _reason_kr("EOD") == "⏹정리"
+
+
+def test_fmt_outperf_pure_avoidance():
+    # 전략 flat(거래 0) + 벤치 하락 → 초과수익 전량 손실회피
+    s = fmt_outperf(1.0, 0.902)
+    assert "전략 +0.00%" in s and "벤치 -9.80%" in s and "초과 +9.80%p" in s
+    assert "전량 손실회피" in s
+
+
+def test_fmt_outperf_loss_defense():
+    # 전략도 하락(-3%)했지만 벤치(-9.8%)보다 덜 → 손실방어
+    s = fmt_outperf(0.97, 0.902)
+    assert "손실방어" in s and "초과 +6.80%p" in s
+
+
+def test_fmt_outperf_real_gain_no_tag():
+    # 전략 실제 수익(+2%) → 손실회피/방어 태그 없음
+    s = fmt_outperf(1.02, 0.902)
+    assert "전략 +2.00%" in s and "초과 +11.80%p" in s
+    assert "손실회피" not in s and "손실방어" not in s
+
+
+def test_summary_shows_absolute_and_avoidance(sent):
+    con_ = sqlite3.connect(":memory:")
+    con_.execute("CREATE TABLE paper_notified (key TEXT PRIMARY KEY, day TEXT,"
+                 " kind TEXT, sent_at TEXT)")
+    summ = {"v2_leader": {"trades": 0, "day_ret": -0.0559, "equity": 1.0,
+                          "alpha_vs_bench": 0.098},
+            "gm_v3": {"closed_today": 0, "open_positions": 0},
+            "bench_bh": {"day_ret": -0.0559, "equity": 0.902}}
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "전략 +0.00%" in msg and "벤치 -9.80%" in msg and "손실회피" in msg
 
 
 def test_fmt_trade_has_prices():

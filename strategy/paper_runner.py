@@ -64,7 +64,7 @@ from config import settings  # noqa: E402
 from core.market_calendar import is_trading_day  # noqa: E402
 from core.market_schedule import next_action  # noqa: E402
 from core.time_utils import now_kst, to_db_iso  # noqa: E402
-from strategy.paper_notify import notify_events  # noqa: E402
+from strategy.paper_notify import fmt_outperf, notify_events  # noqa: E402
 from strategy.gm_v3.config import GmV3Config  # noqa: E402
 from strategy.gm_v3.data_source import (  # noqa: E402
     kis_backfill_daily, load_daily_from_toss,
@@ -649,17 +649,17 @@ def report() -> None:
             "SELECT day, strategy, n_trades, day_ret, equity FROM paper_daily "
             "ORDER BY day, strategy"):
         print(f"{row[0]:<12}{row[1]:<11}{row[2]:>3}{row[3]*100:>8.2f}%{row[4]:>9.4f}")
-    # 최신일 기준 알파
+    # 최신일 기준 누적 초과수익 (절대수익 병기 + 손실회피 태그)
     last = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
     if last:
         rows = dict(con.execute(
             "SELECT strategy, equity FROM paper_daily WHERE day=?", (last,)).fetchall())
         bench = rows.get("bench_bh")
         if bench:
-            print(f"\n[{last}] 벤치마크 대비 초과수익:")
+            print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
             for s in ("v2", "v2_leader", "gm_v3"):
                 if s in rows:
-                    print(f"  {s:<11} {(rows[s]-bench)*100:+.2f}%p (eq {rows[s]:.4f} vs bench {bench:.4f})")
+                    print(f"  {s:<11} {fmt_outperf(rows[s], bench)}")
     con.close()
 
 

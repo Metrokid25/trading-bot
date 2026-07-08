@@ -107,19 +107,39 @@ def _fmt_gm3_exit(r: dict) -> str:
     )
 
 
+def fmt_outperf(strat_eq: float, bench_eq: float) -> str:
+    """누적 초과수익 표기 — 절대수익 병기 + 출처 태그.
+
+    '초과수익(알파)'은 벤치가 빠진 만큼(손실회피)과 실제 매매수익이 섞인다.
+    전략 절대수익을 나란히 보여 출처를 드러내고, 매매수익이 없거나 마이너스면
+    '손실회피/손실방어'로 명시한다 (절대손익 단독 오독 방지, 헌장 절대규칙②).
+    """
+    strat_abs = strat_eq - 1.0
+    bench_abs = bench_eq - 1.0
+    alpha = strat_eq - bench_eq
+    if abs(strat_abs) < 0.0005 and alpha > 0.0005:
+        tag = " → 전량 손실회피(매매수익 0)"
+    elif strat_abs < -0.0005 and alpha > 0.0005:
+        tag = " → 손실방어(전략도 하락, 벤치보다 덜)"
+    else:
+        tag = ""
+    return (f"전략 {strat_abs:+.2%} · 벤치 {bench_abs:+.2%} · "
+            f"초과 {alpha:+.2%}p{tag}")
+
+
 def _fmt_summary(day, finalized: int, summary: dict) -> str:
     lead = summary.get("v2_leader", {})
     gm3 = summary.get("gm_v3", {})
     bench = summary.get("bench_bh", {})
-    alpha = lead.get("alpha_vs_bench", 0.0)
     tag = "(확정)" if finalized else "(잠정)"
+    outperf = fmt_outperf(lead.get("equity", 1.0), bench.get("equity", 1.0))
     return (
         f"📊 페이퍼 마감 {day} {tag}\n"
-        f"주도주 v2_leader: {lead.get('trades', 0)}종목 진입, "
-        f"당일 {lead.get('day_ret', 0.0):+.2%}\n"
-        f"gm_v3: 청산 {gm3.get('closed_today', 0)}종목 "
-        f"(보유 {gm3.get('open_positions', 0)})\n"
-        f"벤치 {bench.get('day_ret', 0.0):+.2%} · 알파 {alpha:+.2%}p"
+        f"주도주 v2_leader: 오늘 {lead.get('trades', 0)}종목 진입 "
+        f"(당일 {lead.get('day_ret', 0.0):+.2%})\n"
+        f"누적 {outperf}\n"
+        f"gm_v3: 오늘 청산 {gm3.get('closed_today', 0)}종목 "
+        f"(보유 {gm3.get('open_positions', 0)})"
     )
 
 
