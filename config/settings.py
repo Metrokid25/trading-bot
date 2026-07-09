@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     DAILY_LOSS_LIMIT_PCT: float = -10.0
     STOP_LOSS_PCT: float = -5.0
 
+    # --- 웹 대시보드 (webapp/server.py) ---
+    # 등록·삭제 API 공유 비밀번호. 비어 있으면 등록·삭제 요청 전부 거부(안전 기본값).
+    WEB_SHARED_KEY: str = ""
+
     # --- Infra ---
     LOG_LEVEL: str = "INFO"
     LOG_DIR: Path = PROJECT_ROOT / "logs"

@@ -5,8 +5,19 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
+from config.settings import settings
 from data.sector_store import SectorStore
 from webapp.server import app, get_http, get_kis, get_master, get_store
+
+# 등록·삭제 라우트 공유 비밀번호 (테스트용)
+WEB_KEY = "test-shared-key"
+KEY_HDR = {"X-Web-Key": WEB_KEY}
+
+
+@pytest.fixture(autouse=True)
+def _web_key(monkeypatch):
+    """모든 테스트에서 공유 비밀번호를 설정 상태로 둔다 (미설정=전부 거부라서)."""
+    monkeypatch.setattr(settings, "WEB_SHARED_KEY", WEB_KEY)
 
 
 def _markets_handler(request: httpx.Request) -> httpx.Response:
@@ -103,7 +114,11 @@ async def client(tmp_path):
     app.dependency_overrides[get_http] = lambda: mock_http
 
     transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    # 기본 헤더에 공유 키 포함 — 인증 실패 케이스는 요청 단위 headers로 덮어쓴다
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=KEY_HDR
+    ) as c:
+        c.store = store  # author 스탬프 검증용 직접 조회 핸들
         yield c
 
     app.dependency_overrides.clear()
@@ -305,3 +320,134 @@ async def test_register_empty_stocks_rejected_by_validation(client):
     )
     # pydantic min_length=1 → 422
     assert res.status_code == 422
+
+
+# ----- 공유 비밀번호 (등록·삭제 라우트 보호) -----
+
+_REG = {"sector_name": "반도체", "stocks": [{"code": "005930"}]}
+
+
+@pytest.mark.asyncio
+async def test_register_without_key_returns_401(client):
+    res = await client.post("/api/picks", json=_REG, headers={"X-Web-Key": ""})
+    assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_register_with_wrong_key_returns_401(client):
+    res = await client.post("/api/picks", json=_REG, headers={"X-Web-Key": "wrong-key"})
+    assert res.status_code == 401
+    assert "올바르지 않습니다" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_mutations_rejected_when_key_unset(client, monkeypatch):
+    """서버에 WEB_SHARED_KEY 미설정이면 올바른 키를 보내도 전부 거부(안전 기본값)."""
+    monkeypatch.setattr(settings, "WEB_SHARED_KEY", "")
+    res = await client.post("/api/picks", json=_REG)
+    assert res.status_code == 401
+    assert "설정되지 않았습니다" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_remove_routes_require_key(client):
+    r1 = await client.post(
+        "/api/picks/remove-stock",
+        json={"sector_name": "반도체", "stock_code": "005930"},
+        headers={"X-Web-Key": ""},
+    )
+    r2 = await client.post(
+        "/api/picks/remove-sector",
+        json={"sector_name": "반도체"},
+        headers={"X-Web-Key": ""},
+    )
+    assert r1.status_code == 401
+    assert r2.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_read_routes_open_without_key(client):
+    """조회(GET)는 키 없이 허용 — 보호 대상은 등록·삭제뿐."""
+    assert (await client.get("/api/picks", headers={"X-Web-Key": ""})).status_code == 200
+    res = await client.get("/api/search", params={"q": "삼성"}, headers={"X-Web-Key": ""})
+    assert res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_register_with_header_fully_absent_returns_401(client):
+    """헤더 자체가 없는 요청(빈 문자열 아님)도 401 — 실제 브라우저 외 클라이언트 케이스."""
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as bare:
+        res = await bare.post("/api/picks", json=_REG)
+    assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_server_key_rejected_with_clear_message(client, monkeypatch):
+    """한글 키는 HTTP 헤더로 전송 불가 → 서버가 명확한 메시지로 거부해야 한다."""
+    monkeypatch.setattr(settings, "WEB_SHARED_KEY", "한글비밀번호")
+    res = await client.post("/api/picks", json=_REG)
+    assert res.status_code == 401
+    assert "영문" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_server_key_surrounding_whitespace_tolerated(client, monkeypatch):
+    """.env에 공백 낀 키가 저장돼도(따옴표 값 등) 서버가 strip 후 비교한다."""
+    monkeypatch.setattr(settings, "WEB_SHARED_KEY", f"  {WEB_KEY}  ")
+    res = await client.post("/api/picks", json=_REG)
+    assert res.status_code == 200
+
+
+# ----- 등록자(author) 스탬프 -----
+
+@pytest.mark.asyncio
+async def test_register_stamps_default_author(client):
+    res = await client.post("/api/picks", json=_REG)
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    assert picks[0].raw_input == "[web:황파파]"
+
+
+@pytest.mark.asyncio
+async def test_register_stamps_custom_author(client):
+    res = await client.post("/api/picks", json={**_REG, "author": "테스터"})
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    assert picks[0].raw_input == "[web:테스터]"
+
+
+@pytest.mark.asyncio
+async def test_register_author_sanitized(client):
+    """대괄호·공백은 스탬프 형식([web:이름]) 보호를 위해 정리, 빈 이름은 기본값."""
+    res = await client.post("/api/picks", json={**_REG, "author": " [테스터] "})
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    assert picks[0].raw_input == "[web:테스터]"
+
+    res = await client.post(
+        "/api/picks",
+        json={"sector_name": "2차전지", "stocks": [{"code": "042700"}], "author": "  "},
+    )
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    by_input = {p.raw_input for p in picks}
+    assert "[web:황파파]" in by_input
+
+
+@pytest.mark.asyncio
+async def test_register_author_control_chars_stripped(client):
+    """개행 등 비인쇄 문자는 제거 — raw_input 한 줄 스탬프 형식 보호."""
+    res = await client.post("/api/picks", json={**_REG, "author": "테\n스터"})
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    assert picks[0].raw_input == "[web:테스터]"
+
+
+@pytest.mark.asyncio
+async def test_list_picks_exposes_registered_by(client):
+    """등록자 표시 — GET /api/picks가 registered_by를 내려준다."""
+    await client.post("/api/picks", json={**_REG, "author": "테스터"})
+    res = await client.get("/api/picks")
+    assert res.status_code == 200
+    assert res.json()[0]["registered_by"] == "테스터"
