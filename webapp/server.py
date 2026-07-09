@@ -9,16 +9,19 @@ KIS 시세/매매·텔레그램 발송은 건드리지 않고, 종목 검색(Sto
 """
 from __future__ import annotations
 
+import hmac
+import re
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from config.settings import settings
 from core.kis_api import KISClient
 from core.time_utils import now_kst
 from data.sector_models import SectorPick, SectorStock
@@ -26,6 +29,32 @@ from data.sector_store import SectorStore
 from data.stock_master import StockMaster
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# 등록자 표시 기본값 — UI에서 이름을 지우고 등록해도 이 값으로 스탬프된다.
+DEFAULT_AUTHOR = "황파파"
+
+# raw_input 스탬프 "[web:이름]"에서 등록자 추출용
+_WEB_AUTHOR_RE = re.compile(r"^\[web:(.+)\]$")
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _web_key_error(x_web_key: str) -> str | None:
+    """공유 비밀번호 검사. 통과면 None, 실패면 사용자에게 보여줄 메시지.
+
+    - WEB_SHARED_KEY 미설정이면 전부 거부 — ALLOWED_TELEGRAM_USERS(빈 리스트=전부 거부)와
+      같은 안전 기본값 원칙.
+    - HTTP 헤더는 latin-1 제약이 있어 한글 키는 브라우저에서 전송 자체가 불가능하다.
+      비ASCII 키가 설정돼 있으면 명확한 메시지로 거부해 조용한 벽돌 상태를 막는다.
+    """
+    key = settings.WEB_SHARED_KEY.strip()
+    if not key:
+        return "서버에 공유 비밀번호(WEB_SHARED_KEY)가 설정되지 않았습니다 (.env 확인)"
+    if not key.isascii():
+        return "WEB_SHARED_KEY는 영문·숫자만 지원합니다 (미니PC .env 수정 필요)"
+    if not hmac.compare_digest(x_web_key.encode(), key.encode()):
+        return "공유 비밀번호가 올바르지 않습니다"
+    return None
 
 
 def _to_int(v: object) -> int | None:
@@ -57,6 +86,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="trading-bot 종목 등록", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def guard_mutations(request: Request, call_next):
+    """/api 하위 변경 요청(POST 등)은 전부 공유 비밀번호 필요.
+
+    라우트별 opt-in(dependencies=)이 아니라 미들웨어 기본 보호 — 앞으로 변경 라우트가
+    추가돼도 자동으로 보호 대상에 들어간다. 조회(GET)는 키 없이 허용.
+    """
+    if request.url.path.startswith("/api") and request.method not in _SAFE_METHODS:
+        err = _web_key_error(request.headers.get("X-Web-Key", ""))
+        if err:
+            return JSONResponse(status_code=401, content={"detail": err})
+    return await call_next(request)
+
+
 # ----- 의존성 (테스트에서 override 가능) -----
 def get_store(request: Request) -> SectorStore:
     return request.app.state.store
@@ -84,6 +127,7 @@ class RegisterIn(BaseModel):
     sector_name: str = Field(min_length=1)
     pick_date: str | None = None
     stocks: list[StockIn] = Field(min_length=1)
+    author: str = Field(default="", max_length=20)  # 빈 값이면 핸들러가 DEFAULT_AUTHOR로
 
 
 class RemoveStockIn(BaseModel):
@@ -114,11 +158,13 @@ async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
     out: list[dict] = []
     for pick in picks:
         stocks = await store.get_stocks_by_pick(pick.id) if pick.id else []
+        m = _WEB_AUTHOR_RE.match(pick.raw_input or "")
         out.append(
             {
                 "pick_id": pick.id,
                 "pick_date": pick.pick_date,
                 "expires_at": pick.expires_at.isoformat(),
+                "registered_by": m.group(1) if m else None,
                 "stocks": [
                     {
                         "code": s.stock_code,
@@ -307,6 +353,10 @@ async def register(
 ) -> dict:
     """섹터 + 종목 등록. 텔레그램 /p 와 동일 경로(resolve → upsert_sector)."""
     pick_date = body.pick_date or now_kst().strftime("%Y-%m-%d")
+    # raw_input 스탬프용 등록자 정리 — "[web:이름]" 한 줄 형식 보호를 위해
+    # 대괄호와 개행 등 비인쇄 문자를 제거
+    author = "".join(ch for ch in body.author if ch.isprintable())
+    author = author.replace("[", "").replace("]", "").strip() or DEFAULT_AUTHOR
 
     sector_stocks: list[SectorStock] = []
     seen: set[str] = set()
@@ -333,7 +383,7 @@ async def register(
     if not sector_stocks:
         raise HTTPException(status_code=400, detail="등록할 종목이 없습니다")
 
-    pick_template = SectorPick.create(pick_date, raw_input="[web]", expires_days=7)
+    pick_template = SectorPick.create(pick_date, raw_input=f"[web:{author}]", expires_days=7)
     result = await store.upsert_sector(
         body.sector_name, sector_stocks, pick_template, record_pick_event=True
     )

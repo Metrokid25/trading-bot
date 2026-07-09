@@ -11,3 +11,4 @@
 - [Trading-bot operating charter](trading-bot-operating-charter.md) — 오너 지정 상주 운영헌장: forward가 최우선 자원, 벤치마크 대비만 판단, 우선순위(유니버스단일화→모의투자→수급축적→gm_v3 실데이터)
 - [MiniPC paper deploy](minipc-paper-deploy.md) — 미니PC 모의투자 상주 완료(2026-07-06): 자동시작=Startup VBS(작업스케줄러 아님, 관리자 회피), paper_start 2026-07-06, IP 등록됨
 - [Mentor archive buy timing](mentor-archive-buy-timing.md) — 스승님 매수타점 원칙(진바닥→무릎, 허리 필터, 거래량 마름/실림) + article_id, v3 구현
+- [Web colleague access](web-colleague-access.md) — 웹앱 공유키(WEB_SHARED_KEY, 영문만)+등록자 스탬프 구현, 기존섹터 추가 시 author 미기록은 오너 결정 대기

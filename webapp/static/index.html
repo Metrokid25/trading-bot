@@ -60,12 +60,12 @@
   .panel .sub { color: var(--faint); font-size: 12px; margin-bottom: 16px; }
 
   label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 7px; font-weight: 600; }
-  input[type=text] {
+  input[type=text], input[type=password] {
     width: 100%; padding: 12px 13px; background: var(--panel-2);
     border: 1px solid var(--border); border-radius: 11px; color: var(--text); font-size: 14px;
   }
-  input[type=text]::placeholder { color: var(--faint); }
-  input[type=text]:focus { outline: none; border-color: var(--blue); background: #1b1f29; }
+  input[type=text]::placeholder, input[type=password]::placeholder { color: var(--faint); }
+  input[type=text]:focus, input[type=password]:focus { outline: none; border-color: var(--blue); background: #1b1f29; }
 
   .search-box { position: relative; }
   .dropdown {
@@ -218,6 +218,12 @@
 
       <div class="chips" id="chips"></div>
 
+      <label>등록자</label>
+      <input type="text" id="author" placeholder="이름" maxlength="20" />
+
+      <label>공유 비밀번호</label>
+      <input type="password" id="webkey" placeholder="공유 비밀번호 (영문·숫자)" autocomplete="current-password" />
+
       <button class="primary" id="submit" disabled>등록</button>
       <div class="msg" id="msg"></div>
     </section>
@@ -245,6 +251,30 @@
 const $ = (id) => document.getElementById(id);
 let selected = [];
 let searchTimer = null;
+
+// 등록자·공유 비밀번호는 기기별로 기억 (localStorage 차단 브라우저에서도 죽지 않게 보호)
+function lsGet(k){ try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k,v){ try { localStorage.setItem(k,v); } catch {} }
+$("author").value = lsGet("web_author") || "황파파";
+$("webkey").value = lsGet("web_key") || "";
+function authHeaders(){
+  lsSet("web_author", $("author").value.trim());
+  lsSet("web_key", $("webkey").value.trim());
+  return {"Content-Type":"application/json", "X-Web-Key": $("webkey").value.trim()};
+}
+// 브라우저는 한글 등 비ASCII 헤더값을 전송하지 못한다 — fetch가 알 수 없는 오류를
+// 던지기 전에 여기서 사람이 읽을 메시지로 막는다.
+function keyProblem(){
+  const k = $("webkey").value.trim();
+  if (!k) return "공유 비밀번호를 입력하세요";
+  if (!/^[\x21-\x7e]+$/.test(k)) return "공유 비밀번호는 영문·숫자만 입력할 수 있습니다";
+  return null;
+}
+// FastAPI 422 응답의 detail은 객체 배열 — 그대로 표시하면 [object Object]가 된다
+function errDetail(d, fallback){
+  if (Array.isArray(d)) return d.map(e => e.msg || JSON.stringify(e)).join(", ");
+  return d || fallback;
+}
 const SECTOR_COLORS = ["#3182f6","#2ac1a0","#f0616d","#f5a623","#9b6cf0","#19b6c9","#e8639b"];
 
 function renderChips() {
@@ -301,15 +331,20 @@ function closeDropdown(){ $("dropdown").style.display = "none"; }
 $("submit").addEventListener("click", async () => {
   const sector = $("sector").value.trim();
   if (!sector || !selected.length) return;
+  const kp = keyProblem();
+  if (kp){ $("msg").className = "msg err"; $("msg").textContent = "❌ " + kp; return; }
   $("submit").disabled = true;
   $("msg").className = "msg"; $("msg").textContent = "등록 중…";
   try {
     const res = await fetch("/api/picks", {
-      method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ sector_name: sector, stocks: selected }),
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        sector_name: sector, stocks: selected,
+        author: $("author").value.trim(),
+      }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "등록 실패");
+    if (!res.ok) throw new Error(errDetail(data.detail, "등록 실패"));
     $("msg").className = "msg ok";
     $("msg").textContent = `✅ [${sector}] ${data.added}종목 등록 (총 ${data.total}` +
       (data.skipped.length ? `, 중복 ${data.skipped.length}` : "") + ")";
@@ -324,24 +359,28 @@ $("refresh").addEventListener("click", () => { loadIndexBar(); loadPicks(); });
 
 async function removeStock(sector, code){
   if (!confirm(`${code} 을(를) [${sector}]에서 제거할까요?`)) return;
+  const kp = keyProblem();
+  if (kp){ alert("❌ " + kp); return; }
   try {
     const res = await fetch("/api/picks/remove-stock", {
-      method: "POST", headers: {"Content-Type":"application/json"},
+      method: "POST", headers: authHeaders(),
       body: JSON.stringify({ sector_name: sector, stock_code: code }),
     });
-    if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "제거 실패"); }
+    if (!res.ok) { const d = await res.json(); throw new Error(errDetail(d.detail, "제거 실패")); }
     loadPicks();
   } catch (e) { alert("❌ " + e.message); }
 }
 
 async function removeSector(sector){
   if (!confirm(`[${sector}] 섹터 전체를 제거할까요? (소속 종목 모두 삭제)`)) return;
+  const kp = keyProblem();
+  if (kp){ alert("❌ " + kp); return; }
   try {
     const res = await fetch("/api/picks/remove-sector", {
-      method: "POST", headers: {"Content-Type":"application/json"},
+      method: "POST", headers: authHeaders(),
       body: JSON.stringify({ sector_name: sector }),
     });
-    if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "제거 실패"); }
+    if (!res.ok) { const d = await res.json(); throw new Error(errDetail(d.detail, "제거 실패")); }
     loadPicks();
   } catch (e) { alert("❌ " + e.message); }
 }
@@ -352,9 +391,11 @@ async function loadPicks(){
     const picks = await res.json();
     // sector → [{name,code,pick_id,expires}]
     const bySector = {};
+    const sectorBy = {};
     let total = 0;
     for (const p of picks) for (const s of p.stocks) {
       (bySector[s.sector] = bySector[s.sector] || []).push({...s, pick_id: p.pick_id, expires: p.expires_at.slice(0,10)});
+      if (p.registered_by && !sectorBy[s.sector]) sectorBy[s.sector] = p.registered_by;
       total++;
     }
     const sectors = Object.keys(bySector);
@@ -388,6 +429,7 @@ async function loadPicks(){
             <span class="dot" style="width:9px;height:9px;border-radius:50%;background:${SECTOR_COLORS[si%SECTOR_COLORS.length]}"></span>
             <span class="name">${esc(sec)}</span>
             <span class="cnt">${items.length}종목</span>
+            ${sectorBy[sec] ? `<span class="cnt">등록: ${esc(sectorBy[sec])}</span>` : ""}
             <button class="sector-del" onclick="removeSector('${esc(sec)}')">섹터 삭제</button>
           </div>
           <table>
