@@ -495,6 +495,17 @@ def record_day(day: date) -> dict:
     # 0) 메타 + 당일 유니버스 감사 기록 — 즉시 커밋 (리뷰 F5: 수 분짜리 네트워크
     #    구간 동안 paper.db 쓰기 락을 잡고 있지 않도록 트랜잭션을 짧게 끊는다)
     _stamp_meta(con)
+    # 장중 유니버스 변경 관찰성: 직전 사이클 기록과 diff — 웹앱 장중 등록이
+    # 다음 사이클에 편입되는지(그리고 만료로 이탈하는지) 로그로 즉시 확인 가능
+    prev_codes = {r[0] for r in con.execute(
+        "SELECT code FROM paper_universe_log WHERE day=?", (day.isoformat(),))}
+    cur_codes = {c for c, _n, _s in universe}
+    if prev_codes and prev_codes != cur_codes:
+        joined = sorted(cur_codes - prev_codes)
+        left = sorted(prev_codes - cur_codes)
+        logger.info("[paper][universe] {} 장중 변경 — 편입 {}건{} / 이탈 {}건{}",
+                    day, len(joined), f" {joined}" if joined else "",
+                    len(left), f" {left}" if left else "")
     con.execute("DELETE FROM paper_universe_log WHERE day=?", (day.isoformat(),))
     con.executemany(
         "INSERT INTO paper_universe_log VALUES (?,?,?,?,?)",

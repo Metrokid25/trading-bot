@@ -535,6 +535,41 @@ async def test_server_key_surrounding_whitespace_tolerated(client, monkeypatch):
     assert res.status_code == 200
 
 
+# ----- 웹 등록 픽 유효기간 (유니버스 상시 유지) -----
+
+@pytest.mark.asyncio
+async def test_register_uses_long_expiry(client):
+    """웹 등록 픽은 1년 유효 — 7일 만료로 유니버스가 증발하지 않게."""
+    from core.time_utils import now_kst
+
+    res = await client.post("/api/picks", json=_REG)
+    assert res.status_code == 200
+    picks = await client.store.get_active_picks()
+    # DB 왕복 후 naive datetime — 날짜 기준으로 비교 (tz 무관)
+    assert (picks[0].expires_at.date() - now_kst().date()).days >= 360
+
+
+@pytest.mark.asyncio
+async def test_register_to_existing_sector_extends_expiry(client):
+    """기존 활성 섹터에 종목 추가 시 낡은 만료시각도 1년 이상으로 갱신."""
+    from datetime import timedelta
+
+    from core.time_utils import now_kst, to_db_iso
+
+    res = await client.post("/api/picks", json=_REG)
+    pick_id = res.json()["pick_id"]
+    # 만료 임박 상태를 인위로 만든 뒤 같은 섹터에 종목 추가
+    soon = to_db_iso(now_kst() + timedelta(days=1))
+    await client.store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?", (soon, pick_id))
+    res = await client.post(
+        "/api/picks", json={"sector_name": "반도체", "stocks": [{"code": "000660"}]})
+    assert res.status_code == 200
+    assert res.json()["pick_id"] == pick_id  # 같은 활성 픽에 추가됐는지
+    picks = await client.store.get_active_picks()
+    assert (picks[0].expires_at.date() - now_kst().date()).days >= 360
+
+
 # ----- 등록자(author) 스탬프 -----
 
 @pytest.mark.asyncio

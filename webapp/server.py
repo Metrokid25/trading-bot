@@ -36,6 +36,11 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 # 등록자 표시 기본값 — UI에서 이름을 지우고 등록해도 이 값으로 스탬프된다.
 DEFAULT_AUTHOR = "황파파"
 
+# 웹 등록 픽 유효기간(일). 텔레그램 /p 의 7일과 달리 웹 등록 유니버스는
+# "섹터 삭제 전까지 상시 유지"가 운영 규칙 — 2026-07-10 유니버스가 7일 만료로
+# 장중 증발(72→8종목)한 사고 재발 방지. 사실상 무기한(1년, 등록·추가 시마다 갱신).
+WEB_PICK_EXPIRES_DAYS = 365
+
 # raw_input 스탬프 "[web:이름]"에서 등록자 추출용
 _WEB_AUTHOR_RE = re.compile(r"^\[web:(.+)\]$")
 
@@ -551,10 +556,15 @@ async def register(
     if not sector_stocks:
         raise HTTPException(status_code=400, detail="등록할 종목이 없습니다")
 
-    pick_template = SectorPick.create(pick_date, raw_input=f"[web:{author}]", expires_days=7)
+    pick_template = SectorPick.create(
+        pick_date, raw_input=f"[web:{author}]", expires_days=WEB_PICK_EXPIRES_DAYS
+    )
     result = await store.upsert_sector(
         body.sector_name, sector_stocks, pick_template, record_pick_event=True
     )
+    # 기존 활성 섹터에 추가한 경우 낡은 만료시각이 남지 않게 항상 1년 이상 보장
+    if result.pick_id:
+        await store.ensure_pick_expiry(result.pick_id, WEB_PICK_EXPIRES_DAYS)
     return {
         "pick_id": result.pick_id,
         "is_new_pick": result.is_new_pick,

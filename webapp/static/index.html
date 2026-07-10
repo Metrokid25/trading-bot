@@ -195,16 +195,16 @@
   .idx-quote .idx-chg { display: block; font-size: 12px; font-variant-numeric: tabular-nums; }
   .idx-canvas { width: 100%; height: 220px; display: block; }
 
-  /* 우측: 시장 대시보드 */
+  /* 우측: 시장 대시보드 — 좁은 컬럼에서 이름/숫자 겹침 방지: 카드 세로 1열 + nowrap */
   .side h2.side-h { font-size: 15px; margin: 0 0 12px; }
   .side h2.side-h .unit { color: var(--faint); font-size: 11px; font-weight: 500; margin-left: 6px; }
-  .mkt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .mkt-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
-  .mkt-card .mkt-title { color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 8px; }
-  .mkt-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3.5px 0; font-size: 13px; }
-  .mkt-row .mn { color: var(--text); }
-  .mkt-row .mv { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; }
-  .mkt-row .mv small { font-weight: 600; font-size: 11px; margin-left: 4px; }
+  .mkt-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  .mkt-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 11px 14px; min-width: 0; }
+  .mkt-card .mkt-title { color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+  .mkt-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 3.5px 0; font-size: 13px; }
+  .mkt-row .mn { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mkt-row .mv { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; white-space: nowrap; flex: 0 0 auto; }
+  .mkt-row .mv small { font-weight: 600; font-size: 11px; margin-left: 5px; }
 
   /* 우측: 수급 */
   .flow-block { padding: 10px 0; }

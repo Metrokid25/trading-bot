@@ -575,6 +575,21 @@ class SectorStore:
         )
         return cur.rowcount or 0
 
+    async def ensure_pick_expiry(self, pick_id: int, min_days: int) -> None:
+        """expires_at이 now+min_days 미만이면 그 시점까지 연장 (이미 더 길면 무변경).
+
+        웹앱 등록 유니버스는 '삭제 전까지 상시 유지'가 운영 규칙(2026-07-10 오너)
+        — 기존 활성 섹터에 종목을 추가할 때 낡은 만료시각이 그대로 남아
+        유니버스가 장중 증발하는 사고를 막는다.
+        """
+        if not self._db:
+            return
+        target = to_db_iso(now_kst() + timedelta(days=min_days))
+        await self._db.execute(
+            "UPDATE sector_picks SET expires_at = ? WHERE id = ? AND expires_at < ?",
+            (target, pick_id, target),
+        )
+
     async def extend_pick(self, pick_id: int, days: int) -> None:
         if not self._db:
             return
