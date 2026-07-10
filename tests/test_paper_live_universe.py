@@ -170,3 +170,47 @@ def test_bench_dedups_same_code_across_sectors(bench_con, fake_daily_cache):
 def test_bench_all_missing_returns_zero(bench_con, fake_daily_cache):
     day_ret, n, excluded = bench_day(bench_con, D, [("C", "씨", "섹터1")])
     assert (day_ret, n, excluded) == (0.0, 0, 1)
+
+
+# ---------------- gm_v3 변형 축 (GM3_VARIANTS, 2026-07-11) ----------------
+
+def test_gm3_replay_cfg_variant_changes_result(monkeypatch):
+    """run_gm3_replay 가 cfg 주입을 존중하는지 — R13 켠 변형은 지지레벨 매수로
+    베이스에 없는 트레이드를 만든다 (변형 축 배선 회귀 방지)."""
+    from dataclasses import replace as dc_replace
+
+    from strategy.gm_v3.config import GmV3Config
+    from strategy.gm_v3.synth import make_bars
+
+    rows = ([(10000, 10100, 9900, 10000, 200)] * 5           # 워밍업 (20봉 하한 충족)
+            + [(10000, 10100, 9900, 10000, 200),
+               (10100, 10850, 10050, 10800, 200),
+               (10800, 11650, 10750, 11600, 200),
+               (11600, 12550, 11550, 12500, 200),
+               (12500, 13550, 12450, 13500, 200),
+               (13500, 14550, 13450, 14500, 200),
+               (14500, 15650, 14450, 15600, 200),
+               (15600, 16850, 15550, 16800, 200),
+               (16800, 18050, 16750, 18000, 200),
+               (18000, 19350, 17950, 19300, 200),
+               (19300, 20000, 19250, 19900, 200)]            # 상승 파동 (고점 20000)
+            + [(19900, 19950, 18900, 19000, 100),
+               (19000, 19050, 18300, 18400, 100),
+               (18400, 18450, 17800, 17900, 100),
+               (17900, 17950, 17500, 17600, 100),
+               (16900, 17500, 16850, 17400, 100)]            # 눌림 → 되돌림30% 지지 양봉
+            + [(17400, 17500, 17300, 17450, 100),
+               (17450, 17500, 17350, 17400, 100)])           # 체결·EOR 마감용
+    bars = make_bars(rows)
+    monkeypatch.setattr(paper_runner, "_daily_cache", {"X": bars})
+    uni = [("X", "테스트", "섹터1")]
+
+    base = paper_runner.run_gm3_replay(bars[0].day, bars[-1].day, uni)
+    r13 = paper_runner.run_gm3_replay(
+        bars[0].day, bars[-1].day, uni,
+        cfg=dc_replace(GmV3Config(), r13_enabled=True).validated())
+    assert len(base) == 0          # 베이스는 이 시나리오에서 무거래
+    assert len(r13) == 1           # R13 지지레벨 매수 → EOR 스냅샷 1건
+    assert "GM3_VARIANTS" in dir(paper_runner)
+    assert [s for s, _f in paper_runner.GM3_VARIANTS] == [
+        "gm_v3", "gm_v3_r13", "gm_v3_r14", "gm_v3_r13r14"]

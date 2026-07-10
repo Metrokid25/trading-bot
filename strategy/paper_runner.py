@@ -5,6 +5,7 @@
     v2          — 프리장 급등→눌림 지지·다지기→아침고점 재돌파 (당일 스캘핑)
     v2_leader   — v2 + 주도섹터 필터(신호일 d-1 기준 최근 5거래일 수익률 1위 섹터만)
     gm_v3       — 멘토 룰엔진 R1~R12 (일봉 스윙, 다음날 시가 체결)
+    gm_v3_r13 / gm_v3_r14 / gm_v3_r13r14 — Tier1 변형 축 (GM3_VARIANTS, 07-11)
     bench_bh    — 당일 등록 유니버스 동일가중 (시가→종가, 무비용 기준선)
 
 명시적 체결/비용 가정 (paper_meta 에 스탬프):
@@ -48,6 +49,7 @@ import json
 import sqlite3
 import sys
 import time as time_mod
+from dataclasses import replace as dc_replace
 from datetime import date, datetime, time as dtime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -77,6 +79,16 @@ PAPER_DB = PROJECT_ROOT / "db" / "paper.db"
 
 COST_PER_SIDE = 0.0025          # 0.25%/편도 (왕복 0.5%)
 GM3_WARMUP_DAYS = 90            # 지표 워밍업용 과거 일봉(달력 아님, 거래일 여유)
+
+# gm_v3 변형 축 (2026-07-11 오너 지시) — Tier1 백테스트 채택 후보를 forward 에서
+# 병행 관찰. 이름 = paper_trades/paper_daily 의 strategy 값. 기존 gm_v3 축은 불변.
+# 백테스트 근거(1~7월 71종목): +R13 거래 2배·기대값 유지 / +R14 중립 / 조합은 R13 단독보다 열위.
+GM3_VARIANTS: tuple[tuple[str, dict], ...] = (
+    ("gm_v3", {}),
+    ("gm_v3_r13", {"r13_enabled": True}),
+    ("gm_v3_r14", {"r14_enabled": True}),
+    ("gm_v3_r13r14", {"r13_enabled": True, "r14_enabled": True}),
+)
 
 V2_PARAMS = dict(pre_surge=0.05, pullback_min=0.03, support_tol=0.005,
                  tp_levels=(0.05, 0.10, 0.15, 0.20, 0.25), stop_pct=0.04,
@@ -330,7 +342,8 @@ def run_v2_for_day(day: date, universe) -> list[dict]:
 
 
 def run_gm3_replay(paper_start: date, today: date, universe,
-                   removed: list[tuple[str, str, date]] = ()) -> list[dict]:
+                   removed: list[tuple[str, str, date]] = (),
+                   cfg: GmV3Config | None = None) -> list[dict]:
     """gm_v3 전체 리플레이(결정적) — act 윈도우 [paper_start, act_to].
 
     상태를 DB에 영속하지 않고 매일 데이터에서 재구성 → 멱등.
@@ -338,8 +351,9 @@ def run_gm3_replay(paper_start: date, today: date, universe,
     제외일까지 act 하고 그 시점 EOR 로 동결한다: 웹앱에서 종목을 지워도 과거
     손실 트레이드가 리플레이에서 소멸하지 않는다 (생존편향 차단, 리뷰 F4).
     코드 단위 dedup — 두 섹터에 걸친 종목이 두 번 리플레이되지 않게.
+    cfg 로 룰 토글 변형(GM3_VARIANTS)을 주입한다 — None 이면 기본 gm_v3.
     """
-    cfg = GmV3Config()
+    cfg = cfg if cfg is not None else GmV3Config()
     targets: dict[str, tuple[str, date]] = {}
     for code, name, _sector in universe:
         targets.setdefault(code, (name, today))
@@ -543,7 +557,13 @@ def record_day(day: date) -> dict:
         logger.info("[paper][leader] {} 주도섹터 판정 불가(일봉 부족) — v2_leader 스킵",
                     day)
     removed = _removed_members(con, universe, day)
-    gm3_rows = run_gm3_replay(paper_start, day, universe, removed)
+    # gm_v3 변형 축 병행 리플레이 — 일봉 캐시(_daily_cache)는 변형 간 공유
+    gm3_by_strat = {
+        strat: run_gm3_replay(paper_start, day, universe, removed,
+                              cfg=dc_replace(GmV3Config(), **flags).validated())
+        for strat, flags in GM3_VARIANTS
+    }
+    gm3_rows = gm3_by_strat["gm_v3"]     # 기존 소비자(알림 등)는 기본 축 유지
     b_ret, n_bench, n_excl = bench_day(con, day, universe)
 
     # 확정 판정: 과거일 기록이거나 20:05(애프터 종료+버퍼) 이후만 확정치 (리뷰 F2)
@@ -563,22 +583,24 @@ def record_day(day: date) -> dict:
                       now_iso, finalized)
         summary[strat] = {"trades": len(rows), "day_ret": day_ret - 1, "equity": eq}
 
-    #    gm_v3 — 전체 리플레이 재기록(멱등). EOR(미청산 MTM)은 equity 반영,
-    #    실청산 집계 제외 (H1). 제거 종목 이력은 removed 로 보존.
-    con.execute("DELETE FROM paper_trades WHERE strategy='gm_v3'")
-    _upsert_trades(con, "gm_v3", gm3_rows, now_iso)
-    real_closed_today = [r for r in gm3_rows
-                         if not r["eor"] and str(r["closed_on"]) == day.isoformat()]
-    open_mtm = [r for r in gm3_rows if r["eor"]]
-    eq = _serial_equity(con, "gm_v3", day)
-    # day_ret = 전일 기록 equity 대비 변화 (실현+MTM 통합, 이중집계 방지)
-    prev_eq = _prev_equity(con, "gm_v3", day)
-    _upsert_daily(con, day, "gm_v3", len(real_closed_today),
-                  eq / prev_eq - 1 if prev_eq else 0.0, eq,
-                  f"open_mtm={len(open_mtm)},removed={len(removed)}",
-                  now_iso, finalized)
-    summary["gm_v3"] = {"closed_today": len(real_closed_today),
-                        "open_positions": len(open_mtm), "equity": eq}
+    #    gm_v3 (+변형 축) — 전체 리플레이 재기록(멱등). EOR(미청산 MTM)은 equity
+    #    반영, 실청산 집계 제외 (H1). 제거 종목 이력은 removed 로 보존.
+    for strat, _flags in GM3_VARIANTS:
+        rows = gm3_by_strat[strat]
+        con.execute("DELETE FROM paper_trades WHERE strategy=?", (strat,))
+        _upsert_trades(con, strat, rows, now_iso)
+        real_closed_today = [r for r in rows
+                             if not r["eor"] and str(r["closed_on"]) == day.isoformat()]
+        open_mtm = [r for r in rows if r["eor"]]
+        eq = _serial_equity(con, strat, day)
+        # day_ret = 전일 기록 equity 대비 변화 (실현+MTM 통합, 이중집계 방지)
+        prev_eq = _prev_equity(con, strat, day)
+        _upsert_daily(con, day, strat, len(real_closed_today),
+                      eq / prev_eq - 1 if prev_eq else 0.0, eq,
+                      f"open_mtm={len(open_mtm)},removed={len(removed)}",
+                      now_iso, finalized)
+        summary[strat] = {"closed_today": len(real_closed_today),
+                          "open_positions": len(open_mtm), "equity": eq}
 
     #    벤치마크 — 당일 유니버스 일수익을 직전 레짐 equity 에 체인
     eq_b = _prev_equity(con, "bench_bh", day) * (1 + b_ret)
@@ -588,7 +610,7 @@ def record_day(day: date) -> dict:
                            "stocks": n_bench, "excluded": n_excl}
 
     # 4) 알파(초과수익) 스냅샷
-    for strat in ("v2", "v2_leader", "gm_v3"):
+    for strat in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS)):
         summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_b
     summary["finalized"] = finalized
 
@@ -655,11 +677,11 @@ def report() -> None:
     con = paper_conn()
     start = _meta_get(con, "paper_start")
     print(f"paper_start={start}")
-    print(f"{'day':<12}{'strategy':<11}{'n':>3}{'day_ret':>9}{'equity':>9}")
+    print(f"{'day':<12}{'strategy':<13}{'n':>3}{'day_ret':>9}{'equity':>9}")
     for row in con.execute(
             "SELECT day, strategy, n_trades, day_ret, equity FROM paper_daily "
             "ORDER BY day, strategy"):
-        print(f"{row[0]:<12}{row[1]:<11}{row[2]:>3}{row[3]*100:>8.2f}%{row[4]:>9.4f}")
+        print(f"{row[0]:<12}{row[1]:<13}{row[2]:>3}{row[3]*100:>8.2f}%{row[4]:>9.4f}")
     # 최신일 기준 누적 초과수익 (절대수익 병기 + 손실회피 태그)
     last = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
     if last:
@@ -668,9 +690,9 @@ def report() -> None:
         bench = rows.get("bench_bh")
         if bench:
             print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
-            for s in ("v2", "v2_leader", "gm_v3"):
+            for s in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS)):
                 if s in rows:
-                    print(f"  {s:<11} {fmt_outperf(rows[s], bench)}")
+                    print(f"  {s:<13} {fmt_outperf(rows[s], bench)}")
     con.close()
 
 
