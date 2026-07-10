@@ -33,3 +33,11 @@ metadata:
 **절대규칙**: paper.db 기록은 이 미니PC 1대에서만(노트북/PC 기록 금지, 원장 분리 방지).
 성과는 벤치마크 대비 초과수익으로만 판단. 관련: [[trading-bot-operating-charter]],
 [[nxt-premarket-historical-data]], [[data-accumulation-machine]].
+
+**운영 이슈(2026-07-10 기준)**:
+- 상주 프로세스 **무음 사망 3회 재발**(로그 에러 없이 끊김, 재부팅 무관) — 세션마다
+  3프로세스(webapp/main_tracker/paper loop) 생존 확인 습관 필수. 워치독 도입 제안 상태.
+- **픽 7일 만료**(sector_picks.expires_at): 매주 재등록 필요. 만료되면 유니버스가
+  조용히 쪼그라든다(07-10 실측: 59→8종목).
+- KIS 분봉(inquire-time-itemchartprice, UN)은 간헐 500 — 실패분은 반복 재시도로
+  회수되나 완고한 잔여는 토스 백필(1m 4년 소급 가능)로 커버 가능.
