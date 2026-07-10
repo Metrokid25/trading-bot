@@ -32,6 +32,7 @@ VARIANTS: list[tuple[str, dict]] = [
     ("+R14 목표격자익절", {"r14_enabled": True}),
     ("+R15 반전캔들청산", {"r15_enabled": True}),
     ("+R16 구조손절", {"r16_enabled": True}),
+    ("+R13+R14 (유망 조합)", {"r13_enabled": True, "r14_enabled": True}),
     ("ALL (R13~R16)", {"r13_enabled": True, "r14_enabled": True,
                        "r15_enabled": True, "r16_enabled": True}),
 ]
