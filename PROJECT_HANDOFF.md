@@ -1248,3 +1248,23 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 
 상주 구성(오너 승인 ①안 수정판): main_tracker(수집) + paper_runner
 --market-schedule(페이퍼) 두 프로세스, 시작프로그램 VBS 로 자동 시작.
+
+---
+
+## 2026-07-10 (미니PC) 웹앱 동료 공유 배포 완료 ✅
+
+`feature/web-colleague-access`(2b60152 병합, 노트북 구현: X-Web-Key 인증 + 등록자
+스탬프)를 미니PC에 실배포. 상세·실측 로그는 `HANDOFF_웹공유.md` 상단 갱신 블록.
+
+- `.env` `WEB_SHARED_KEY` 설정(값은 미니PC .env에만, 문서 평문 금지).
+- 웹앱 `0.0.0.0:8000` 상주 — VBS ③라인 추가로 **미니PC 상주 = 3프로세스**
+  (main_tracker / paper_runner --market-schedule / uvicorn webapp).
+- 방화벽 `trading-bot webapp (Tailscale only)` 적용(TCP 8000, Tailscale 인터페이스
+  + 100.64.0.0/10 한정 — 관리자 권한이라 오너 실행). Wi-Fi/인터넷 쪽은 기본 Block.
+- Tailscale 공유: 동료 계정(chojaesng97@gmail.com) 초대·수락 완료.
+- 스모크 9항목 전부 통과(무키/오키 401, 정키 등록 200 + registered_by, 삭제,
+  Tailscale IP 200). 테스트 섹터 즉시 삭제 — paper 유니버스 오염 0.
+
+### 잔여 (서버 작업 없음)
+1. 동료 폰 Tailscale 앱 설치·로그인·ON → `http://100.100.141.24:8000` 첫 실접속 확인.
+2. 이후 평시 운영: 동료 등록 픽도 오너 픽과 동일하게 당일 유니버스 반영(주도섹터 필터는 동일 적용).

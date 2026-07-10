@@ -6,6 +6,23 @@
 > 실행결과로 재검증**해 기록했다. 추측 없음. 미확인 항목은 명시.
 > 작성 시점 기준일: 2026-07-09 (미니PC에서 검증).
 
+> **[갱신 2026-07-10, 미니PC] 배포 완료 ✅ — 아래 [3](a)~(d) 전부 실행됨.** 실측 결과:
+> - **(a) 상주**: 웹앱 `0.0.0.0:8000` 가동 중(`Get-NetTCPConnection` 확인). 시작프로그램 VBS
+>   (`trading-bot-paper.vbs`)에 ③웹앱 라인 포함 — 재부팅 자동 기동. 이제 미니PC 상주 = 3프로세스
+>   (main_tracker / paper_runner --market-schedule / uvicorn webapp).
+> - **(사전작업) `.env`에 `WEB_SHARED_KEY` 설정 완료** — 키 값은 오너·미니PC `.env`에만
+>   (문서에 평문 기록 안 함). settings 로드 검증됨(ascii, len 6).
+> - **(b) 방화벽**: 규칙 `trading-bot webapp (Tailscale only)` **적용·Enabled 확인** —
+>   Inbound Allow TCP 8000, `-InterfaceAlias Tailscale` + `-RemoteAddress 100.64.0.0/10`
+>   3중 스코핑(오너가 관리자 PowerShell로 실행). Wi-Fi/인터넷 쪽 8000은 기본 Block 유지.
+> - **(c) Tailscale 공유**: 오너가 admin console에서 동료 계정(chojaesng97@gmail.com) 초대,
+>   **수락 확인됨**. ⚠️ 동료 폰에 Tailscale 앱 설치·로그인·토글 ON이 **아직 미완**(마지막 단계)
+>   — 완료되면 폰 브라우저에서 `http://100.100.141.24:8000` 바로 접속 가능.
+> - **(d) 기능 검증(스모크 9항목 전부 통과, 2026-07-10 실측)**: GET / 200(무키) / 등록·삭제
+>   무키·오키 **401** / 정키 등록 200 + `registered_by` 표시 / 삭제 200 / 삭제 후 잔존 0 /
+>   Tailscale IP 직접 접속 200. 테스트 섹터는 즉시 삭제 — paper 유니버스 로그 오염 0 확인.
+> - **남은 것**: 동료 폰 앱 연결(위 c) + 첫 실접속 확인뿐. 서버 측 작업 없음.
+
 > **[갱신 2026-07-09, 노트북]** [3]의 미결정 2건은 오너가 결정, 노트북에서 구현 완료
 > (브랜치 `feature/web-colleague-access`): ① 공유 비밀번호 = `.env`의 `WEB_SHARED_KEY`
 > (영문·숫자만, 미설정 시 등록·삭제 전부 401) — `/api` 변경 요청 전체를 미들웨어로 보호,
