@@ -23,6 +23,22 @@ _TOKEN_CACHE_REAL = Path(settings.DB_PATH).parent / "kis_token_real.json"
 _TOKEN_CACHE_PAPER = Path(settings.DB_PATH).parent / "kis_token_paper.json"
 
 
+def _safe_float(value: Any) -> float:
+    """KIS 숫자 문자열 → float. 결측/형식 오류는 0.0."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_int(value: Any) -> int:
+    """KIS 숫자 문자열 → int (소수점 문자열 허용). 결측/형식 오류는 0."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 class _RateLimiter:
     """초당 max_per_sec 회 제한 토큰 버킷 (sliding window)."""
 
@@ -198,11 +214,16 @@ class KISClient:
         r.raise_for_status()
         return int(r.json()["output"]["stck_prpr"])
 
-    async def get_quote(self, code: str) -> dict[str, Any]:
-        """현재가 + 전일대비 등락률(%) 조회. inquire-price output 파싱."""
+    async def get_quote(self, code: str, market_code: str = "J") -> dict[str, Any]:
+        """현재가 + 전일대비 등락률(%) 조회. inquire-price output 파싱.
+
+        market_code: FID_COND_MRKT_DIV_CODE. "J"(KRX 정규장) / "NX"(NXT) /
+        "UN"(KRX+NXT 통합). NXT 프리장·애프터장 시세는 "UN"으로 받는다
+        (2026-07-10 프로브 확인).
+        """
         await self._market_limiter.acquire()
         headers = await self._real_headers("FHKST01010100")
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+        params = {"FID_COND_MRKT_DIV_CODE": market_code, "FID_INPUT_ISCD": code}
         r = await self._real_client.get(
             "/uapi/domestic-stock/v1/quotations/inquire-price",
             headers=headers,
@@ -210,19 +231,12 @@ class KISClient:
         )
         r.raise_for_status()
         out = r.json().get("output", {}) or {}
-
-        def _f(value: Any) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return 0.0
-
         return {
             "code": code,
-            "price": int(_f(out.get("stck_prpr"))),
-            "change_rate": _f(out.get("prdy_ctrt")),  # 부호 포함 등락률 %
-            "volume": int(_f(out.get("acml_vol"))),  # 누적 거래량(주)
-            "value": int(_f(out.get("acml_tr_pbmn"))),  # 누적 거래대금(원)
+            "price": _safe_int(out.get("stck_prpr")),
+            "change_rate": _safe_float(out.get("prdy_ctrt")),  # 부호 포함 등락률 %
+            "volume": _safe_int(out.get("acml_vol")),  # 누적 거래량(주)
+            "value": _safe_int(out.get("acml_tr_pbmn")),  # 누적 거래대금(원)
         }
 
     async def get_index(self, code: str) -> dict[str, Any]:
@@ -240,26 +254,90 @@ class KISClient:
         )
         r.raise_for_status()
         out = r.json().get("output", {}) or {}
-
-        def _f(value: Any) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return 0.0
-
         return {
             "code": code,
-            "value": _f(out.get("bstp_nmix_prpr")),  # 업종지수 현재가
-            "change": _f(out.get("bstp_nmix_prdy_vrss")),  # 전일대비
-            "change_rate": _f(out.get("bstp_nmix_prdy_ctrt")),  # 전일대비율 %
+            "value": _safe_float(out.get("bstp_nmix_prpr")),  # 업종지수 현재가
+            "change": _safe_float(out.get("bstp_nmix_prdy_vrss")),  # 전일대비
+            "change_rate": _safe_float(out.get("bstp_nmix_prdy_ctrt")),  # 전일대비율 %
+            # 시장 폭 (상승/상한/보합/하락/하한 종목수) — 하한은 lslm_issu_cnt
+            "up_count": _safe_int(out.get("ascn_issu_cnt")),
+            "upper_count": _safe_int(out.get("uplm_issu_cnt")),
+            "flat_count": _safe_int(out.get("stnr_issu_cnt")),
+            "down_count": _safe_int(out.get("down_issu_cnt")),
+            "lower_count": _safe_int(out.get("lslm_issu_cnt")),
         }
 
-    async def get_minute_candles(self, code: str) -> list[dict[str, Any]]:
+    async def get_index_minute_chart(
+        self, code: str, interval_sec: int = 300
+    ) -> dict[str, Any]:
+        """업종지수 분봉차트 (TR FHKUP03500200, inquire-time-indexchartprice).
+
+        FID_INPUT_HOUR_1은 기준 시각이 아니라 '봉 간격(초)'이다. 최근 102봉을
+        최신→과거 순으로 돌려주므로, 당일 전체를 한 번에 받으려면 300초(5분봉)
+        이상을 쓴다 (102봉 × 5분 = 510분 > 정규장 390분).
+
+        반환: {"summary": output1(지수 현재가·전일대비 등), "bars": output2(봉 목록)}
+        """
+        await self._market_limiter.acquire()
+        headers = await self._real_headers("FHKUP03500200")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "U",
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_HOUR_1": str(interval_sec),
+            "FID_PW_DATA_INCU_YN": "N",
+            "FID_ETC_CLS_CODE": "0",
+        }
+        r = await self._real_client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-time-indexchartprice",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        body = r.json()
+        return {
+            "summary": body.get("output1", {}) or {},
+            "bars": body.get("output2", []) or [],
+        }
+
+    # 시장별 투자자매매동향 파라미터 — (FID_INPUT_ISCD, FID_INPUT_ISCD_2).
+    # 다른 조합은 rt_cd=0이지만 전부 0을 돌려준다 (2026-07-10 프로브로 확정).
+    _MARKET_FLOW_PARAMS = {"KOSPI": ("KSP", "0001"), "KOSDAQ": ("KSQ", "1001")}
+
+    async def get_market_investor_flow(self, market: str) -> dict[str, int]:
+        """시장 전체 투자자별 순매수 대금 (TR FHPTJ04030000). 단위: 백만원.
+
+        market: "KOSPI" | "KOSDAQ". 반환: 개인/외국인/기관 순매수 대금.
+        """
+        iscd, iscd2 = self._MARKET_FLOW_PARAMS[market]
+        await self._market_limiter.acquire()
+        headers = await self._real_headers("FHPTJ04030000")
+        params = {"FID_INPUT_ISCD": iscd, "FID_INPUT_ISCD_2": iscd2}
+        r = await self._real_client.get(
+            "/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market",
+            headers=headers,
+            params=params,
+        )
+        r.raise_for_status()
+        # 응답은 현재 스냅샷 단일 행 (2026-07-10 프로브: output list len=1)
+        rows = r.json().get("output", []) or []
+        row = rows[0] if rows else {}
+        return {
+            "individual": _safe_int(row.get("prsn_ntby_tr_pbmn")),
+            "foreign": _safe_int(row.get("frgn_ntby_tr_pbmn")),
+            "institution": _safe_int(row.get("orgn_ntby_tr_pbmn")),
+        }
+
+    async def get_minute_candles(
+        self, code: str, market_code: str = "J"
+    ) -> list[dict[str, Any]]:
         """당일 1분봉 30개 조회 (현재 시각 기준 과거 방향).
 
         KIS inquire-time-itemchartprice는 1분봉만 지원하며,
         FID_INPUT_HOUR_1에는 조회 기준 시각 HHMMSS 6자리를 넘겨야 한다.
         이 엔드포인트는 분봉 간격(interval) 선택을 지원하지 않는다.
+
+        market_code: "J"(KRX) / "NX"(NXT) / "UN"(통합). NXT 프리장·애프터장
+        분봉은 "UN"으로 받는다 (get_minute_candles_at 프로브와 동일).
         """
         await self._market_limiter.acquire()
         from core.time_utils import now_kst
@@ -267,7 +345,7 @@ class KISClient:
         headers = await self._real_headers("FHKST03010200")
         params = {
             "FID_ETC_CLS_CODE": "",
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": market_code,
             "FID_INPUT_ISCD": code,
             "FID_INPUT_HOUR_1": hhmmss,
             "FID_PW_DATA_INCU_YN": "N",

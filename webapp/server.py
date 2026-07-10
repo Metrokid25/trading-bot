@@ -9,8 +9,10 @@ KIS 시세/매매·텔레그램 발송은 건드리지 않고, 종목 검색(Sto
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -19,6 +21,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 from pydantic import BaseModel, Field
 
 from config.settings import settings
@@ -62,6 +65,53 @@ def _to_int(v: object) -> int | None:
         return int(float(v))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _to_float(v: object) -> float | None:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+class _TTLCache:
+    """단순 TTL 캐시 — 다중 브라우저 탭의 60초 폴링이 KIS/야후 호출을
+    중복 발사하지 않게 한다 (미니PC에서 KIS 레이트리밋은 수집·페이퍼
+    상주 프로세스와 공유되므로 웹앱 호출량을 억제해야 한다)."""
+
+    def __init__(self, ttl: float) -> None:
+        self.ttl = ttl
+        self._d: dict[object, tuple[float, object]] = {}
+
+    def get(self, key: object) -> object | None:
+        hit = self._d.get(key)
+        if hit and time.monotonic() - hit[0] < self.ttl:
+            return hit[1]
+        return None
+
+    def set(self, key: object, value: object) -> None:
+        self._d[key] = (time.monotonic(), value)
+
+    def clear(self) -> None:
+        self._d.clear()
+
+
+_index_chart_cache = _TTLCache(60.0)
+_indices_cache = _TTLCache(60.0)
+_markets_cache = _TTLCache(60.0)
+_flows_cache = _TTLCache(60.0)
+_quote_cache = _TTLCache(30.0)
+# 종목별 유효 시장코드 메모 (code -> (기록시각, "UN"|"J")) — NXT 미상장 종목이
+# 매 폴링마다 UN 실패 후 J 재호출로 2배 호출을 내지 않게 30분 기억.
+_quote_market: dict[str, tuple[float, str]] = {}
+_QUOTE_MARKET_TTL = 1800.0
+
+
+def _clear_runtime_caches() -> None:
+    """테스트 격리용 — 모듈 전역 캐시 전부 초기화."""
+    for c in (_index_chart_cache, _indices_cache, _markets_cache, _flows_cache, _quote_cache):
+        c.clear()
+    _quote_market.clear()
 
 
 @asynccontextmanager
@@ -179,78 +229,180 @@ async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
 
 
 _INDICES = [("0001", "코스피"), ("1001", "코스닥")]
+_INDEX_NAMES = dict(_INDICES)
 
 
 @app.get("/api/indices")
 async def indices(kis: KISClient = Depends(get_kis)) -> list[dict]:
-    """국내 주요 지수(코스피·코스닥) 현재값·등락. 실패 시 값은 null."""
+    """국내 주요 지수(코스피·코스닥) 현재값·등락·시장폭. 실패 시 값은 null. 60초 캐시."""
+    cached = _indices_cache.get("all")
+    if cached is not None:
+        return cached  # type: ignore[return-value]
     out: list[dict] = []
+    ok = True
     for code, name in _INDICES:
         try:
             q = await kis.get_index(code)
             out.append({
+                "code": code,
                 "name": name,
                 "value": q["value"],
                 "change": q["change"],
                 "change_rate": q["change_rate"],
+                # 시장 폭 (상승/상한/보합/하락/하한)
+                "up": q.get("up_count"),
+                "upper": q.get("upper_count"),
+                "flat": q.get("flat_count"),
+                "down": q.get("down_count"),
+                "lower": q.get("lower_count"),
             })
         except Exception:
-            out.append({"name": name, "value": None, "change": None, "change_rate": None})
+            ok = False
+            out.append({"code": code, "name": name, "value": None, "change": None, "change_rate": None})
+    if ok:
+        _indices_cache.set("all", out)  # 실패 응답은 캐시하지 않음
     return out
 
 
-# Yahoo Finance(비공식) 심볼: 나스닥종합 / S&P500 / 원달러환율
-_YAHOO = [("^IXIC", "나스닥"), ("^GSPC", "S&P500"), ("KRW=X", "환율")]
+@app.get("/api/index-chart")
+async def index_chart(code: str = "0001", kis: KISClient = Depends(get_kis)) -> dict:
+    """당일 업종지수 5분봉 선차트 데이터 (과거→최신). 60초 캐시.
+
+    code: '0001'(코스피) / '1001'(코스닥). 실패 시 bars=[] + null 값.
+    프리장 등 당일 봉이 아직 없으면 직전 거래일 차트가 나간다 — date 필드로
+    구분 가능하며 프론트가 날짜 라벨을 표시한다.
+    """
+    if code not in _INDEX_NAMES:
+        raise HTTPException(status_code=400, detail="지원하지 않는 지수 코드입니다")
+    cached = _index_chart_cache.get(code)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    out = {
+        "code": code, "name": _INDEX_NAMES[code], "value": None, "change": None,
+        "change_rate": None, "prev_close": None, "date": None, "bars": [],
+    }
+    try:
+        data = await kis.get_index_minute_chart(code, interval_sec=300)
+        s = data["summary"]
+        raw = data["bars"]  # 최신→과거
+        latest_date = raw[0].get("stck_bsop_date") if raw else None
+        bars = []
+        for row in raw:
+            if row.get("stck_bsop_date") != latest_date:
+                continue  # 이월 봉(직전 거래일) 제외 — 최신 거래일만
+            c = _to_float(row.get("bstp_nmix_prpr"))
+            if c is None:
+                continue
+            bars.append({"t": row.get("stck_cntg_hour", ""), "c": c})
+        bars.reverse()
+        out.update({
+            "value": _to_float(s.get("bstp_nmix_prpr")),
+            "change": _to_float(s.get("bstp_nmix_prdy_vrss")),
+            "change_rate": _to_float(s.get("bstp_nmix_prdy_ctrt")),
+            "prev_close": _to_float(s.get("prdy_nmix")),
+            "date": latest_date,
+            "bars": bars,
+        })
+        _index_chart_cache.set(code, out)
+    except Exception as e:
+        # 실패 응답은 캐시하지 않음 — 다음 요청에서 재시도. 무소음 실패 방지용 로그.
+        logger.warning(f"index-chart 조회 실패 code={code}: {type(e).__name__} {e}")
+    return out
 
 
-def _yahoo_to_market(name: str, meta: dict) -> dict:
+# Yahoo Finance(비공식) 심볼. group: 대시보드 카드 묶음 / unit: 표시 단위 힌트.
+_YAHOO = [
+    ("NQ=F", "나스닥F", "us_futures", "idx"),
+    ("YM=F", "다우F", "us_futures", "idx"),
+    ("ES=F", "S&PF", "us_futures", "idx"),
+    ("^IXIC", "나스닥", "us", "idx"),
+    ("^DJI", "다우", "us", "idx"),
+    ("^GSPC", "S&P500", "us", "idx"),
+    ("KRW=X", "환율", "fx", "krw"),
+    ("CL=F", "WTI", "fx", "usd"),
+    ("EWY", "한국ETF", "fx", "usd"),
+]
+
+
+def _yahoo_to_market(name: str, group: str, unit: str, meta: dict) -> dict:
     price = meta.get("regularMarketPrice")
     prev = meta.get("chartPreviousClose")
     if price is None:
-        return {"name": name, "value": None, "change": None, "change_rate": None}
+        return {"name": name, "group": group, "unit": unit,
+                "value": None, "change": None, "change_rate": None}
     change = (price - prev) if prev else 0.0
     rate = ((price - prev) / prev * 100) if prev else 0.0
-    return {"name": name, "value": price, "change": change, "change_rate": rate}
-
-
-def _binance_to_market(name: str, row: dict) -> dict:
-    """바이낸스 24h ticker → 달러 가격."""
-    price = row.get("lastPrice")
-    if price is None:
-        return {"name": name, "value": None, "change": None, "change_rate": None}
-    try:
-        return {
-            "name": name,
-            "value": float(price),
-            "change": float(row.get("priceChange") or 0),
-            "change_rate": float(row.get("priceChangePercent") or 0),
-        }
-    except (TypeError, ValueError):
-        return {"name": name, "value": None, "change": None, "change_rate": None}
+    return {"name": name, "group": group, "unit": unit,
+            "value": price, "change": change, "change_rate": rate}
 
 
 @app.get("/api/markets")
 async def markets(http: httpx.AsyncClient = Depends(get_http)) -> list[dict]:
-    """해외지수·환율·비트코인. Yahoo Finance + 업비트. 실패 항목은 값 null."""
-    out: list[dict] = []
-    for symbol, name in _YAHOO:
+    """미국 선물/미국장/환율·유가 (Yahoo Finance, 동시 조회). 실패 항목은 값 null. 60초 캐시."""
+    cached = _markets_cache.get("all")
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    async def fetch_one(symbol: str, name: str, group: str, unit: str) -> dict:
         try:
             r = await http.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
                 params={"interval": "1d", "range": "1d"},
             )
             meta = r.json()["chart"]["result"][0]["meta"]
-            out.append(_yahoo_to_market(name, meta))
+            return _yahoo_to_market(name, group, unit, meta)
         except Exception:
-            out.append({"name": name, "value": None, "change": None, "change_rate": None})
-    try:
-        r = await http.get(
-            "https://api.binance.com/api/v3/ticker/24hr", params={"symbol": "BTCUSDT"}
-        )
-        out.append(_binance_to_market("비트코인", r.json()))
-    except Exception:
-        out.append({"name": "비트코인", "value": None, "change": None, "change_rate": None})
+            return {"name": name, "group": group, "unit": unit,
+                    "value": None, "change": None, "change_rate": None}
+
+    out = list(await asyncio.gather(*(fetch_one(*item) for item in _YAHOO)))
+    if any(m["value"] is not None for m in out):
+        _markets_cache.set("all", out)  # 전 항목 실패(야후 차단 등)는 캐시하지 않음
     return out
+
+
+@app.get("/api/flows")
+async def flows(kis: KISClient = Depends(get_kis)) -> dict[str, dict]:
+    """시장별 투자자 순매수 (개인/외국인/기관, 단위 억원). 실패 시장은 null. 60초 캐시."""
+    cached = _flows_cache.get("all")
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    out: dict[str, dict] = {}
+    ok = True
+    for key, market in (("kospi", "KOSPI"), ("kosdaq", "KOSDAQ")):
+        try:
+            f = await kis.get_market_investor_flow(market)
+            # KIS 응답 단위는 백만원 → 억원
+            out[key] = {k: round(v / 100) for k, v in f.items()}
+        except Exception:
+            ok = False
+            out[key] = {"individual": None, "foreign": None, "institution": None}
+    if ok:
+        _flows_cache.set("all", out)
+    return out
+
+
+async def _quote_nxt_fallback(kis: KISClient, code: str) -> dict:
+    """통합(UN) 시세 우선, 실패 시 KRX(J)로 폴백.
+
+    UN은 NXT 프리장(08:00~)·애프터장 체결가를 반영한다. NXT 미상장 등으로
+    UN이 실패/무가격이면 J 폴백으로 기존 동작을 유지하고, 그 결과를
+    _quote_market 에 30분 기억해 매 폴링 2배 호출(UN 실패 후 J 재호출)을 막는다.
+    """
+    now = time.monotonic()
+    memo = _quote_market.get(code)
+    try_un = not (memo and now - memo[0] < _QUOTE_MARKET_TTL and memo[1] == "J")
+    if try_un:
+        try:
+            q = await kis.get_quote(code, "UN")
+            if q.get("price"):
+                _quote_market[code] = (now, "UN")
+                return q
+        except Exception:
+            pass
+        _quote_market[code] = (now, "J")
+    return await kis.get_quote(code)
 
 
 @app.get("/api/quotes")
@@ -258,20 +410,30 @@ async def quotes(
     codes: str = "",
     kis: KISClient = Depends(get_kis),
 ) -> dict[str, dict | None]:
-    """종목별 현재가·등락률. codes=콤마구분 6자리코드. 실패 종목은 null."""
-    code_list = [c.strip() for c in codes.split(",") if c.strip()][:60]
+    """종목별 현재가·등락률 (NXT 통합 시세, 실패 시 KRX). 실패 종목은 null.
+
+    종목별 30초 캐시 — 다중 탭이 같은 유니버스를 폴링해도 KIS 호출은 30초에
+    종목당 1회로 수렴한다.
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:100]
     out: dict[str, dict | None] = {}
     for code in code_list:
+        cached = _quote_cache.get(code)
+        if cached is not None:
+            out[code] = cached  # type: ignore[assignment]
+            continue
         try:
-            q = await kis.get_quote(code)
-            out[code] = {
+            q = await _quote_nxt_fallback(kis, code)
+            row = {
                 "price": q["price"],
                 "change_rate": q["change_rate"],
                 "volume": q.get("volume", 0),
                 "value": q.get("value", 0),
             }
+            _quote_cache.set(code, row)
+            out[code] = row
         except Exception:
-            out[code] = None
+            out[code] = None  # 실패는 캐시하지 않음 — 다음 요청에서 재시도
     return out
 
 
@@ -280,7 +442,13 @@ async def _fetch_candles(kis: KISClient, code: str, tf: str) -> list[dict]:
     out: list[dict] = []
     try:
         if tf == "minute":
-            raw = await kis.get_minute_candles(code)
+            # 통합(UN) 우선 — NXT 프리장·애프터장 분봉 포함. 실패/빈 응답은 KRX(J).
+            try:
+                raw = await kis.get_minute_candles(code, "UN")
+            except Exception:
+                raw = []
+            if not raw:
+                raw = await kis.get_minute_candles(code)
             for row in raw:
                 c = _to_int(row.get("stck_prpr"))
                 if c is None:
@@ -338,7 +506,7 @@ async def candles_batch(
     kis: KISClient = Depends(get_kis),
 ) -> dict:
     """여러 종목 봉을 한 번에. 행별 미니차트용. {code: candles[]}."""
-    code_list = [c.strip() for c in codes.split(",") if c.strip()][:60]
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:100]
     out: dict[str, list[dict]] = {}
     for code in code_list:
         out[code] = await _fetch_candles(kis, code, tf)

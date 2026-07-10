@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
+import webapp.server as webapp_server
 from config.settings import settings
 from data.sector_store import SectorStore
 from webapp.server import app, get_http, get_kis, get_master, get_store
@@ -21,14 +22,7 @@ def _web_key(monkeypatch):
 
 
 def _markets_handler(request: httpx.Request) -> httpx.Response:
-    """Yahoo/바이낸스 외부 호출을 가짜 응답으로 대체."""
-    url = str(request.url)
-    if "binance" in url:
-        return httpx.Response(200, json={
-            "lastPrice": "64000.50",
-            "priceChange": "-700.00",
-            "priceChangePercent": "-1.08",
-        })
+    """Yahoo 외부 호출을 가짜 응답으로 대체."""
     return httpx.Response(200, json={
         "chart": {"result": [{"meta": {
             "regularMarketPrice": 25266.94,
@@ -38,7 +32,12 @@ def _markets_handler(request: httpx.Request) -> httpx.Response:
 
 
 class FakeKis:
-    """네트워크 없는 결정적 시세 (KIS 실호출 회피)."""
+    """네트워크 없는 결정적 시세 (KIS 실호출 회피).
+
+    NXT 폴백 경로 검증용 시나리오:
+    - 005930: 통합(UN) 시세/분봉 정상 — UN 데이터가 그대로 나가야 한다.
+    - 000660: UN 시세는 예외, UN 분봉은 빈 목록 — KRX(J)로 폴백해야 한다.
+    """
 
     _Q = {
         "005930": (75000, 1.5, 12_000_000, 900_000_000_000),
@@ -47,7 +46,9 @@ class FakeKis:
 
     _IDX = {"0001": (8471.02, 267.18, 3.26), "1001": (909.31, 17.79, 2.0)}
 
-    async def get_quote(self, code: str):
+    async def get_quote(self, code: str, market_code: str = "J"):
+        if market_code == "UN" and code == "000660":
+            raise RuntimeError("UN not supported")
         if code not in self._Q:
             raise RuntimeError("no data")
         price, rate, vol, val = self._Q[code]
@@ -60,7 +61,40 @@ class FakeKis:
         if code not in self._IDX:
             raise RuntimeError("no data")
         value, change, rate = self._IDX[code]
-        return {"code": code, "value": value, "change": change, "change_rate": rate}
+        return {
+            "code": code, "value": value, "change": change, "change_rate": rate,
+            "up_count": 831, "upper_count": 4, "flat_count": 5,
+            "down_count": 77, "lower_count": 0,
+        }
+
+    async def get_index_minute_chart(self, code: str, interval_sec: int = 300):
+        if code not in self._IDX:
+            raise RuntimeError("no data")
+        # KIS는 최신→과거 순 + 이월 봉(전 거래일)이 섞일 수 있다.
+        return {
+            "summary": {
+                "bstp_nmix_prpr": "7560.10",
+                "bstp_nmix_prdy_vrss": "268.19",
+                "bstp_nmix_prdy_ctrt": "3.68",
+                "prdy_nmix": "7291.91",
+            },
+            "bars": [
+                {"stck_bsop_date": "20260710", "stck_cntg_hour": "093500",
+                 "bstp_nmix_prpr": "7560.10"},
+                {"stck_bsop_date": "20260710", "stck_cntg_hour": "093000",
+                 "bstp_nmix_prpr": "7552.49"},
+                {"stck_bsop_date": "20260709", "stck_cntg_hour": "152500",
+                 "bstp_nmix_prpr": "7291.91"},
+            ],
+        }
+
+    async def get_market_investor_flow(self, market: str):
+        # 단위 백만원 — 서버가 억원으로 환산해야 한다
+        if market == "KOSPI":
+            return {"individual": -1_283_514, "foreign": -348_321, "institution": 1_700_413}
+        if market == "KOSDAQ":
+            return {"individual": -308_470, "foreign": -113_949, "institution": 422_546}
+        raise RuntimeError("unknown market")
 
     async def get_daily_candles(self, code: str, start: str, end: str, period: str = "D"):
         # KIS는 최신→과거 순으로 준다. 서버가 오름차순 정렬하는지 검증하려고 역순 제공.
@@ -71,7 +105,19 @@ class FakeKis:
              "stck_lwpr": "88", "stck_clpr": "98", "acml_vol": "800"},
         ]
 
-    async def get_minute_candles(self, code: str):
+    async def get_minute_candles(self, code: str, market_code: str = "J"):
+        if market_code == "UN":
+            if code == "000660":
+                return []  # UN 미지원 → 서버가 J로 폴백해야 함
+            return [
+                {"stck_cntg_hour": "100100", "stck_oprc": "100", "stck_hgpr": "101",
+                 "stck_lwpr": "99", "stck_prpr": "100", "cntg_vol": "50"},
+                {"stck_cntg_hour": "100000", "stck_oprc": "99", "stck_hgpr": "100",
+                 "stck_lwpr": "98", "stck_prpr": "99", "cntg_vol": "40"},
+                # NXT 프리장 봉 — UN에서만 온다
+                {"stck_cntg_hour": "084500", "stck_oprc": "98", "stck_hgpr": "99",
+                 "stck_lwpr": "97", "stck_prpr": "98", "cntg_vol": "10"},
+            ]
         return [
             {"stck_cntg_hour": "100100", "stck_oprc": "100", "stck_hgpr": "101",
              "stck_lwpr": "99", "stck_prpr": "100", "cntg_vol": "50"},
@@ -104,6 +150,7 @@ class FakeMaster:
 
 @pytest_asyncio.fixture
 async def client(tmp_path):
+    webapp_server._clear_runtime_caches()  # 모듈 전역 캐시가 테스트 간 새지 않게
     store = SectorStore(str(tmp_path / "web.db"))
     await store.open()
     master = FakeMaster()
@@ -151,20 +198,98 @@ async def test_indices_returns_kospi_kosdaq(client):
     kospi = data[0]
     assert kospi["value"] == 8471.02
     assert kospi["change_rate"] == 3.26
+    # 시장 폭 (상승/상한/보합/하락/하한)
+    assert kospi["up"] == 831
+    assert kospi["upper"] == 4
+    assert kospi["down"] == 77
 
 
 @pytest.mark.asyncio
-async def test_markets_returns_overseas_and_btc(client):
+async def test_markets_returns_dashboard_groups(client):
     res = await client.get("/api/markets")
     assert res.status_code == 200
     data = res.json()
-    assert [d["name"] for d in data] == ["나스닥", "S&P500", "환율", "비트코인"]
-    nasdaq = data[0]
-    assert nasdaq["value"] == 25266.94
-    assert nasdaq["change_rate"] < 0  # 25266.94 < 25358.60
-    btc = data[-1]
-    assert btc["value"] == 64000.50  # 바이낸스 BTCUSDT 달러가
-    assert btc["change_rate"] == -1.08
+    assert [d["name"] for d in data] == [
+        "나스닥F", "다우F", "S&PF", "나스닥", "다우", "S&P500", "환율", "WTI", "한국ETF",
+    ]
+    groups = {d["name"]: d["group"] for d in data}
+    assert groups["나스닥F"] == "us_futures"
+    assert groups["나스닥"] == "us"
+    assert groups["WTI"] == "fx"
+    nasdaq_f = data[0]
+    assert nasdaq_f["value"] == 25266.94
+    assert nasdaq_f["change_rate"] < 0  # 25266.94 < 25358.60
+
+
+@pytest.mark.asyncio
+async def test_index_chart_filters_today_and_sorts_ascending(client):
+    """이월 봉(전 거래일) 제외 + 과거→최신 정렬 + 요약값."""
+    res = await client.get("/api/index-chart", params={"code": "0001"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["name"] == "코스피"
+    assert data["value"] == 7560.10
+    assert data["prev_close"] == 7291.91
+    assert data["date"] == "20260710"
+    # 20260709 봉은 제외, 당일 봉만 오름차순
+    assert data["bars"] == [
+        {"t": "093000", "c": 7552.49},
+        {"t": "093500", "c": 7560.10},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_index_chart_unknown_code_returns_400(client):
+    """지원 지수(0001/1001) 외 코드는 400 — 임의 코드로 KIS 호출·캐시 증식 방지."""
+    res = await client.get("/api/index-chart", params={"code": "9999"})
+    assert res.status_code == 400
+
+
+class _BrokenKis(FakeKis):
+    async def get_index_minute_chart(self, code: str, interval_sec: int = 300):
+        raise RuntimeError("KIS down")
+
+
+@pytest.mark.asyncio
+async def test_index_chart_kis_failure_returns_empty_not_500(client):
+    app.dependency_overrides[get_kis] = lambda: _BrokenKis()
+    res = await client.get("/api/index-chart", params={"code": "0001"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["bars"] == []
+    assert data["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_flows_converted_to_eok_won(client):
+    """KIS 백만원 단위를 억원으로 환산해 내려준다."""
+    res = await client.get("/api/flows")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["kospi"] == {
+        "individual": -12835, "foreign": -3483, "institution": 17004,
+    }
+    assert data["kosdaq"]["institution"] == 4225
+
+
+class _CountingKis(FakeKis):
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_quote(self, code: str, market_code: str = "J"):
+        self.calls.append((code, market_code))
+        return await super().get_quote(code, market_code)
+
+
+@pytest.mark.asyncio
+async def test_quote_market_memo_avoids_repeated_un_probing(client):
+    """UN 실패 종목은 시장코드를 기억해 다음 폴링부터 J 직행(2배 호출 방지)."""
+    kis = _CountingKis()
+    app.dependency_overrides[get_kis] = lambda: kis
+    await client.get("/api/quotes", params={"codes": "000660"})  # UN 예외 → J 폴백 + 메모
+    webapp_server._quote_cache.clear()  # 시세 캐시만 비우고 메모는 유지
+    await client.get("/api/quotes", params={"codes": "000660"})
+    assert kis.calls == [("000660", "UN"), ("000660", "J"), ("000660", "J")]
 
 
 @pytest.mark.asyncio
@@ -176,6 +301,7 @@ async def test_quotes_returns_price_and_change(client):
         "price": 75000, "change_rate": 1.5,
         "volume": 12_000_000, "value": 900_000_000_000,
     }
+    # 000660은 UN 시세가 예외 → KRX(J) 폴백으로 정상 응답해야 한다
     assert data["000660"]["change_rate"] == -2.3
     assert data["999999"] is None  # 조회 실패 종목은 null
 
@@ -193,11 +319,21 @@ async def test_candles_daily_sorted_ascending(client):
 
 
 @pytest.mark.asyncio
-async def test_candles_minute_ascending(client):
+async def test_candles_minute_ascending_with_nxt(client):
+    """통합(UN) 분봉 사용 — NXT 프리장 봉(084500) 포함 + 과거→최신 정렬."""
     res = await client.get("/api/candles", params={"code": "005930", "tf": "minute"})
     assert res.status_code == 200
     data = res.json()
     # KIS 최신→과거를 서버가 뒤집어 과거→최신으로
+    assert [c["t"] for c in data["candles"]] == ["084500", "100000", "100100"]
+
+
+@pytest.mark.asyncio
+async def test_candles_minute_falls_back_to_krx_when_un_empty(client):
+    """UN 분봉이 비어 있으면 KRX(J) 분봉으로 폴백한다."""
+    res = await client.get("/api/candles", params={"code": "000660", "tf": "minute"})
+    assert res.status_code == 200
+    data = res.json()
     assert [c["t"] for c in data["candles"]] == ["100000", "100100"]
 
 
