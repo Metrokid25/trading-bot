@@ -49,6 +49,9 @@ def main() -> None:
                     help="최근 N일 내 만료된 픽만 복구 (기본 3)")
     ap.add_argument("--extend-days", type=int, default=365,
                     help="복구/연장 후 유효기간(일, 기본 365)")
+    ap.add_argument("--extend-only", action="store_true",
+                    help="만료 연장(②)만 수행 — 이미 수동 재등록해서 expired 복구가"
+                         " 중복 카드만 만드는 경우 (2026-07-10 상황)")
     ap.add_argument("--all-sources", action="store_true",
                     help="텔레그램 등 모든 픽 소스 포함 (기본: 웹/동기화 픽만)")
     ap.add_argument("--db", default=str(settings.DB_PATH), help="trading.db 경로")
@@ -72,7 +75,7 @@ def main() -> None:
     # 상주 프로세스(웹앱/수집)와 동시 실행 대비 — 저장소 표준 30초 대기
     con.execute("PRAGMA busy_timeout=30000")
     try:
-        expired = con.execute(
+        expired = [] if args.extend_only else con.execute(
             base_select.format(extra="sp.expires_at >= ?"),
             ("expired", cutoff)).fetchall()
         # 현재 활성인데 만료가 목표보다 짧은 픽 (오늘 새로 등록한 7일짜리 등)
