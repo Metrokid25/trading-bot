@@ -62,6 +62,36 @@ class GmV3Config:
     r11_hold_dd_pct: float = 0.02     # 고점 대비 이 이내로 버티면 홀딩 플래그
     r11_hold_days: int = 5            # 플래그 지속 거래일 (동안 R7 트레일링 유예, R10 은 불가침)
 
+    # ---- TIER 1 확장 (그림해설판 PDF, 2026-07-11 인수인계. 기본 OFF — A/B 검증용) ----
+
+    # R13 지지레벨 분할매수 (툴1 신규분, p15-16·19): 상승 파동 조정 시
+    # 되돌림 30/50% 또는 이동평균(20일선, 붕괴 시 60일선) 지지 + 거래량 축소 확인 매수
+    r13_enabled: bool = False
+    r13_lookback_days: int = 60       # 상승 파동(H/L) 탐지 lookback
+    r13_min_upmove_pct: float = 0.15  # 파동 유의성: 저점→고점 최소 상승폭
+    r13_level_tol_pct: float = 0.02   # 지지레벨 터치 허용 오차
+    r13_require_drying: bool = True   # 진입 게이트: 하락 중 거래량 축소 필수 (p8-9)
+    r13_cooldown_days: int = 5        # 재발화 쿨다운 (거래일)
+
+    # R14 목표격자 익절 (툴2 신규분, p15-16·40): 급락 파동 회복 시
+    # 저점+1/3, 저점+1/2(=중간값) 저항 도달 후 돌파 실패하면 일부 매도
+    r14_enabled: bool = False
+    r14_lookback_days: int = 90       # 하락 파동(H→L) 탐지 lookback
+    r14_min_downmove_pct: float = 0.15  # 파동 유의성: 고점 대비 최소 하락폭
+    r14_sell_frac: float = 0.3        # 레벨당 매도 비율
+
+    # R15 반전캔들 청산 (툴3 신규분, p45-46)
+    r15_enabled: bool = False
+    r15_wick_body_mult: float = 2.0   # (a) 윗꼬리 ≥ 몸통×N → 경고(정보성)
+    r15_shoot_gap_pct: float = 0.03   # (b) 시초 슛팅 갭업 기준 (전일 종가 대비)
+    r15_shoot_sell_frac: float = 0.5  # (b) 슛팅 후 음봉 마감 → 절반 매도〔M〕
+    r15_vol_exceed_mult: float = 1.0  # (c) 음봉 거래량 > 직전 거래량×N → 수익 중 전량 익절
+
+    # R16 이동평균 구조 손절 (툴4 신규분, p16·19): 20일선 이탈 후
+    # 회복 실패 상태에서 60일선까지 이탈하면 전량 손절
+    r16_enabled: bool = False
+    r16_recover_days: int = 3         # 20일선 회복 유예 (거래일)
+
     def validated(self) -> "GmV3Config":
         """단순 무결성 체크 후 자신 반환 (엔진 진입 전 1회 호출)."""
         assert 0 < self.r6_scout_weight < 0.2001, "선발대 비중은 20% 미만 원칙(R6)"
@@ -71,4 +101,8 @@ class GmV3Config:
             v = getattr(self, f.name)
             if f.name.endswith("_pct"):
                 assert 0 <= v < 1, f"{f.name} 은 소수 비율이어야 함(예: 0.10)"
+            if f.name.endswith(("_frac", "_weight")):
+                assert 0 < v <= 1, f"{f.name} 은 (0,1] 비율이어야 함 (0.3 = 30%)"
+            if f.name.endswith("_days"):
+                assert v >= 0, f"{f.name} 은 음수 불가"
         return self

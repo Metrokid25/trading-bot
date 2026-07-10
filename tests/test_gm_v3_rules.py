@@ -284,6 +284,163 @@ def test_r12_liquidation_order_sorts_by_loss():
     assert [c for c, _r in order] == ["B", "C", "A"]
 
 
+# ==================== TIER 1 확장 (R13~R16, 기본 OFF) ====================
+
+# 상승 파동(저점 ~9900 → 고점 20000, 일일 +8% 미만로 R3 회피) + 눌림 5봉
+_R13_RISE = [
+    (10000, 10100, 9900, 10000, 200), (10100, 10850, 10050, 10800, 200),
+    (10800, 11650, 10750, 11600, 200), (11600, 12550, 11550, 12500, 200),
+    (12500, 13550, 12450, 13500, 200), (13500, 14550, 13450, 14500, 200),
+    (14500, 15650, 14450, 15600, 200), (15600, 16850, 15550, 16800, 200),
+    (16800, 18050, 16750, 18000, 200), (18000, 19350, 17950, 19300, 200),
+    (19300, 20000, 19250, 19900, 200),
+]
+
+
+def _r13_pullback(vol: float) -> list[tuple]:
+    return [
+        (19900, 19950, 18900, 19000, vol), (19000, 19050, 18300, 18400, vol),
+        (18400, 18450, 17800, 17900, vol), (17900, 17950, 17500, 17600, vol),
+        # 되돌림 30% 레벨(20000-0.3×10100≈16970) 터치 후 양봉 지지 마감
+        (16900, 17500, 16850, 17400, vol),
+    ]
+
+
+def test_r13_fires_on_retrace_support_with_drying_volume():
+    cfg = replace(CFG, r13_enabled=True)
+    sigs, _ = feed(make_bars(_R13_RISE + _r13_pullback(100)), cfg)
+    buys = only(sigs, "R13")
+    assert len(buys) == 1
+    assert buys[0].type == SignalType.BUY
+    assert buys[0].reason["level"] == "r30"
+    assert buys[0].weight == CFG.r6_scout_weight
+
+
+def test_r13_no_fire_when_volume_rising_in_decline():
+    cfg = replace(CFG, r13_enabled=True)
+    sigs, _ = feed(make_bars(_R13_RISE + _r13_pullback(400)), cfg)  # 하락 중 거래량 증가
+    assert not only(sigs, "R13")
+
+
+def test_r13_off_by_default():
+    sigs, _ = feed(make_bars(_R13_RISE + _r13_pullback(100)))
+    assert not only(sigs, "R13")
+
+
+# 하락 파동 (고점 20000 → 저점 10000) — R14 저항 격자 산출용
+_R14_FALL = [
+    (19800, 20000, 19500, 19800, 100), (19000, 19200, 17000, 17200, 100),
+    (17000, 17100, 14000, 14200, 100), (14000, 14100, 11000, 11200, 100),
+    (11000, 11100, 10000, 10200, 100),
+]
+
+
+def test_r14_partial_sell_on_grid_level_reject():
+    cfg = replace(CFG, r14_enabled=True, r7_enabled=False, r9_enabled=False)
+    st = StockState(code="000001")
+    for b in make_bars(_R14_FALL):
+        evaluate_day(st, b, cfg)
+    st.position = pos(10500, peak=10500)
+    # 반등봉: 1/3 레벨(10000+3333≈13333) 고가 터치 후 종가 아래 → 돌파 실패 매도
+    sigs = evaluate_day(st, make_bars([(12800, 13500, 12700, 13000, 100)])[0], cfg)
+    r14 = only(sigs, "R14")
+    assert len(r14) == 1
+    assert r14[0].weight == cfg.r14_sell_frac
+    assert abs(r14[0].reason["level"] - (10000 + 10000 / 3)) < 5
+
+
+def test_r14_holds_on_strong_breakout_of_level():
+    cfg = replace(CFG, r14_enabled=True, r7_enabled=False, r9_enabled=False)
+    st = StockState(code="000001")
+    for b in make_bars(_R14_FALL):
+        evaluate_day(st, b, cfg)
+    st.position = pos(10500, peak=10500)
+    # 레벨 아래 봉에서 격자 초기화 (1/3≈13333, 1/2=15000 둘 다 살아있는 상태)
+    evaluate_day(st, make_bars([(10300, 10800, 10250, 10700, 100)])[0], cfg)
+    assert len(st.position.r14_levels) == 2
+    # 종가가 1/3 레벨을 강돌파 → 매도 없이 소비(pop)만, 다음 레벨 15000 대기
+    sigs = evaluate_day(st, make_bars([(12800, 13800, 12700, 13700, 100)])[0], cfg)
+    assert not only(sigs, "R14")
+    assert st.position.r14_levels == [15000.0]
+
+
+def test_r15b_half_sell_on_open_shoot_bear_close():
+    cfg = replace(CFG, r15_enabled=True, r9_enabled=False)
+    rows = [(10000, 10100, 9900, 10000, 100),
+            (10500, 10600, 10250, 10300, 100)]   # 시초 +5% 슛팅 → 음봉 마감
+    sigs, _ = feed(make_bars(rows), cfg, position=pos(10000, peak=10000))
+    r15 = [s for s in only(sigs, "R15") if s.type == SignalType.SELL]
+    assert len(r15) == 1
+    assert r15[0].reason["variant"] == "b"
+    assert r15[0].weight == cfg.r15_shoot_sell_frac
+
+
+def test_r15c_full_exit_on_bear_volume_exceed_in_profit():
+    cfg = replace(CFG, r15_enabled=True, r9_enabled=False)
+    rows = [(10000, 10600, 9900, 10500, 100),
+            (10500, 10550, 10250, 10300, 250)]   # 음봉 + 거래량 2.5배, 수익 중
+    sigs, _ = feed(make_bars(rows), cfg, position=pos(10000, peak=10600))
+    r15 = [s for s in only(sigs, "R15") if s.type == SignalType.SELL]
+    assert len(r15) == 1
+    assert r15[0].reason["variant"] == "c"
+    assert r15[0].weight == 1.0
+
+
+def test_r8_state_restored_when_higher_priority_sell_wins():
+    """같은 봉에서 R15(우선)와 R8 동시 발동 — 러너는 R15만 체결하므로
+    R8 원샷 상태(r8_done)가 소비된 채 남으면 안 된다 (리뷰 반영)."""
+    cfg = replace(CFG, r15_enabled=True, r7_enabled=False, r9_enabled=False)
+    rows = [(10000, 10100, 9900, 10000, 100),
+            (10000, 10100, 9900, 10000, 100),
+            (12000, 12050, 11150, 11200, 100)]  # 갭 슛팅→음봉 + 종가 ≥ +10%
+    sigs, st = feed(make_bars(rows), cfg,
+                    position=pos(10000, peak=10000, r8_done=False))
+    sell_rules = [s.rule for s in sigs if s.type == SignalType.SELL]
+    assert "R15" in sell_rules and "R8" in sell_rules
+    assert st.position.r8_done is False   # 밀린 R8 은 다음 기회에 다시 발동 가능
+
+
+def test_r15a_upper_wick_warns_only():
+    cfg = replace(CFG, r15_enabled=True, r9_enabled=False)
+    rows = [(10000, 10100, 9900, 10000, 100),
+            (10000, 10900, 9950, 10200, 100)]    # 윗꼬리 700 ≥ 몸통 200×2
+    sigs, _ = feed(make_bars(rows), cfg, position=pos(10000, peak=10000))
+    marks = [s for s in only(sigs, "R15") if s.type == SignalType.MARK]
+    assert marks and marks[0].reason["variant"] == "a"
+    assert not [s for s in only(sigs, "R15") if s.type == SignalType.SELL]
+
+
+def _r16_rows(recover: bool) -> list[tuple]:
+    rows = [(10500, 10550, 10450, 10500, 100)] * 60      # MA20≈MA60≈10500
+    rows.append((10400, 10450, 9750, 9800, 100))         # 20일선 이탈 감지
+    if recover:
+        rows.append((9800, 10700, 9750, 10650, 100))     # 즉시 회복 → 해제
+        rows += [(10650, 10700, 10550, 10600, 100)] * 3
+    else:
+        rows += [(9800, 9850, 9650, 9700, 100),
+                 (9700, 9750, 9550, 9600, 100),
+                 (9600, 9650, 9450, 9500, 100)]          # 유예 3일 경과 + 60일선 아래
+    return rows
+
+
+def test_r16_structural_stop_after_failed_recovery():
+    cfg = replace(CFG, r16_enabled=True, r7_enabled=False, r9_enabled=False,
+                  r15_enabled=False)
+    sigs, _ = feed(make_bars(_r16_rows(recover=False)), cfg,
+                   position=pos(9000, peak=10500))
+    r16 = only(sigs, "R16")
+    assert len(r16) >= 1
+    assert r16[0].weight == 1.0
+
+
+def test_r16_no_fire_when_ma20_recovered():
+    cfg = replace(CFG, r16_enabled=True, r7_enabled=False, r9_enabled=False,
+                  r15_enabled=False)
+    sigs, _ = feed(make_bars(_r16_rows(recover=True)), cfg,
+                   position=pos(9000, peak=10500))
+    assert not only(sigs, "R16")
+
+
 # -------------------- 합성 데이터 유틸 --------------------
 def test_synth_random_walk_is_reproducible_and_valid():
     a = make_random_walk(seed=7, n=30)

@@ -29,7 +29,9 @@ class SignalType(str, Enum):
 
 
 #: SELL 시그널 우선순위 (숫자 낮을수록 먼저 적용; 러너가 사용)
-SELL_PRIORITY = {"R10": 0, "R9": 1, "R7": 2, "R8": 3}
+#: 손절(R10) > 구조 손절(R16) > 위험 청산(R9) > 반전캔들(R15) > 어깨(R7)
+#: > 목표 분할(R8) > 목표격자(R14)
+SELL_PRIORITY = {"R10": 0, "R16": 1, "R9": 2, "R15": 3, "R7": 4, "R8": 5, "R14": 6}
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,9 @@ class Position:
     opened_on: Date
     peak: float = 0.0         # 보유 중 최고가 (엔진이 매 봉 갱신)
     r8_done: bool = False     # R8 목표가 분할매도 1회 소진 여부
+    # R14 목표격자: 보유 첫 평가 봉에서 산출·고정하는 저항 레벨 (낮은 것부터).
+    # 도달·소비된 레벨은 pop — 재발화 방지. None = 미초기화 / [] = 레벨 없음/소진.
+    r14_levels: list[float] | None = None
 
 
 @dataclass(slots=True)
@@ -72,6 +77,8 @@ class StockState:
     watch: WatchState | None = None
     hold_until: int = -1      # R11: 이 bar 인덱스까지 R7 유예
     used_pivot_i: int = -1    # R1 이 소비한 피벗 인덱스 (같은 피벗 재발화 방지)
+    r13_last_i: int = -10**9  # R13 마지막 매수 봉 인덱스 (쿨다운)
+    ma20_broken_i: int = -1   # R16: 20일선 이탈 감지 봉 인덱스 (-1=정상)
 
     # ---- 러너용 체결 헬퍼 (페이퍼 전용) ----
     def apply_buy(self, price: float, weight: float, day: Date) -> None:
@@ -92,5 +99,6 @@ class StockState:
         if frac >= 1.0 or self.position.invested <= 0:
             self.position = None
             self.hold_until = -1
+            self.ma20_broken_i = -1   # R16 플래그는 포지션 생애주기와 함께 종료
         else:
             self.position.invested *= (1.0 - frac)

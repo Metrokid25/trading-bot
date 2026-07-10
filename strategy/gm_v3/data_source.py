@@ -71,9 +71,16 @@ async def kis_backfill_daily(code: str, before: Date, n_days: int
     try:
         from core.kis_api import KISClient
         kis = KISClient()
-        start = (before - timedelta(days=int(n_days * 1.6) + 10)).strftime("%Y%m%d")
-        end = (before - timedelta(days=1)).strftime("%Y%m%d")
-        rows = await kis.get_daily_candles(code, start, end)
+        # KIS 일봉은 요청당 최대 ~100행 — 필요한 거래일 수를 채울 때까지
+        # 달력 ~140일 창으로 나눠 과거 방향 페이징 (n_days>100 지원)
+        rows: list[dict] = []
+        win_end = before - timedelta(days=1)
+        target_start = before - timedelta(days=int(n_days * 1.6) + 10)
+        while win_end >= target_start and len(rows) < n_days * 1.2:
+            win_start = max(target_start, win_end - timedelta(days=139))
+            rows += await kis.get_daily_candles(
+                code, win_start.strftime("%Y%m%d"), win_end.strftime("%Y%m%d"))
+            win_end = win_start - timedelta(days=1)
     except Exception:
         return []
     out: list[DailyBar] = []
@@ -85,8 +92,9 @@ async def kis_backfill_daily(code: str, before: Date, n_days: int
                                 float(r["acml_vol"])))
         except (KeyError, ValueError):
             continue
-    out.sort(key=lambda b: b.day)
-    return [b for b in out if b.day < before]
+    uniq = {b.day: b for b in out}
+    return sorted((b for b in uniq.values() if b.day < before),
+                  key=lambda b: b.day)
 
 
 def synth_pad(bars: list[DailyBar], n: int, seed: int) -> list[DailyBar]:
