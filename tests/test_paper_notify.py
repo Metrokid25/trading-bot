@@ -173,6 +173,27 @@ def test_summary_lists_today_trades_with_reason(sent):
     assert "보유 1종목" in msg
 
 
+def test_summary_gm3_shows_winrate(sent):
+    """gm_v3 계열에도 건수·평균·승률 표기 (EOR 제외) — 2026-07-14 오너 지시."""
+    con_ = _make_con()
+    con_.executemany(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        [("gm_v3", "A", "에이", "2026-07-01", "2026-07-02",
+          0.05, 0.045, "R8", "t"),
+         ("gm_v3", "B", "비", "2026-07-01", "2026-07-03",
+          -0.01, -0.009, "R10", "t"),
+         ("gm_v3", "C", "씨", "2026-07-01", DAY.isoformat(),
+          0.0, 0.0, "R8|EOR", "t"),                   # EOR → 통계 제외
+         ("gm_v3", "D", "디", "2026-08-01", "2026-08-01",
+          0.1, 0.09, "R8", "t")])                     # 미래일 → 제외
+    summ = {"gm_v3": {"closed_today": 0, "open_positions": 1, "equity": 1.035},
+            "bench_bh": {"day_ret": 0.0, "equity": 0.9, "stocks": 70}}
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "2건 · 평균 +1.80% · 승률 50%" in msg       # EOR·미래 제외한 2건
+    assert "시드 +3.50%" in msg                        # 누적/시장비교 유지
+
+
 def test_summary_no_trades_says_watching(sent):
     con_ = _make_con()
     summ = {"gm_v3": {"closed_today": 0, "open_positions": 0, "equity": 1.0},
@@ -196,7 +217,7 @@ def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
     }
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "총 3건" in msg and "승률 67%" in msg
+    assert "3건" in msg and "승률 67%" in msg
     assert "+51" not in msg                           # 착시 누적치 미표기
     assert "gm_v3+R13" in msg                         # 변형 축 라벨
 

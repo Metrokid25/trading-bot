@@ -217,23 +217,23 @@ def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
     else:
         lines.append("· 없음 — 진입 조건 충족 종목 없어 관망")
 
-    # ② 누적 성적 — 시장 대비 직관 표현
+    # ② 누적 성적 — 시장 대비 직관 표현 + 건별 통계(승률)
     lines += ["", "📈 누적 성적 (시장과 비교)"]
     for name, s in summary.items():
         if name in _SUMMARY_META_KEYS or not isinstance(s, dict):
             continue
         label = _STRAT_LABEL.get(name, name)
+        # 실현 트레이드 건별 통계 (EOR=미청산 MTM 스냅샷 제외)
+        n, avg, wins = con.execute(
+            "SELECT COUNT(*), COALESCE(AVG(ret_net),0), "
+            "COALESCE(SUM(ret_net > 0),0) FROM paper_trades "
+            "WHERE strategy=? AND closed_on<=? AND detail NOT LIKE '%EOR%'",
+            (name, day_s)).fetchone()
+        stats = (f"{n}건 · 평균 {avg:+.2%} · 승률 {wins / n:.0%}"
+                 if n else "아직 매매 없음")
         if "trades" in s:
-            # v2 계열: 직렬복리 누적 대신 건별 통계 (착시 방지)
-            n, avg, wins = con.execute(
-                "SELECT COUNT(*), COALESCE(AVG(ret_net),0), "
-                "COALESCE(SUM(ret_net > 0),0) FROM paper_trades "
-                "WHERE strategy=? AND closed_on<=?", (name, day_s)).fetchone()
-            if n:
-                lines.append(f"· {label}: 총 {n}건 · 평균 {avg:+.2%}/건 · "
-                             f"승률 {wins / n:.0%}")
-            else:
-                lines.append(f"· {label}: 아직 매매 없음")
+            # v2 계열: 직렬복리 누적은 착시(전액 재투입 가정)라 건별 통계만
+            lines.append(f"· {label}: {stats}")
             continue
         strat_abs = s.get("equity", 1.0) - 1.0
         alpha = s.get("equity", 1.0) - bench_eq
@@ -246,7 +246,8 @@ def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
             vs = "시장과 동률"
         hold = s.get("open_positions", 0)
         hold_s = f" · 보유 {hold}종목" if hold else ""
-        lines.append(f"· {label}: 시드 {strat_abs:+.2%} ({vs}){hold_s}")
+        lines.append(f"· {label}: 시드 {strat_abs:+.2%} ({vs})\n"
+                     f"   ↳ {stats}{hold_s}")
     return "\n".join(lines)
 
 
