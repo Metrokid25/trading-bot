@@ -127,20 +127,44 @@ def fmt_outperf(strat_eq: float, bench_eq: float) -> str:
             f"초과 {alpha:+.2%}p{tag}")
 
 
+# summary dict 에서 전략이 아닌 메타 키 — 이 외 dict 값은 전부 전략으로 간주해
+# 출력하므로, 전략 축이 늘어나도(GM3_VARIANTS 등) 자동으로 요약에 포함된다.
+_SUMMARY_META_KEYS = {"day", "universe", "finalized", "skipped", "bench_bh"}
+
+
 def _fmt_summary(day, finalized: int, summary: dict) -> str:
-    lead = summary.get("v2_leader", {})
-    gm3 = summary.get("gm_v3", {})
+    """일일 요약 — 돌고 있는 전략 전부 한 줄씩 (2026-07-14 오너 지시).
+
+    각 줄 = 누적 절대수익 · 벤치 대비 초과(%p) · 오늘 활동. 절대수익·벤치
+    병기 원칙(헌장 절대규칙②) 유지, 손실회피/방어는 압축 태그로.
+    """
     bench = summary.get("bench_bh", {})
     tag = "(확정)" if finalized else "(잠정)"
-    outperf = fmt_outperf(lead.get("equity", 1.0), bench.get("equity", 1.0))
-    return (
-        f"📊 페이퍼 마감 {day} {tag}\n"
-        f"주도주 v2_leader: 오늘 {lead.get('trades', 0)}종목 진입 "
-        f"(당일 {lead.get('day_ret', 0.0):+.2%})\n"
-        f"누적 {outperf}\n"
-        f"gm_v3: 오늘 청산 {gm3.get('closed_today', 0)}종목 "
-        f"(보유 {gm3.get('open_positions', 0)})"
-    )
+    bench_eq = bench.get("equity", 1.0)
+    lines = [
+        f"📊 페이퍼 마감 {day} {tag}",
+        f"벤치: 당일 {bench.get('day_ret', 0.0):+.2%} · 누적 {bench_eq - 1:+.2%} "
+        f"({bench.get('stocks', 0)}종목)",
+    ]
+    for name, s in summary.items():
+        if name in _SUMMARY_META_KEYS or not isinstance(s, dict):
+            continue
+        eq = s.get("equity", 1.0)
+        strat_abs = eq - 1.0
+        alpha = eq - bench_eq
+        if "trades" in s:                       # v2 계열 (당일 스캘핑)
+            act = f"오늘 {s['trades']}건"
+        else:                                   # gm_v3 계열 (스윙)
+            act = (f"청산 {s.get('closed_today', 0)}"
+                   f"·보유 {s.get('open_positions', 0)}")
+        if abs(strat_abs) < 0.0005 and alpha > 0.0005:
+            src = " (손실회피)"
+        elif strat_abs < -0.0005 and alpha > 0.0005:
+            src = " (방어)"
+        else:
+            src = ""
+        lines.append(f"{name}: 누적 {strat_abs:+.2%} · 초과 {alpha:+.2%}p · {act}{src}")
+    return "\n".join(lines)
 
 
 def _already_sent(con: sqlite3.Connection, key: str) -> bool:

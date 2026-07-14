@@ -132,11 +132,38 @@ def test_summary_shows_absolute_and_avoidance(sent):
                  " kind TEXT, sent_at TEXT)")
     summ = {"v2_leader": {"trades": 0, "day_ret": -0.0559, "equity": 1.0,
                           "alpha_vs_bench": 0.098},
-            "gm_v3": {"closed_today": 0, "open_positions": 0},
+            "gm_v3": {"closed_today": 0, "open_positions": 0, "equity": 1.0},
             "bench_bh": {"day_ret": -0.0559, "equity": 0.902}}
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "전략 +0.00%" in msg and "벤치 -9.80%" in msg and "손실회피" in msg
+    assert "누적 -9.80%" in msg                 # 벤치 절대수익 병기
+    assert "v2_leader: 누적 +0.00% · 초과 +9.80%p" in msg
+    assert "손실회피" in msg
+
+
+def test_summary_includes_every_strategy(sent):
+    """돌고 있는 전략 전부(6축) + 벤치가 요약에 포함 — 축 추가 시 자동 확장."""
+    con_ = sqlite3.connect(":memory:")
+    con_.execute("CREATE TABLE paper_notified (key TEXT PRIMARY KEY, day TEXT,"
+                 " kind TEXT, sent_at TEXT)")
+    summ = {
+        "day": "2026-07-14", "universe": 73, "finalized": 1,
+        "v2": {"trades": 2, "day_ret": 0.01, "equity": 1.51},
+        "v2_leader": {"trades": 0, "day_ret": 0.0, "equity": 0.955},
+        "gm_v3": {"closed_today": 0, "open_positions": 1, "equity": 0.982},
+        "gm_v3_r13": {"closed_today": 1, "open_positions": 0, "equity": 0.956},
+        "gm_v3_r14": {"closed_today": 0, "open_positions": 0, "equity": 0.982},
+        "gm_v3_r13r14": {"closed_today": 1, "open_positions": 0, "equity": 0.956},
+        "bench_bh": {"day_ret": -0.0089, "equity": 0.8735, "stocks": 75},
+    }
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    for strat in ("v2:", "v2_leader:", "gm_v3:", "gm_v3_r13:",
+                  "gm_v3_r14:", "gm_v3_r13r14:", "벤치:"):
+        assert strat in msg, f"{strat} 누락"
+    assert "day" not in msg.splitlines()[2]      # 메타 키는 전략으로 출력 안 됨
+    assert "오늘 2건" in msg                      # v2 활동 표기
+    assert "청산 1·보유 0" in msg                 # gm3 변형 활동 표기
 
 
 def test_fmt_trade_has_prices():
