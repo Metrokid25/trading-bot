@@ -12,13 +12,22 @@ from strategy.paper_notify import (
 DAY = date(2026, 7, 6)
 
 
-@pytest.fixture()
-def con():
+def _make_con():
     c = sqlite3.connect(":memory:")
     c.execute("CREATE TABLE paper_notified ("
               "key TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL,"
               " sent_at TEXT NOT NULL)")
+    # 요약이 당일 매매·v2 건별 통계를 조회하는 테이블
+    c.execute("CREATE TABLE paper_trades ("
+              " strategy TEXT, code TEXT, name TEXT, opened_on TEXT,"
+              " closed_on TEXT, ret_gross REAL, ret_net REAL, detail TEXT,"
+              " recorded_at TEXT)")
     return c
+
+
+@pytest.fixture()
+def con():
+    return _make_con()
 
 
 @pytest.fixture()
@@ -126,44 +135,70 @@ def test_fmt_outperf_real_gain_no_tag():
     assert "손실회피" not in s and "손실방어" not in s
 
 
-def test_summary_shows_absolute_and_avoidance(sent):
-    con_ = sqlite3.connect(":memory:")
-    con_.execute("CREATE TABLE paper_notified (key TEXT PRIMARY KEY, day TEXT,"
-                 " kind TEXT, sent_at TEXT)")
-    summ = {"v2_leader": {"trades": 0, "day_ret": -0.0559, "equity": 1.0,
-                          "alpha_vs_bench": 0.098},
+def test_summary_intuitive_market_comparison(sent):
+    """'초과 %p' 용어 없이 시장 대비 직관 표현 + 시드 절대수익 병기."""
+    con_ = _make_con()
+    summ = {"v2_leader": {"trades": 0, "day_ret": -0.0559, "equity": 0.955},
             "gm_v3": {"closed_today": 0, "open_positions": 0, "equity": 1.0},
-            "bench_bh": {"day_ret": -0.0559, "equity": 0.902}}
+            "gm_v3_r13": {"closed_today": 0, "open_positions": 0, "equity": 0.955},
+            "bench_bh": {"day_ret": -0.0559, "equity": 0.902, "stocks": 72}}
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "누적 -9.80%" in msg                 # 벤치 절대수익 병기
-    assert "v2_leader: 누적 +0.00% · 초과 +9.80%p" in msg
-    assert "손실회피" in msg
+    assert "초과" not in msg                          # 용어 제거 (오너 피드백)
+    assert "시장(등록 72종목 보유 시)" in msg          # 벤치 병기 (헌장 ②)
+    assert "아직 매매 없음" in msg                     # v2_leader = 건별 통계 경로
+    assert "시드 -4.50%" in msg                       # gm3 변형 절대수익
+    assert "시장보다 5.3%p 덜 잃음" in msg             # 직관 비교 (마이너스 쪽)
+    assert "시장보다 9.8%p 앞섬" in msg                # gm_v3 (플러스 쪽 표현)
 
 
-def test_summary_includes_every_strategy(sent):
-    """돌고 있는 전략 전부(6축) + 벤치가 요약에 포함 — 축 추가 시 자동 확장."""
-    con_ = sqlite3.connect(":memory:")
-    con_.execute("CREATE TABLE paper_notified (key TEXT PRIMARY KEY, day TEXT,"
-                 " kind TEXT, sent_at TEXT)")
+def test_summary_lists_today_trades_with_reason(sent):
+    """오늘 매매 종목·수익률·익절/손절 사유가 요약에 나온다."""
+    con_ = _make_con()
+    con_.executemany(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        [("gm_v3", "226320", "잇츠한불", "2026-07-06", DAY.isoformat(),
+          -0.008, -0.009, "R10", "t"),
+         ("v2", "161890", "한국콜마", DAY.isoformat(), DAY.isoformat(),
+          0.0105, 0.0055, "2TP/BE", "t"),
+         ("gm_v3", "035720", "카카오", "2026-07-06", DAY.isoformat(),
+          0.0, 0.0, "R8|EOR", "t")])                  # EOR 은 제외돼야 함
+    summ = {"gm_v3": {"closed_today": 1, "open_positions": 1, "equity": 0.99},
+            "bench_bh": {"day_ret": 0.0, "equity": 0.9, "stocks": 70}}
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "잇츠한불: -0.9% 🔴손절" in msg
+    assert "한국콜마: +0.5% 🟢익절" in msg
+    assert "카카오" not in msg                        # EOR 제외
+    assert "보유 1종목" in msg
+
+
+def test_summary_no_trades_says_watching(sent):
+    con_ = _make_con()
+    summ = {"gm_v3": {"closed_today": 0, "open_positions": 0, "equity": 1.0},
+            "bench_bh": {"day_ret": 0.01, "equity": 1.01, "stocks": 70}}
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "관망" in msg
+
+
+def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
+    """v2 는 직렬복리 누적(+51% 착시) 대신 건수·평균·승률로 표기."""
+    con_ = _make_con()
+    con_.executemany(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        [("v2", f"{i:06d}", f"종목{i}", "2026-07-03", "2026-07-03",
+          0.05, 0.04 if i < 2 else -0.02, "2TP", "t") for i in range(3)])
     summ = {
-        "day": "2026-07-14", "universe": 73, "finalized": 1,
-        "v2": {"trades": 2, "day_ret": 0.01, "equity": 1.51},
-        "v2_leader": {"trades": 0, "day_ret": 0.0, "equity": 0.955},
-        "gm_v3": {"closed_today": 0, "open_positions": 1, "equity": 0.982},
-        "gm_v3_r13": {"closed_today": 1, "open_positions": 0, "equity": 0.956},
-        "gm_v3_r14": {"closed_today": 0, "open_positions": 0, "equity": 0.982},
-        "gm_v3_r13r14": {"closed_today": 1, "open_positions": 0, "equity": 0.956},
-        "bench_bh": {"day_ret": -0.0089, "equity": 0.8735, "stocks": 75},
+        "v2": {"trades": 0, "day_ret": 0.0, "equity": 1.51},   # 착시 누적치
+        "gm_v3_r13": {"closed_today": 0, "open_positions": 0, "equity": 0.956},
+        "bench_bh": {"day_ret": 0.0, "equity": 0.87, "stocks": 75},
     }
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    for strat in ("v2:", "v2_leader:", "gm_v3:", "gm_v3_r13:",
-                  "gm_v3_r14:", "gm_v3_r13r14:", "벤치:"):
-        assert strat in msg, f"{strat} 누락"
-    assert "day" not in msg.splitlines()[2]      # 메타 키는 전략으로 출력 안 됨
-    assert "오늘 2건" in msg                      # v2 활동 표기
-    assert "청산 1·보유 0" in msg                 # gm3 변형 활동 표기
+    assert "총 3건" in msg and "승률 67%" in msg
+    assert "+51" not in msg                           # 착시 누적치 미표기
+    assert "gm_v3+R13" in msg                         # 변형 축 라벨
 
 
 def test_fmt_trade_has_prices():

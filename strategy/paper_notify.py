@@ -131,39 +131,122 @@ def fmt_outperf(strat_eq: float, bench_eq: float) -> str:
 # 출력하므로, 전략 축이 늘어나도(GM3_VARIANTS 등) 자동으로 요약에 포함된다.
 _SUMMARY_META_KEYS = {"day", "universe", "finalized", "skipped", "bench_bh"}
 
+# 전략 표시명 (미등록 축은 이름 그대로)
+_STRAT_LABEL = {
+    "v2": "v2 (당일치기)",
+    "v2_leader": "v2_leader (주도주만)",
+    "gm_v3": "gm_v3 (멘토룰)",
+    "gm_v3_r13": "gm_v3+R13",
+    "gm_v3_r14": "gm_v3+R14",
+    "gm_v3_r13r14": "gm_v3+R13R14",
+}
 
-def _fmt_summary(day, finalized: int, summary: dict) -> str:
-    """일일 요약 — 돌고 있는 전략 전부 한 줄씩 (2026-07-14 오너 지시).
+_WEEKDAY_KR = "월화수목금토일"
 
-    각 줄 = 누적 절대수익 · 벤치 대비 초과(%p) · 오늘 활동. 절대수익·벤치
-    병기 원칙(헌장 절대규칙②) 유지, 손실회피/방어는 압축 태그로.
+_MAX_TRADE_LINES = 12   # 요약 내 당일 매매 나열 상한 (초과분은 "외 N건")
+
+
+def _gm3_reason_kr(detail: str) -> str:
+    """gm_v3 exit_rules 문자열(R10, R8/R7 등) → 사람이 읽는 사유."""
+    d = (detail or "").upper()
+    if "R10" in d or "R16" in d:
+        return "손절"
+    if "R9" in d or "R15" in d:
+        return "반전청산"
+    if "R8" in d or "R14" in d:
+        return "분할익절"
+    if "R7" in d:
+        return "트레일링익절"
+    return "정리"
+
+
+def _trade_reason_kr(strategy: str, detail: str, ret_net: float) -> str:
+    if strategy.startswith("gm_v3"):
+        base = _gm3_reason_kr(detail)
+    else:                                   # v2 계열: 'SL' / 'nTP/..' / 'EOD'
+        d = (detail or "").upper()
+        if "SL" in d:
+            base = "손절"
+        elif "TP" in d:
+            base = "익절"
+        else:
+            base = "장마감 정리"
+    emoji = "🔴" if ret_net < 0 else "🟢"
+    return f"{emoji}{base}"
+
+
+def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
+    """일일 요약 — 가독성 개편 (2026-07-14 오너 피드백).
+
+    ① 오늘 매매: 전 전략의 실제 진입·청산 종목 + 수익률 + 익절/손절 사유.
+    ② 누적 성적: 시장(등록 종목 그냥 보유) 대비 "덜 잃음/더 벌음"의 직관 표현.
+       - v2 는 직렬복리 누적이 착시(건마다 전액 재투입 가정)라 표기하지 않고
+         건별 통계(건수·평균 수익률·승률)로 보여준다 (오너 지시).
+       - '초과 %p' 용어 제거 → "시장보다 x%p 선방/뒤짐".
     """
     bench = summary.get("bench_bh", {})
-    tag = "(확정)" if finalized else "(잠정)"
     bench_eq = bench.get("equity", 1.0)
+    bench_abs = bench_eq - 1.0
+    try:
+        wd = _WEEKDAY_KR[day.weekday()]
+    except Exception:
+        wd = ""
+    tag = "확정" if finalized else "잠정"
+    day_s = day.isoformat()
+
     lines = [
-        f"📊 페이퍼 마감 {day} {tag}",
-        f"벤치: 당일 {bench.get('day_ret', 0.0):+.2%} · 누적 {bench_eq - 1:+.2%} "
-        f"({bench.get('stocks', 0)}종목)",
+        f"📊 페이퍼 마감 {day_s[5:]}({wd}) — {tag}",
+        f"🌊 시장(등록 {bench.get('stocks', 0)}종목 보유 시): "
+        f"오늘 {bench.get('day_ret', 0.0):+.2%} · 누적 {bench_abs:+.2%}",
+        "",
+        "📌 오늘 매매",
     ]
+
+    # ① 당일 실현 매매 (전 전략, EOR 제외)
+    rows = con.execute(
+        "SELECT strategy, COALESCE(name, code), ret_net, COALESCE(detail,'') "
+        "FROM paper_trades WHERE closed_on=? AND detail NOT LIKE '%EOR%' "
+        "ORDER BY strategy, ret_net DESC", (day_s,)).fetchall()
+    if rows:
+        for strat, name, rn, det in rows[:_MAX_TRADE_LINES]:
+            label = _STRAT_LABEL.get(strat, strat).split(" ")[0]
+            lines.append(f"· [{label}] {name}: {rn:+.1%} "
+                         f"{_trade_reason_kr(strat, det, rn)}")
+        if len(rows) > _MAX_TRADE_LINES:
+            lines.append(f"· … 외 {len(rows) - _MAX_TRADE_LINES}건")
+    else:
+        lines.append("· 없음 — 진입 조건 충족 종목 없어 관망")
+
+    # ② 누적 성적 — 시장 대비 직관 표현
+    lines += ["", "📈 누적 성적 (시장과 비교)"]
     for name, s in summary.items():
         if name in _SUMMARY_META_KEYS or not isinstance(s, dict):
             continue
-        eq = s.get("equity", 1.0)
-        strat_abs = eq - 1.0
-        alpha = eq - bench_eq
-        if "trades" in s:                       # v2 계열 (당일 스캘핑)
-            act = f"오늘 {s['trades']}건"
-        else:                                   # gm_v3 계열 (스윙)
-            act = (f"청산 {s.get('closed_today', 0)}"
-                   f"·보유 {s.get('open_positions', 0)}")
-        if abs(strat_abs) < 0.0005 and alpha > 0.0005:
-            src = " (손실회피)"
-        elif strat_abs < -0.0005 and alpha > 0.0005:
-            src = " (방어)"
+        label = _STRAT_LABEL.get(name, name)
+        if "trades" in s:
+            # v2 계열: 직렬복리 누적 대신 건별 통계 (착시 방지)
+            n, avg, wins = con.execute(
+                "SELECT COUNT(*), COALESCE(AVG(ret_net),0), "
+                "COALESCE(SUM(ret_net > 0),0) FROM paper_trades "
+                "WHERE strategy=? AND closed_on<=?", (name, day_s)).fetchone()
+            if n:
+                lines.append(f"· {label}: 총 {n}건 · 평균 {avg:+.2%}/건 · "
+                             f"승률 {wins / n:.0%}")
+            else:
+                lines.append(f"· {label}: 아직 매매 없음")
+            continue
+        strat_abs = s.get("equity", 1.0) - 1.0
+        alpha = s.get("equity", 1.0) - bench_eq
+        if alpha >= 0.0005:
+            vs = f"시장보다 {alpha * 100:.1f}%p 덜 잃음" if strat_abs < 0 \
+                else f"시장보다 {alpha * 100:.1f}%p 앞섬"
+        elif alpha <= -0.0005:
+            vs = f"시장보다 {-alpha * 100:.1f}%p 뒤짐"
         else:
-            src = ""
-        lines.append(f"{name}: 누적 {strat_abs:+.2%} · 초과 {alpha:+.2%}p · {act}{src}")
+            vs = "시장과 동률"
+        hold = s.get("open_positions", 0)
+        hold_s = f" · 보유 {hold}종목" if hold else ""
+        lines.append(f"· {label}: 시드 {strat_abs:+.2%} ({vs}){hold_s}")
     return "\n".join(lines)
 
 
@@ -235,7 +318,7 @@ def notify_events(con, day, finalized: int, leader_rows: list[dict],
         # 3) 당일 요약 (하루 1회, 상한과 무관)
         skey = f"summary:{day_s}"
         if not _already_sent(con, skey):
-            _emit(skey, "summary", _fmt_summary(day, finalized, summary))
+            _emit(skey, "summary", _fmt_summary(con, day, finalized, summary))
 
         if sent:
             logger.info("[paper][tg] {} 알림 {}건 발송", day, sent)
