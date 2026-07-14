@@ -34,9 +34,17 @@ metadata:
 성과는 벤치마크 대비 초과수익으로만 판단. 관련: [[trading-bot-operating-charter]],
 [[nxt-premarket-historical-data]], [[data-accumulation-machine]].
 
-**운영 이슈(2026-07-10 기준)**:
-- 상주 프로세스 **무음 사망 3회 재발**(로그 에러 없이 끊김, 재부팅 무관) — 세션마다
-  3프로세스(webapp/main_tracker/paper loop) 생존 확인 습관 필수. 워치독 도입 제안 상태.
+**운영 이슈**:
+- **[원인 확정 2026-07-14] 상주 무음 사망 4회의 범인 = Claude 앱 프로세스 트리.**
+  AI 세션이 Start-Process 로 띄운 상주는 Claude 앱의 Job 트리에 묶여, 앱 자동
+  업데이트(이벤트 7045 "Claude 서비스 설치" — 07-14 09:53, 07-10 06:22 실측 일치)나
+  앱 종료 시 통째로 정리된다. python 크래시(WER)/절전/재부팅 이벤트 0건,
+  타 부모의 아카이브봇은 생존 — 코드 문제 아님.
+  **→ 규칙: 상주 기동/재시작은 반드시 Claude 트리 밖에서.**
+  ① 표준: `Invoke-CimMethod -ClassName Win32_Process -MethodName Create
+  -Arguments @{CommandLine='...python.exe ...'; CurrentDirectory='C:\trading-bot'}`
+  (부모=WmiPrvSE, 즉시 분리) ② 재부팅 커버: 시작프로그램 VBS.
+  **Start-Process 로 상주를 띄우지 말 것** — 다음 Claude 업데이트 때 또 죽는다.
 - **픽 7일 만료**(sector_picks.expires_at): 매주 재등록 필요. 만료되면 유니버스가
   조용히 쪼그라든다(07-10 실측: 59→8종목).
 - KIS 분봉(inquire-time-itemchartprice, UN)은 간헐 500 — 실패분은 반복 재시도로
