@@ -49,3 +49,18 @@ metadata:
   조용히 쪼그라든다(07-10 실측: 59→8종목).
 - KIS 분봉(inquire-time-itemchartprice, UN)은 간헐 500 — 실패분은 반복 재시도로
   회수되나 완고한 잔여는 토스 백필(1m 4년 소급 가능)로 커버 가능.
+- **[2026-07-15] Windows Update 자동 재부팅 사고 + 이중 방어 조치.**
+  09:16 TrustedInstaller가 "운영 체제 업그레이드"로 자동 재부팅 → Startup VBS는
+  로그온 시에만 실행되므로 22:35 오너 로그인까지 13시간 상주 3종 전체 다운.
+  조치: ① WU 정책 적용(관리자 UAC 승인) — `HKLM\SOFTWARE\Policies\Microsoft\
+  Windows\WindowsUpdate\AU` NoAutoUpdate=1 + NoAutoRebootWithLoggedOnUsers=1,
+  사용시간 08:00~02:00. **업데이트는 이제 수동 전용 — 주말에 수동 설치 권장.**
+  ② 잔여 리스크: 재부팅(정전 등) 후 로그온 전까지는 여전히 봇 다운 — 자동
+  로그온 또는 관리자 예약작업(AtStartup) 승격은 오너 결정 대기.
+- **[2026-07-15 발견] 20:05 이후 재시작 시 당일 토스 캐시 고착 버그(코드 미수정).**
+  장중 수집이 죽고(09:11 컷) 20:05 이후 재기동하면 `ensure_day_cached`가
+  부분 데이터를 '완전 수집'으로 오인 → record_day가 잘린 데이터로 finalized=1
+  확정 + 오알림 발송(07-15 실측: bench +4.67%로 확정, 실제 +8.53%).
+  복구 절차(멱등): 당일 candles/fetched 삭제 → ensure_day_cached 재수집 →
+  paper_notified 당일 키 삭제 → record_day 재실행(정정 알림 자동 발송).
+  근본 수정(마지막 봉 <15:30이면 강제 재수집)은 백로그.
