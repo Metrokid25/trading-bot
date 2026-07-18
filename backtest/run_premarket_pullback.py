@@ -32,6 +32,7 @@ CACHE_DB = Path(__file__).resolve().parent.parent / "db" / "toss_candles.db"
 PRE_START, PRE_END = time(8, 0), time(9, 0)        # 프리장 [08:00, 09:00)
 REG_OPEN, REG_CLOSE = time(9, 0), time(15, 30)     # 정규장 [09:00, 15:30]
 WIN_END = time(9, 30)                               # 눌림 윈도우 끝 [09:00, 09:30)
+AFT_END = time(20, 0)                               # 애프터장 끝 (15:30, 20:00] — v4r
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,8 @@ class Trade:
     exit: int
     reason: str       # 'TP' | 'SL' | 'EOD'
     ret: float
+    # v4r(오버나이트) 전용 — 기존 모드는 기본값 유지(생성부 불변)
+    exit_day: date | None = None
 
 
 # ---------------- 캐시 ----------------
@@ -234,7 +237,7 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     if entry is None or entry <= 0:
         return None
 
-    exit_avg, reason, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct)
+    exit_avg, reason, _, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct)
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
                  int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
 
@@ -242,13 +245,14 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
 def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
                 tp_levels: tuple[float, ...], stop_pct: float,
                 stop_floor: float = 0.0,
-                trail_pct: float = 0.0) -> tuple[float, str, int]:
-    """v2/v3/acc 공용 분할 익절 청산. (평균청산가, 사유, 익절구간수) 반환.
+                trail_pct: float = 0.0) -> tuple[float, str, int, int]:
+    """v2/v3/acc 공용 분할 익절 청산. (평균청산가, 사유, 익절구간수, 청산봉 i) 반환.
 
     stop_floor: 구조적 손절선(지지 저점 이탈가). 0 이면 미사용.
     스승님: 지지선이 "무너지면 가차없이 정리해야 하겠지요" (article 89144)
     trail_pct: 첫 익절 후 고점 대비 -trail_pct 로 손절선 상향(꼭지 근처 잔량
     청산, 사유 'TR'). 0 이면 미사용 — v2/v3 는 기본 끔.
+    청산봉 i 는 bars3 기준 절대 인덱스(v4r 재탐색 시작점) — 기존 모드는 무시.
     """
     n = len(tp_levels)
     tps = [entry * (1 + lv) for lv in tp_levels]
@@ -258,10 +262,13 @@ def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
     tp_i = 0
     stop_kind = "SL"
     exit_kind = "EOD"
-    for b in bars3[entry_i + 1:]:
+    exit_i = len(bars3) - 1
+    for i in range(entry_i + 1, len(bars3)):
+        b = bars3[i]
         if b.low <= stop:
             fills += [stop] * (n - len(fills))
             exit_kind = stop_kind
+            exit_i = i
             break
         while tp_i < n and b.high >= tps[tp_i]:
             fills.append(tps[tp_i])
@@ -269,6 +276,7 @@ def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
             if not armed:
                 armed, stop, stop_kind = True, float(entry), "BE"
         if len(fills) >= n:
+            exit_i = i
             break
         if armed and trail_pct > 0:
             trail = b.high * (1 - trail_pct)
@@ -277,7 +285,7 @@ def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
     if len(fills) < n:
         fills += [bars3[-1].close] * (n - len(fills))
     reason = f"{tp_i}TP" + (f"/{exit_kind}" if tp_i < n else "")
-    return sum(fills) / n, reason, tp_i
+    return sum(fills) / n, reason, tp_i, exit_i
 
 
 def evaluate_day_acc(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
@@ -380,8 +388,8 @@ def evaluate_day_acc(symbol: str, name: str, day_bars: list[Bar], prev_close: in
                      int(round(avg_entry)), int(round(exit_px)), "EOD",
                      (exit_px - avg_entry) / avg_entry)
 
-    exit_avg, reason, _ = _split_exit(bars3, entry_done_i, avg_entry, tp_levels,
-                                      stop_pct, trail_pct=trail_pct)
+    exit_avg, reason, _, _ = _split_exit(bars3, entry_done_i, avg_entry, tp_levels,
+                                         stop_pct, trail_pct=trail_pct)
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
                  int(round(avg_entry)), int(round(exit_avg)), reason,
                  (exit_avg - avg_entry) / avg_entry)
@@ -496,8 +504,8 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
         return None
 
     stop_floor = pullback_low * (1 - support_tol)  # 지지 이탈 = 정리 (89144)
-    exit_avg, reason, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct,
-                                      stop_floor)
+    exit_avg, reason, _, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct,
+                                         stop_floor)
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
                  int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
 
@@ -686,6 +694,237 @@ def evaluate_day_v4(symbol: str, name: str, day_bars: list[Bar], prev_close: int
                  int(round(avg_cost)), int(round(exit_avg)), reason + tag, ret)
 
 
+# ---------------- v4r "v4재폭등": 국소 기준선 + 반복 재진입 + 애프터/오버나이트 ----------------
+
+def _session_bars3_v4r(day_bars: list[Bar], use_after: bool = True) -> list[Bar]:
+    """v4r 세션 3분봉: 프리장(무체결 제외) + 정규장 + 애프터장(무체결 제외).
+
+    프리장 봉은 보유 포지션의 익일 청산 평가에만 쓰고(스탑/TP), 진입 탐색은
+    호출부에서 REG_OPEN 이후 봉으로 제한한다. 애프터장은 유동성이 얇아
+    무체결(volume=0) 1분봉을 제외하고 리샘플한다. use_after=False 는 ablation
+    용(애프터장 완전 제외 — 탐색·청산 모두 정규장까지, 오버나이트는 유지).
+    """
+    keep = []
+    aft_start = time(15, 33)   # 15:31~32 는 마감 단일가와 3분 버킷(15:30)이 섞여
+    for b in day_bars:         # is_aft 오분류를 만들므로 제외 (리뷰 F3)
+        t = b.ts.time()
+        if REG_OPEN <= t <= REG_CLOSE:
+            keep.append(b)
+        elif PRE_START <= t < PRE_END and b.volume > 0:
+            keep.append(b)
+        elif use_after and aft_start <= t <= AFT_END and b.volume > 0:
+            keep.append(b)
+    return _resample_3m(keep)
+
+
+def _v4r_gate(day_bars: list[Bar], prev_close: int,
+              pre_surge: float) -> float | None:
+    """프리장 급등 게이트(v2 _gate_and_resample 과 동일 기준·가드).
+
+    정규장 봉 존재 + 정규장 3분봉 6개 이상 가드 포함 — v2 가 구조적으로
+    거르는 얇은/반쪽 거래일을 v4r 도 동일하게 걸러 비교가능성 유지 (리뷰 F5).
+    """
+    pre = [b for b in day_bars
+           if PRE_START <= b.ts.time() < PRE_END and b.volume > 0]
+    reg = [b for b in day_bars if REG_OPEN <= b.ts.time() <= REG_CLOSE]
+    if not pre or not reg or prev_close <= 0:
+        return None
+    pre_high = max(b.high for b in pre)
+    if (pre_high - prev_close) / prev_close < pre_surge:
+        return None
+    if len(_resample_3m(reg)) < 6:
+        return None
+    return float(pre_high)
+
+
+def _v4r_new_cycle(day_high: float) -> dict:
+    """진입 탐색 사이클 상태. day_high=0 이면 다음 봉부터 국소 고점 누적(재진입)."""
+    return {"day_high": day_high, "base_high": None, "pullback_low": None,
+            "hold": 0, "local_high": 0.0}
+
+
+def _v4r_step_setup(cyc: dict, b: Bar, *, pullback_min: float,
+                    support_tol: float, consol_bars: int) -> bool:
+    """v2 셋업의 한 봉 진행 + 변경1(파동 추적 기준선). True = 이 봉 종가 진입.
+
+    룩어헤드 금지 계약: base_high(재돌파 기준선)는 항상 '이 봉 이전' 정보로만
+    구성된다 — 눌림 등록 시 prev_high(현재 봉 반영 전 고점), 지지 이탈 시
+    local_high(직전 봉까지의 반등 고점, 이탈 봉 자신 미포함). 같은 봉에서
+    등록/갱신된 기준선으로 같은 봉 진입은 분기 구조상 불가능하다.
+    """
+    prev_high = cyc["day_high"]
+    cyc["day_high"] = max(prev_high, b.high)
+    if cyc["pullback_low"] is None:
+        # ② 눌림 최초 등록 (재진입 사이클은 prev_high 누적 뒤에야 가능)
+        if prev_high > 0 and b.low <= prev_high * (1 - pullback_min):
+            cyc.update(base_high=prev_high, pullback_low=float(b.low),
+                       hold=0, local_high=0.0)
+        return False
+    # ③ 지지 이탈 먼저 (v2 와 동일한 분기 순서 — 휩쏘 장대봉[저가 이탈+종가
+    #    돌파]은 진입하지 않고 저점 하향으로 처리, 리뷰 F1)
+    #    + [변경1] 기준선을 직전 반등 고점으로 하향 갱신
+    if b.low < cyc["pullback_low"] * (1 - support_tol):
+        if cyc["local_high"] > 0:
+            cyc["base_high"] = min(cyc["base_high"], cyc["local_high"])
+        cyc.update(pullback_low=float(b.low), hold=0, local_high=0.0)
+        return False
+    # ④ 재돌파 (기준선 = 국소 스윙 고점, 절대 고점 고정 아님)
+    if b.close > cyc["base_high"]:
+        if cyc["hold"] >= consol_bars:
+            return True
+        # 다지기 미완 재돌파 = 구조 폐기 → 새 눌림 대기 (추격 금지, v2 동일)
+        cyc.update(base_high=None, pullback_low=None, hold=0, local_high=0.0)
+        return False
+    # 다지기 진행: 저점 유지, 반등 고점(다음 파동의 국소 시작 고점 후보) 추적
+    cyc["pullback_low"] = min(cyc["pullback_low"], float(b.low))
+    cyc["local_high"] = max(cyc["local_high"], float(b.high))
+    cyc["hold"] += 1
+    return False
+
+
+def _v4r_step_exit(pos: dict, b: Bar) -> bool:
+    """보유 포지션의 한 봉 청산 진행. True = 전량 청산 완료.
+
+    갭 계약(시간순, 리뷰 F2 반영): 봉 시가가 시간상 가장 먼저 체결 가능한
+    가격이므로 시가를 선처리한다 —
+      ① 시가 ≤ 스탑: 전량 시가 손절 (스탑이 시가보다 좋게 체결될 수 없음)
+      ② 시가 ≥ TP 레벨들: 해당 레벨 전부 시가 체결(갭업 익절), BE 암
+    이후 인트라바는 순서를 알 수 없으므로 기존 계약 유지: 스탑 우선(보수),
+    TP 는 레벨가 체결. 인트라바 TP 후 같은 봉 저가의 BE 재검사는 하지 않는다
+    (v2 _split_exit 와 동일 계약 — 시가 경로만 예외적으로 이후 저가 검사됨).
+    """
+    n = pos["n"]
+    o = float(b.open)
+    # ① 갭다운: 시가가 이미 손절선 이하 → 전량 시가 체결
+    if o <= pos["stop"]:
+        pos["fills"] += [o] * (n - len(pos["fills"]))
+        pos["exit_kind"] = pos["stop_kind"]
+        return True
+    # ② 갭업: 시가가 TP 레벨 위면 그 레벨들은 시가에 체결 (시간순 정직)
+    while pos["tp_i"] < n and o >= pos["tps"][pos["tp_i"]]:
+        pos["fills"].append(o)
+        pos["tp_i"] += 1
+        if not pos["armed"]:
+            pos["armed"] = True
+            pos["stop"] = pos["entry"]
+            pos["stop_kind"] = "BE"
+    if len(pos["fills"]) >= n:
+        return True
+    # 인트라바: 스탑 우선(보수) → 잔여 TP 레벨가 체결
+    if b.low <= pos["stop"]:
+        pos["fills"] += [pos["stop"]] * (n - len(pos["fills"]))
+        pos["exit_kind"] = pos["stop_kind"]
+        return True
+    while pos["tp_i"] < n and b.high >= pos["tps"][pos["tp_i"]]:
+        pos["fills"].append(pos["tps"][pos["tp_i"]])
+        pos["tp_i"] += 1
+        if not pos["armed"]:
+            pos["armed"] = True
+            pos["stop"] = pos["entry"]      # 첫 익절 후 본절 보호
+            pos["stop_kind"] = "BE"
+    return len(pos["fills"]) >= n
+
+
+def _v4r_close_trade(pos: dict, exit_day: date, *, forced_close: float | None = None,
+                     forced_kind: str = "EOR") -> Trade:
+    n = pos["n"]
+    if forced_close is not None and len(pos["fills"]) < n:
+        pos["fills"] += [forced_close] * (n - len(pos["fills"]))
+        pos["exit_kind"] = forced_kind
+    exit_avg = sum(pos["fills"]) / n
+    tp_i = pos["tp_i"]
+    reason = f"{tp_i}TP" + (f"/{pos['exit_kind']}" if tp_i < n else "")
+    entry = pos["entry"]
+    return Trade(pos["symbol"], pos["name"], pos["entry_day"], pos["prev_close"],
+                 pos["pre_high"], int(entry), int(round(exit_avg)), reason,
+                 (exit_avg - entry) / entry, exit_day=exit_day)
+
+
+def simulate_symbol_v4r(symbol: str, name: str, days: dict[date, list[Bar]],
+                        ordered: list[date], start: date, end: date, *,
+                        pre_surge: float, pullback_min: float, support_tol: float,
+                        tp_levels: tuple[float, ...], stop_pct: float,
+                        consol_bars: int = 3, max_entries: int = 4,
+                        aft_stop_pct: float = 0.03, use_after: bool = True,
+                        winner_gate: bool = True, **_ignore) -> list[Trade]:
+    """v4재폭등: v2 승계 + 국소 기준선 + 하루 max_entries회 재진입 + 승자 게이트
+    + 애프터장 탐색/청산 + 오버나이트 무기한 보유(TP 소진/스탑까지).
+
+    - 보유 중 신규 진입 금지. 청산 후 같은 날(게이트 통과일)에만 재탐색하며,
+      재진입 사이클 기준 고점은 청산 이후 봉부터 국소 누적.
+    - 승자 게이트: 직전 트레이드가 익절 0구간(0TP: SL/EOR 포함)으로 끝나면 그
+      종목은 그날 매매 종료. 첫 트레이드는 무조건 허용.
+    - 애프터장 진입: 다지기 강제는 동일(완화 없음), 손절만 -aft_stop_pct.
+    - 익일부터는 프리장(08:00, 무체결 제외)부터 스탑/TP 평가. 범위(end) 끝까지
+      미청산이면 마지막 유효 봉 종가로 강제 청산(EOR).
+    """
+    n_levels = len(tp_levels)
+    trades: list[Trade] = []
+    pos: dict | None = None
+    last_bar: Bar | None = None
+
+    for di, d in enumerate(ordered):
+        if d > end:
+            break
+        # 시작일 이전 날은 보유가 있을 수 없음(진입이 start 이후) → 스킵
+        if pos is None and d < start:
+            continue
+        bars3 = _session_bars3_v4r(days[d], use_after)
+        if not bars3:
+            continue
+        # 그날 진입 탐색 자격 (start~end 내 + 프리장 게이트)
+        gate_high: float | None = None
+        if start <= d <= end:
+            pc = _prev_close(days, ordered, di)
+            gate_high = _v4r_gate(days[d], pc, pre_surge)
+            prev_close_d = pc
+        entries_today = 0
+        day_blocked = False           # 승자 게이트: 0TP 청산 발생 시 그날 종료
+        cyc = _v4r_new_cycle(gate_high) if gate_high is not None else None
+
+        for b in bars3:
+            last_bar = b
+            t = b.ts.time()
+            if pos is not None:
+                if _v4r_step_exit(pos, b):
+                    trades.append(_v4r_close_trade(pos, d))
+                    won = pos["tp_i"] >= 1
+                    pos = None
+                    if winner_gate and not won:
+                        day_blocked = True        # 변경3: 손절이면 그날 종료
+                    # 재탐색: 게이트 통과일 + 국소 고점은 다음 봉부터 누적
+                    cyc = (_v4r_new_cycle(0.0)
+                           if (gate_high is not None and not day_blocked)
+                           else None)
+                continue
+            if cyc is None or day_blocked or entries_today >= max_entries:
+                continue
+            if t < REG_OPEN:
+                continue                          # 프리장에선 진입 탐색 안 함
+            if _v4r_step_setup(cyc, b, pullback_min=pullback_min,
+                               support_tol=support_tol, consol_bars=consol_bars):
+                is_aft = t > REG_CLOSE
+                entry = float(b.close)
+                use_stop = aft_stop_pct if is_aft else stop_pct   # 변경4
+                pos = {
+                    "symbol": symbol, "name": name, "entry_day": d,
+                    "prev_close": prev_close_d, "pre_high": int(gate_high),
+                    "entry": entry, "n": n_levels,
+                    "tps": [entry * (1 + lv) for lv in tp_levels],
+                    "fills": [], "tp_i": 0, "armed": False,
+                    "stop": entry * (1 - use_stop), "stop_kind": "SL",
+                    "exit_kind": "EOD",
+                }
+                entries_today += 1
+                cyc = None                        # 보유 중 신규 진입 금지
+
+    # 범위 끝까지 미청산 → 마지막 유효 봉 종가 강제 청산 (EOR 로 구분)
+    if pos is not None and last_bar is not None:
+        trades.append(_v4r_close_trade(pos, last_bar.ts.date(),
+                                       forced_close=float(last_bar.close)))
+    return trades
+
+
 _EVALUATORS = {"v1": evaluate_day, "v2": evaluate_day_v2, "v3": evaluate_day_v3,
                "v4": evaluate_day_v4, "acc": evaluate_day_acc}
 
@@ -705,9 +944,13 @@ def _prev_close(days: dict[date, list[Bar]], ordered: list[date], i: int) -> int
 
 
 def backtest_symbol(con, symbol, name, start, end, *, mode="v2", **params) -> list[Trade]:
-    evaluator = _EVALUATORS[mode]
     days = _by_day(_load_bars(con, symbol))
     ordered = sorted(days)
+    if mode == "v4r":
+        # v4r 은 오버나이트 보유(멀티데이)라 day 단위 evaluator 계약을 쓰지 않고
+        # 심볼 단위 시뮬레이터로 처리. 기존 모드 경로는 아래 그대로 (불변).
+        return simulate_symbol_v4r(symbol, name, days, ordered, start, end, **params)
+    evaluator = _EVALUATORS[mode]
     trades: list[Trade] = []
     for i, d in enumerate(ordered):
         if not (start <= d <= end):
@@ -826,10 +1069,24 @@ def _report(trades: list[Trade]) -> None:
     print("-" * 80)
     print(f"트레이드 {n}건 | 승률 {len(wins)/n*100:.1f}% | 평균손익 {avg*100:+.2f}% "
           f"| 누적(복리) {(eq-1)*100:+.1f}% | MDD {mdd*100:.1f}%")
+    # 왕복 비용 0.25% 차감 후 (판정 기준: 추가 트레이드의 평균이 이 비용을 넘는가)
+    cost = 0.0025
+    eq_c, peak_c, mdd_c = 1.0, 1.0, 0.0
+    for t in trades:
+        eq_c *= (1 + t.ret - cost)
+        peak_c = max(peak_c, eq_c)
+        mdd_c = min(mdd_c, eq_c / peak_c - 1)
+    print(f"[비용 0.25%/왕복 차감 후] 평균 {(avg-cost)*100:+.2f}% "
+          f"| 누적 {(eq_c-1)*100:+.1f}% | MDD {mdd_c*100:.1f}%")
     by_reason = {}
     for t in trades:
         by_reason[t.reason] = by_reason.get(t.reason, 0) + 1
     print(f"청산 사유: " + ", ".join(f"{k} {v}" for k, v in sorted(by_reason.items())))
+    overnight = [t for t in trades if t.exit_day and t.exit_day != t.day]
+    if overnight:
+        avg_o = sum(t.ret for t in overnight) / len(overnight)
+        print(f"오버나이트 보유 {len(overnight)}건 (평균 {avg_o*100:+.2f}%, "
+              f"최장 {max((t.exit_day - t.day).days for t in overnight)}일)")
 
 
 def main() -> None:
@@ -840,10 +1097,11 @@ def main() -> None:
     ap.add_argument("--drop", type=float, default=3.0, help="[v1] 9:00~9:30 폭락 임계(퍼센트)")
     ap.add_argument("--tp", type=float, default=5.0, help="[v1] 익절(퍼센트)")
     ap.add_argument("--sl", type=float, default=3.0, help="[v1] 손절(퍼센트)")
-    ap.add_argument("--mode", choices=["v1", "v2", "v3", "v4", "acc"], default="v2",
+    ap.add_argument("--mode", choices=["v1", "v2", "v3", "v4", "v4r", "acc"], default="v2",
                     help="v1=눌림 무조건매수 / v2=지지+재폭등 돌파매수(기본) / "
                          "v3=진바닥 확인 후 무릎 진입(아카이브 근거) / "
-                         "v4=v3+선발대·바닥신호·거래량 조기청산(아카이브 조합) / "
+                         "v4=v3+선발대·바닥신호·거래량 조기청산(아카이브 조합, 폐기·보존) / "
+                         "v4r=v4재폭등: v2+국소기준선+재진입+애프터·오버나이트 / "
                          "acc=지지선 분할매집 지정가(형 실매매 방식)")
     ap.add_argument("--pullback-min", type=float, default=3.0, help="[v2/v3] 아침고점 대비 눌림 최소(퍼센트)")
     ap.add_argument("--support-tol", type=float, default=0.5, help="[v2/v3] 지지 이탈 허용(퍼센트)")
@@ -878,6 +1136,14 @@ def main() -> None:
                          "예 '1,0,-1'=지지+1%%/지지/지지-1%%")
     ap.add_argument("--trail", type=float, default=5.0,
                     help="[acc] 트레일링 스탑(첫 익절 후 고점 대비 퍼센트, 0=끄기)")
+    ap.add_argument("--max-entries", type=int, default=4,
+                    help="[v4r] 하루 최대 재진입 횟수(1=v2 유사 단발). 기본 4")
+    ap.add_argument("--aft-stop", type=float, default=3.0,
+                    help="[v4r] 애프터장 신규 진입 손절(퍼센트). 기본 3")
+    ap.add_argument("--no-after", action="store_true",
+                    help="[v4r/ablation] 애프터장 제외(탐색·청산 정규장까지)")
+    ap.add_argument("--no-winner-gate", action="store_true",
+                    help="[v4r/ablation] 승자 재공략 게이트 끄기(손절 후에도 재진입)")
     ap.add_argument("--top-n", type=int, default=0,
                     help="그날 강도(프리장 급등률) 상위 N종목만 진입. 0=전체(선별 안 함)")
     ap.add_argument("--codes", help="대상 종목코드 CSV (지정 시 이 종목만; 미지정이면 등록 전체)")
@@ -919,6 +1185,16 @@ def main() -> None:
                           vol_exit_ratio=args.vol_exit)
             rule += (f" / 선발대{args.scout_frac} / 꼬리≥{args.wick_min} / "
                      f"VOL청산{args.vol_exit}x")
+        if args.mode == "v4r":
+            params.update(max_entries=args.max_entries,
+                          aft_stop_pct=args.aft_stop / 100,
+                          use_after=not args.no_after,
+                          winner_gate=not args.no_winner_gate)
+            rule += (f" / 재진입≤{args.max_entries}"
+                     + ("" if args.no_winner_gate else " / 승자게이트")
+                     + ("" if args.no_after
+                        else f" / 애프터~20:00(진입SL-{args.aft_stop}%)")
+                     + " / 오버나이트")
         if args.mode == "acc":
             entry_bands = tuple(float(x) for x in args.entry_bands.split(",") if x.strip())
             if not entry_bands:
