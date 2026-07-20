@@ -48,6 +48,7 @@ class Trade:
     ret: float
     # v4r(오버나이트) 전용 — 기존 모드는 기본값 유지(생성부 불변)
     exit_day: date | None = None
+    entry_time: str = ""     # 진입 봉 ts ISO — 당일 재진입 구분(paper PK 유니크)
 
 
 # ---------------- 캐시 ----------------
@@ -837,7 +838,8 @@ def _v4r_close_trade(pos: dict, exit_day: date, *, forced_close: float | None = 
     entry = pos["entry"]
     return Trade(pos["symbol"], pos["name"], pos["entry_day"], pos["prev_close"],
                  pos["pre_high"], int(entry), int(round(exit_avg)), reason,
-                 (exit_avg - entry) / entry, exit_day=exit_day)
+                 (exit_avg - entry) / entry, exit_day=exit_day,
+                 entry_time=pos.get("entry_time", ""))
 
 
 def simulate_symbol_v4r(symbol: str, name: str, days: dict[date, list[Bar]],
@@ -908,6 +910,7 @@ def simulate_symbol_v4r(symbol: str, name: str, days: dict[date, list[Bar]],
                 use_stop = aft_stop_pct if is_aft else stop_pct   # 변경4
                 pos = {
                     "symbol": symbol, "name": name, "entry_day": d,
+                    "entry_time": b.ts.isoformat(),
                     "prev_close": prev_close_d, "pre_high": int(gate_high),
                     "entry": entry, "n": n_levels,
                     "tps": [entry * (1 + lv) for lv in tp_levels],

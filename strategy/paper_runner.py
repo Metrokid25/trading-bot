@@ -6,6 +6,8 @@
     v2_leader   — v2 + 주도섹터 필터(신호일 d-1 기준 최근 5거래일 수익률 1위 섹터만)
     gm_v3       — 멘토 룰엔진 R1~R12 (일봉 스윙, 다음날 시가 체결)
     gm_v3_r13 / gm_v3_r14 / gm_v3_r13r14 — Tier1 변형 축 (GM3_VARIANTS, 07-11)
+    v4r         — v4재폭등 관찰 축 (07-19): 국소 기준선+재진입+오버나이트,
+                  애프터 진입 제외(--no-after 상당). 채택 아님, forward 관찰 전용
     bench_bh    — 당일 등록 유니버스 동일가중 (시가→종가, 무비용 기준선)
 
 명시적 체결/비용 가정 (paper_meta 에 스탬프):
@@ -94,6 +96,11 @@ V2_PARAMS = dict(pre_surge=0.05, pullback_min=0.03, support_tol=0.005,
                  tp_levels=(0.05, 0.10, 0.15, 0.20, 0.25), stop_pct=0.04,
                  consol_bars=3)
 
+# v4r 관찰 축 (2026-07-19 오너 지시) — A/B 판정(PROJECT_HANDOFF 07-17)에서
+# 기각된 애프터장 진입을 뺀 정제형(--no-after 상당). 국소 기준선 + 재진입≤4 +
+# 승자 게이트 + 오버나이트 무기한. 채택 아님 — forward 관찰 전용.
+V4R_PARAMS = dict(**V2_PARAMS, max_entries=4, use_after=False, winner_gate=True)
+
 REGIME = "live_universe_v1"     # 2026-07-06 운영 전환(A안). 정의 변경 시 v2 로 올릴 것.
 
 ASSUMPTIONS = {
@@ -116,6 +123,13 @@ ASSUMPTIONS = {
     "gm3_universe": "리플레이 = 현재 유니버스 + 과거 제외 종목(제외일까지 act, "
                     "그 시점 EOR 동결) — 웹앱 제거로 과거 손실이 소멸하는 "
                     "생존편향 채널 차단",
+    "v4r": "관찰 축(채택 아님): v2+국소 스윙 기준선+재진입≤4+승자 게이트+"
+           "오버나이트 무기한, 애프터 진입 제외. 전체 리플레이 멱등, "
+           "removed 는 제거일까지. EOR 은 편도 비용·실청산 집계 제외 (gm_v3 동일). "
+           "한계: 분봉 캐시는 종목당 편입-12일부터라(ensure_day_cached lookback) "
+           "중도 편입 종목의 그 이전 구간은 리플레이에서 빠짐. opened_on 은 "
+           "진입 봉 ISO 시각(당일 재진입 PK 유니크). 축 도입 첫 기록일 day_ret "
+           "에는 paper_start 이후 소급 손익이 일괄 반영됨",
     "finalized": "finalized=1 행만 확정치(20:05 이후 또는 과거일 기록). "
                  "finalized=0 은 장중 임시 스냅샷 — 다음 기록 전 자동 재확정",
 }
@@ -337,6 +351,42 @@ def run_v2_for_day(day: date, universe) -> list[dict]:
                         "ret_net": t.ret - 2 * COST_PER_SIDE,
                         "entry": t.entry, "exit": t.exit,   # 알림용 진입/청산가
                         "reason": t.reason, "detail": t.reason})
+    cache.close()
+    return out
+
+
+def run_v4r_replay(paper_start: date, today: date, universe,
+                   removed: list[tuple[str, str, date]] = ()) -> list[dict]:
+    """v4r 전체 리플레이(결정적·멱등) — 오버나이트 멀티데이라 gm_v3 처럼
+    매일 [paper_start, act_to] 를 통째로 재계산한다.
+
+    removed = 과거 유니버스에 있었다 제거된 종목: 제거일까지만 시뮬레이션
+    (end=min(제거일, today)) — 웹앱 제거로 과거 손실이 소멸하는 생존편향 차단.
+    EOR(범위 끝 미청산 = 보유 중 MTM)은 gm_v3 와 동일하게 진입 비용(편도)만
+    차감하고 equity 에 반영, 실청산 집계에서는 제외한다.
+    """
+    cache = _cache_conn()
+    targets: dict[str, tuple[str, date]] = {}
+    for code, name, _sector in universe:
+        targets.setdefault(code, (name, today))
+    for code, name, last_day in removed:
+        targets.setdefault(code, (name, min(last_day, today)))
+    out: list[dict] = []
+    for code, (name, end_d) in targets.items():
+        trades = backtest_symbol(cache, code, name, paper_start, end_d,
+                                 mode="v4r", **V4R_PARAMS)
+        for t in trades:
+            eor = t.reason.endswith("EOR")
+            sides = 1 if eor else 2
+            # opened_on = 진입 봉 시각(ISO datetime) — 당일 재진입 트레이드가
+            # paper_trades PK(strategy,code,opened_on,closed_on)에서 서로
+            # 덮어쓰지 않게 유니크화 (리뷰 F1). 폴백은 진입일.
+            out.append({"code": code, "name": name, "eor": eor,
+                        "opened_on": t.entry_time or t.day,
+                        "closed_on": t.exit_day or t.day,
+                        "ret_gross": t.ret,
+                        "ret_net": t.ret - sides * COST_PER_SIDE,
+                        "detail": t.reason})   # EOR 은 reason 자체에 포함됨
     cache.close()
     return out
 
@@ -564,6 +614,7 @@ def record_day(day: date) -> dict:
         for strat, flags in GM3_VARIANTS
     }
     gm3_rows = gm3_by_strat["gm_v3"]     # 기존 소비자(알림 등)는 기본 축 유지
+    v4r_rows = run_v4r_replay(paper_start, day, universe, removed)
     b_ret, n_bench, n_excl = bench_day(con, day, universe)
 
     # 확정 판정: 과거일 기록이거나 20:05(애프터 종료+버퍼) 이후만 확정치 (리뷰 F2)
@@ -602,6 +653,21 @@ def record_day(day: date) -> dict:
         summary[strat] = {"closed_today": len(real_closed_today),
                           "open_positions": len(open_mtm), "equity": eq}
 
+    #    v4r 관찰 축 — gm_v3 와 동일한 전체 리플레이 재기록(멱등)
+    con.execute("DELETE FROM paper_trades WHERE strategy='v4r'")
+    _upsert_trades(con, "v4r", v4r_rows, now_iso)
+    v4r_closed_today = [r for r in v4r_rows
+                        if not r["eor"] and str(r["closed_on"]) == day.isoformat()]
+    v4r_open = [r for r in v4r_rows if r["eor"]]
+    eq_v = _serial_equity(con, "v4r", day)
+    prev_eq_v = _prev_equity(con, "v4r", day)
+    _upsert_daily(con, day, "v4r", len(v4r_closed_today),
+                  eq_v / prev_eq_v - 1 if prev_eq_v else 0.0, eq_v,
+                  f"open_mtm={len(v4r_open)},removed={len(removed)}",
+                  now_iso, finalized)
+    summary["v4r"] = {"closed_today": len(v4r_closed_today),
+                      "open_positions": len(v4r_open), "equity": eq_v}
+
     #    벤치마크 — 당일 유니버스 일수익을 직전 레짐 equity 에 체인
     eq_b = _prev_equity(con, "bench_bh", day) * (1 + b_ret)
     _upsert_daily(con, day, "bench_bh", n_bench, b_ret, eq_b,
@@ -610,7 +676,7 @@ def record_day(day: date) -> dict:
                            "stocks": n_bench, "excluded": n_excl}
 
     # 4) 알파(초과수익) 스냅샷
-    for strat in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS)):
+    for strat in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
         summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_b
     summary["finalized"] = finalized
 
@@ -690,7 +756,7 @@ def report() -> None:
         bench = rows.get("bench_bh")
         if bench:
             print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
-            for s in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS)):
+            for s in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
                 if s in rows:
                     print(f"  {s:<13} {fmt_outperf(rows[s], bench)}")
     con.close()

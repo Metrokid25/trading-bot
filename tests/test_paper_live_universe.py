@@ -172,6 +172,61 @@ def test_bench_all_missing_returns_zero(bench_con, fake_daily_cache):
     assert (day_ret, n, excluded) == (0.0, 0, 1)
 
 
+# ---------------- v4r 관찰 축 (2026-07-19) ----------------
+
+def test_run_v4r_replay_wiring(monkeypatch):
+    """run_v4r_replay: dict 변환·EOR 비용(편도)·removed 종목 end 캡 검증."""
+    from backtest.run_premarket_pullback import Trade as BTrade
+
+    calls: list[tuple] = []
+
+    def fake_backtest_symbol(cache, code, name, start, end, *, mode, **params):
+        calls.append((code, start, end, mode))
+        if code == "AAA":
+            return [
+                BTrade("AAA", name, date(2026, 7, 7), 100, 110, 1000, 1050,
+                       "2TP/BE", 0.05, exit_day=date(2026, 7, 8)),
+                BTrade("AAA", name, date(2026, 7, 9), 100, 110, 1000, 1010,
+                       "1TP/EOR", 0.01, exit_day=date(2026, 7, 10)),
+                # 당일 재진입 2건 — 같은 (code, 진입일, 청산일)이지만
+                # entry_time 으로 PK 유니크 (리뷰 F1)
+                BTrade("AAA", name, date(2026, 7, 10), 100, 110, 1000, 1050,
+                       "1TP/BE", 0.05, exit_day=date(2026, 7, 10),
+                       entry_time="2026-07-10T09:30:00+09:00"),
+                BTrade("AAA", name, date(2026, 7, 10), 100, 110, 1020, 980,
+                       "0TP/SL", -0.04, exit_day=date(2026, 7, 10),
+                       entry_time="2026-07-10T11:00:00+09:00"),
+            ]
+        return []
+
+    monkeypatch.setattr(paper_runner, "backtest_symbol", fake_backtest_symbol)
+    monkeypatch.setattr(paper_runner, "_cache_conn", lambda: type(
+        "C", (), {"close": lambda self: None})())
+
+    uni = [("AAA", "에이", "섹터1"), ("BBB", "비", "섹터2")]
+    removed = [("CCC", "씨", date(2026, 7, 8))]
+    rows = paper_runner.run_v4r_replay(date(2026, 7, 6), date(2026, 7, 10),
+                                       uni, removed)
+
+    # 호출: 현재 유니버스는 end=today, removed 는 end=제거일 캡
+    ends = {c: e for c, _s, e, _m in calls}
+    assert ends["AAA"] == date(2026, 7, 10)
+    assert ends["CCC"] == date(2026, 7, 8)
+    assert all(m == "v4r" for _c, _s, _e, m in calls)
+
+    real = [r for r in rows if not r["eor"]]
+    eor = [r for r in rows if r["eor"]]
+    assert len(real) == 3 and len(eor) == 1
+    # 실청산 = 왕복 비용, EOR = 편도 비용 (gm_v3 동일 규약)
+    assert real[0]["ret_net"] == pytest.approx(0.05 - 2 * paper_runner.COST_PER_SIDE)
+    assert eor[0]["ret_net"] == pytest.approx(0.01 - 1 * paper_runner.COST_PER_SIDE)
+    assert real[0]["closed_on"] == date(2026, 7, 8)   # exit_day 사용(오버나이트)
+    assert eor[0]["detail"].endswith("EOR")           # 알림 EOR 필터와 호환
+    # 당일 재진입 2건: PK 키(code, opened_on, closed_on)가 서로 달라야 함 (F1)
+    keys = {(r["code"], str(r["opened_on"]), str(r["closed_on"])) for r in rows}
+    assert len(keys) == len(rows)
+
+
 # ---------------- gm_v3 변형 축 (GM3_VARIANTS, 2026-07-11) ----------------
 
 def test_gm3_replay_cfg_variant_changes_result(monkeypatch):

@@ -139,6 +139,7 @@ _STRAT_LABEL = {
     "gm_v3_r13": "gm_v3+R13",
     "gm_v3_r14": "gm_v3+R14",
     "gm_v3_r13r14": "gm_v3+R13R14",
+    "v4r": "v4r (재폭등·관찰)",
 }
 
 _WEEKDAY_KR = "월화수목금토일"
