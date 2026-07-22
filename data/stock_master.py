@@ -17,7 +17,9 @@ from loguru import logger
 
 from config import settings
 
-_CODE_RE = re.compile(r"^\d{6}$")
+# KRX 신형 단축코드는 숫자 4자리 + 영문/숫자 1자리 + 숫자 1자리 형식도 사용한다.
+# 예: SOL AI반도체TOP2플러스 0167A0. 기존 숫자 6자리도 같은 패턴에 포함된다.
+_CODE_RE = re.compile(r"^\d{4}[0-9A-Z]\d$")
 _ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.DOTALL)
 _TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -27,11 +29,11 @@ _KIS_KOSPI_MASTER_URL = (
 )
 _KIS_MASTER_TAIL_LEN = 228
 _ETF_GROUP_CODE = "EF"
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 
 class StockMaster:
-    """한글/영문 종목명 ↔ 6자리 종목코드 조회."""
+    """한글/영문 종목명 ↔ 6자리 영숫자 종목코드 조회."""
 
     def __init__(self, cache_path: Path | None = None) -> None:
         self._by_name: dict[str, str] = {}  # normalized name → code
@@ -42,6 +44,7 @@ class StockMaster:
         self._refresh_lock = asyncio.Lock()
         self._load_task_lock = asyncio.Lock()
         self._load_task: asyncio.Task[int] | None = None
+        self._cache_version: int | None = None
         self._loaded = False
         self._load_disk()
 
@@ -54,13 +57,14 @@ class StockMaster:
             return
         try:
             data = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            self._cache_version = data.get("version")
             self._by_code = data.get("by_code", {})
             saved_types = data.get("types", {})
             self._types = {
                 code: saved_types.get(code, "stock") for code in self._by_code
             }
             self._by_name = {self._norm(n): c for c, n in self._by_code.items()}
-            self._loaded = bool(self._by_code) and data.get("version") == _CACHE_VERSION
+            self._loaded = bool(self._by_code) and self._cache_version == _CACHE_VERSION
             suffix = "" if self._loaded else " (구버전 — 첫 검색 시 갱신)"
             logger.info(f"[StockMaster] 캐시 로드: {len(self._by_code)}종목{suffix}")
         except Exception as e:
@@ -80,6 +84,7 @@ class StockMaster:
                 ),
                 encoding="utf-8",
             )
+            self._cache_version = _CACHE_VERSION
         except Exception as e:
             logger.warning(f"[StockMaster] 캐시 저장 실패: {e}")
 
@@ -127,9 +132,14 @@ class StockMaster:
             for code, name in self._by_code.items()
             if self._types.get(code) == "etf"
         }
+        etf_source_ok = etfs is not None
         if etfs is None:
             etfs = cached_etfs
-        cache_complete = bool(etfs)
+        # 최신 캐시의 ETF는 원본 장애 때 완전본으로 재사용할 수 있다. 하지만 구형
+        # 캐시는 영문 혼합 ETF가 빠져 있으므로 v3로 승격하지 않고 다음 요청에서 재시도.
+        cache_complete = bool(etfs) and (
+            etf_source_ok or self._cache_version == _CACHE_VERSION
+        )
         by_code = {**stocks, **etfs}
         async with self._lock:
             self._by_code = by_code
@@ -139,7 +149,7 @@ class StockMaster:
             }
             self._by_name = {self._norm(n): c for c, n in by_code.items()}
             self._loaded = cache_complete
-            # 최초 ETF 수신 실패를 정상 v2 캐시로 굳히지 않는다. 메모리의 주식
+            # 최초 ETF 수신 실패를 정상 최신 캐시로 굳히지 않는다. 메모리의 주식
             # 검색은 허용하되 다음 검색에서 ETF 다운로드를 다시 시도한다.
             if cache_complete:
                 self._save_disk()
@@ -217,15 +227,16 @@ class StockMaster:
     async def resolve(self, query: str) -> tuple[str, str] | None:
         """입력을 (code, name)으로 해석. 실패 시 None.
 
-        - 6자리 숫자: 코드로 간주
+        - 6자리 KRX 영숫자 단축코드: 코드로 간주
         - 그 외: 이름 정확 일치 → 부분 일치 1건 우선
         """
         q = query.strip()
         if not q:
             return None
-        if _CODE_RE.match(q):
+        code_query = q.upper()
+        if _CODE_RE.match(code_query):
             await self._ensure_loaded()
-            return q, self._by_code.get(q, "")
+            return code_query, self._by_code.get(code_query, "")
 
         await self._ensure_loaded()
         key = self._norm(q)
@@ -253,9 +264,10 @@ class StockMaster:
         q = query.strip()
         if not q:
             return []
-        if _CODE_RE.match(q):
-            name = self._by_code.get(q)
-            return [(q, name)] if name else []
+        code_query = q.upper()
+        if _CODE_RE.match(code_query):
+            name = self._by_code.get(code_query)
+            return [(code_query, name)] if name else []
         return self._partial(self._norm(q), limit=limit)
 
     async def close(self) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
+import re
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -60,8 +61,9 @@ async def fetch_daily_candles_for_pick(
         - lookback_days=20이면 pick_date 포함 21일치 범위 요청
           (캘린더 일수 기준, KIS는 거래일만 반환하므로 실제 응답 수는 더 적음).
     """
-    if not ticker or not ticker.isdigit() or len(ticker) != 6:
-        raise ValueError(f"ticker must be 6-digit numeric string: {ticker!r}")
+    if not ticker or re.fullmatch(r"\d{4}[0-9A-Z]\d", ticker.upper()) is None:
+        raise ValueError(f"ticker must be 6-character KRX code: {ticker!r}")
+    ticker = ticker.upper()
 
     if lookback_days < 0:
         raise ValueError(f"lookback_days must be >= 0, got {lookback_days}")

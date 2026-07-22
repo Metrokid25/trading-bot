@@ -1,0 +1,228 @@
+트레이딩봇 전담 개발자 인수인계
+작성 기준: 2026-07-22 12:41 KST
+프로젝트 경로: C:\trading-bot
+
+이 파일의 목적
+================
+새 담당자가 기존 대화 요약이나 오래된 문서에 끌려가지 않고, 현재 코드와 운영
+상태를 안전하게 이어받도록 만든 단일 인수인계서다. 이 문서도 맹신하지 말고
+착수할 때마다 git, 실제 코드, 실행 결과로 재확인한다. 추측은 반드시 "추측"이라고
+표시한다.
+
+
+1. 지금 가장 중요한 상태
+========================
+- 현재 작업 브랜치: fix/alphanumeric-etf-codes (origin/main 기준 분기)
+- 영문 혼합 ETF 지원 변경은 아직 미커밋·미배포
+- 최신 커밋: 52978b9 docs: record ETF web rollout status
+- 기능 커밋: 813d78e feat: support ETF registration and mobile web UI
+- 전체 테스트: 397 passed, 기존 경고 1건
+- 독립 코드 재리뷰: 추가 결함 없음, 승인 가능 판정
+- ETF/모바일 웹앱 코드는 main과 origin/main에 반영됐지만 미니PC에는 아직 미배포다.
+- 현재 서비스 http://100.100.141.24:8000 은 미니PC pull 및 uvicorn 재기동 전까지
+  구버전일 수 있다.
+- 이 인수인계서를 작성한 PC가 미니PC인지 확인하지 않았으므로, 여기서는 paper.db
+  기록이나 상주 프로세스 조작을 하지 않았다.
+
+즉시 이어서 할 일:
+  장 마감 후 미니PC에서 main을 pull하고, 웹앱 uvicorn만 WMI로 재기동한 뒤
+  069500/KODEX 200 검색과 모바일 화면을 스모크 테스트한다.
+
+
+2. 프로젝트 목적
+================
+- 투자 멘토의 매매 규율을 코드로 기계화한 KOSPI/KOSDAQ 자동매매 연구 프로젝트다.
+- 현재 목표는 실전 주문이 아니라 forward 모의투자 데이터 축적과 벤치마크 대비
+  초과수익 검증이다.
+- 오너와 동료가 미니PC 웹앱으로 매일 관심 종목을 등록하고, 페이퍼 전략들이 같은
+  유니버스를 병행 기록한다.
+- 최소 20거래일 forward 이후에 알파를 판정한다. 알파가 없다는 결론도 유효하다.
+
+
+3. 절대 규칙
+============
+1) 오너의 별도 명시 승인 없이는 실전 주문 경로를 절대 활성화하지 않는다.
+2) 성과는 절대손익만 보고하지 말고 항상 벤치마크 대비 초과수익을 병기한다.
+3) paper.db 기록은 지정 미니PC 한 대에서만 실행한다.
+4) 각 컴포넌트는 자기 DB에만 쓴다. 외부 mentor.db는 읽기 전용이다.
+5) 커밋과 push는 오너 승인 후에만 한다. Co-Authored-By를 넣지 않는다.
+6) 장중 08:00~16:00에는 코드 반영을 위한 상주 프로세스 재기동을 하지 않는다.
+   죽은 프로세스를 살리는 장애 복구만 예외다.
+7) 상주 프로세스는 Start-Process로 띄우지 않는다. 반드시 WMI 또는 시작프로그램
+   VBS로 기동한다. Start-Process는 AI 앱 종료/업데이트 때 같이 죽는 원인이었다.
+8) force push와 git reset --hard를 사용하지 않는다.
+
+
+4. 미니PC 상주 3프로세스
+========================
+1) main_tracker.py
+   - 매일 16:00 Phase2.5 데이터 수집
+2) python -m strategy.paper_runner --market-schedule
+   - 페이퍼 전략 기록 및 20:05 이후 확정/알림
+3) uvicorn webapp.server:app --host 0.0.0.0 --port 8000
+   - Tailscale 전용 종목 등록 웹앱
+
+생존 확인:
+  Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -like '*trading-bot*' } |
+    Select-Object ProcessId, ParentProcessId, CommandLine
+
+기동 원칙:
+  Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments `
+    @{CommandLine='C:\trading-bot\.venv\Scripts\python.exe -m uvicorn webapp.server:app --host 0.0.0.0 --port 8000'; CurrentDirectory='C:\trading-bot'}
+
+주의:
+- 코드 반영 재시작은 장 마감 후에 한다.
+- ETF 웹앱 배포 때는 tracker와 paper_runner를 끊지 말고 uvicorn만 교체한다.
+- WEB_SHARED_KEY 값은 미니PC .env에만 있으며 문서나 로그에 출력하지 않는다.
+
+
+5. ETF/모바일 웹앱 변경 내용
+===========================
+문제 원인:
+- 기존 StockMaster는 KRX 상장법인 목록만 사용해서 ETF가 검색 마스터에 없었다.
+- 미니PC 구버전에서 069500 및 KODEX 200 검색 결과 0건을 실제 재현했다.
+- KIS 시세와 일봉 API는 069500을 정상 처리했으므로 검색 마스터 문제였다.
+
+해결 내용:
+- KRX KOSPI/KOSDAQ 주식과 KIS 공식 kospi_code.mst의 EF 그룹 ETF를 병합한다.
+- 실제 마스터 기준 주식 2,599개 + ETF 1,143개(영문 혼합 279개) = 총 3,742개를 확인했다.
+- 캐시 v3에 stock/etf 유형을 저장하고 구버전 캐시는 첫 검색에서 갱신한다.
+- ETF 소스 장애 시 기존 ETF 캐시를 보존한다.
+- 동시 최초 검색은 정상/장애 모두 하나의 갱신 Task를 공유한다.
+- /api/search와 /api/picks에 type=stock|etf를 추가했다.
+- ETF 검색 결과, 선택 칩, 등록 현황에 ETF 배지를 표시한다.
+- 1440px 이하 레이아웃을 정리하고 640px 이하에서는 종목표를 모바일 카드형으로
+  바꿨다. 390px 테스트에서 viewport 375px, scrollWidth 375px로 가로 넘침이 없다.
+- 섹터 필터, 모두/개별 접기, 등록 설정 접기, 검색 0건/오류 안내를 추가했다.
+- 실제 이름이 all인 섹터도 전체 보기와 충돌하지 않는다.
+- 자동완성은 버튼, 방향키, Enter, Escape, ARIA를 지원한다.
+- 새로고침으로 canvas DOM이 교체돼도 캐시된 미니차트를 즉시 다시 그린다.
+- 검색 장애 후 이전의 숨은 결과를 키보드로 선택할 수 없도록 상태를 초기화한다.
+
+핵심 파일:
+- data/stock_master.py
+- webapp/server.py
+- webapp/static/index.html
+- tests/test_stock_master.py
+- tests/test_webapp.py
+
+
+6. 미니PC 배포 절차
+===================
+반드시 장 마감 후 실행한다.
+
+1) 저장소 확인
+  cd C:\trading-bot
+  git fetch origin
+  git status --short --branch
+
+2) 로컬 변경이 없고 behind인 경우에만 fast-forward pull
+  git pull --ff-only origin main
+
+3) 테스트
+  $env:PYTHONUTF8='1'
+  $env:PYTHONIOENCODING='utf-8'
+  .venv\Scripts\python.exe -m pytest tests\ -q
+  기대값: 397 passed, 기존 pandas_market_calendars 경고 1건
+
+4) 기존 uvicorn PID를 정확히 확인하고 웹앱만 종료
+  Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -like '*uvicorn webapp.server:app*' } |
+    Select-Object ProcessId, ParentProcessId, CommandLine
+
+5) 확인한 uvicorn PID만 Stop-Process로 종료
+   tracker와 paper_runner는 종료하지 않는다.
+
+6) 위 4절의 Invoke-CimMethod Win32_Process Create 명령으로 uvicorn 기동
+   Start-Process 사용 금지.
+
+7) 새 프로세스의 ParentProcessId가 WmiPrvSE 계열인지 확인하고 포트 8000 확인
+  Get-NetTCPConnection -LocalPort 8000 -State Listen
+
+8) 스모크 테스트
+  - GET / 가 200인지 확인
+  - GET /api/search?q=069500 결과에 code=069500, name=KODEX 200, type=etf 확인
+  - GET /api/search?q=KODEX%20200에서도 ETF 검색 확인
+  - 기존 등록 현황과 시세가 정상인지 확인
+  - 모바일 390px 전후에서 가로 스크롤이 없는지 확인
+  - 변경 API를 시험할 경우 WEB_SHARED_KEY를 출력하지 말고 테스트 데이터는 즉시 삭제
+
+첫 ETF 검색은 구버전 캐시를 v3로 갱신하면서 외부 마스터를 내려받아 평소보다 늦을 수
+있다. 실패하면 추측하지 말고 미니PC 로그, stock_master.json version/types,
+KIS ETF 마스터 응답을 실제 확인한다.
+
+
+7. 페이퍼 전략 현황
+===================
+- v2: 당일치기 주력 비교축
+- v2_leader: 주도섹터만 거래하는 핵심 비교축
+- gm_v3 및 r13/r14/r13r14 변형축
+- v4r: 재폭등 관찰축이며 채택 전략이 아니다. 초기 forward 성과가 약세장 손실
+  패턴을 재현 중이므로 데이터를 그대로 관찰한다.
+- bench_bh: 같은 유니버스 동일가중 무비용 벤치마크
+
+main.py의 라이브 주문 엔진은 현재 전략과 무관한 구식 스택이다. 켜지 않는다.
+
+페이퍼 현황 확인(미니PC에서만):
+  $env:PYTHONUTF8='1'
+  $env:PYTHONIOENCODING='utf-8'
+  .venv\Scripts\python.exe -m strategy.paper_runner --report
+
+
+8. 작업 절차
+============
+1) 세션 시작마다 git fetch origin 및 git status. behind면 먼저 pull.
+2) HANDOFF_트레이딩봇_담당자.txt 전체를 읽는다.
+3) PROJECT_HANDOFF.md 최신 3~4개 섹션으로 시간순 맥락을 확인한다.
+4) 미니PC라면 상주 3프로세스와 --report를 실측한다.
+5) 비자명 변경은 별도 브랜치에서 작업한다.
+6) 커밋 전 독립 리뷰어를 두고 실제 결함을 수정한다.
+7) 테스트는 저장소 루트가 아니라 tests\ 디렉터리만 실행한다.
+8) 완료 후 PROJECT_HANDOFF.md와 필요한 .claude-memory 문서를 갱신한다.
+9) 오너 승인 후 main fast-forward 및 push한다.
+
+오너 표준 호출 문구:
+  "미니PC에서 작업끝났으니 깃pull 해"
+
+이 문구를 받으면 단순 pull만 하지 않는다. HANDOFF_AI작업자.md의 "오너 표준 호출
+문구" 절차에 따라 fetch/status → ff-only pull → 최신 인수인계 재독 → tests\ 전체
+테스트 → 상주 3프로세스와 --report 확인 → 장 마감 후 필요한 프로세스만 WMI 재기동
+→ 스모크 테스트까지 수행한다. 장중이면 재기동만 보류하고 남은 절차를 보고한다.
+
+
+9. 자주 밟는 함정
+=================
+- LF/CRLF 차이만 있는 파일을 기능 변경에 섞지 않는다. git diff --check와
+  git diff --numstat로 확인한다.
+- KRX 달력상 거래일이어도 실제 봉이 0개인 날이 있다. 데이터 0건 스킵이 정상이다.
+- KIS 분봉 API는 간헐적으로 500을 반환한다. 반복 재시도 또는 토스 백필이 가능하다.
+- paper_trades의 당일 다회 진입은 opened_on에 진입 봉 ISO 시각이 필요하다.
+- 웹픽과 trading.db는 미니PC 로컬 데이터다. 다른 PC에서 등록해도 미니PC로
+  자동 전달되지 않는다. 실제 픽은 미니PC 웹앱으로 등록한다.
+- 현재 HANDOFF_AI작업자.md 상단 기준 커밋과 테스트 수는 오래됐다. 운영 헌장은
+  유효하지만 최신 Git/테스트/웹앱 상태는 이 파일과 실제 저장소를 우선한다.
+
+
+10. 다음 작업 후보
+==================
+우선순위는 오너에게 확인한 뒤 착수한다.
+1) ETF/모바일 웹앱을 미니PC에 장 마감 후 배포하고 스모크 테스트
+2) forward 관측: 상주 3프로세스, --report, 알림 확인
+3) v4r 레짐 필터 연구
+4) 부분 분봉 캐시를 완전 데이터로 오인하는 고착 문제 근본 수정
+5) 보조 워치독 검토
+6) 20거래일 이후 벤치마크 대비 1차 알파 판정
+
+
+11. 새 담당자의 첫 보고 형식
+===========================
+- 현재 브랜치와 origin 대비 ahead/behind
+- 현재 HEAD 커밋
+- 미니PC 여부
+- 미니PC라면 상주 3프로세스 PID/부모/명령행과 --report 실제 출력 요약
+- ETF 웹앱 배포 여부와 069500 검색 실제 결과
+- 추측과 실측을 구분
+- 다음에 할 작업과 그 이유
+
+끝.

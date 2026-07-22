@@ -106,6 +106,18 @@ async def test_fetch_invalid_ticker(bad_ticker):
 
 
 @pytest.mark.asyncio
+async def test_fetch_accepts_alphanumeric_krx_ticker():
+    client = _mock_client([])
+
+    result = await fetch_daily_candles_for_pick(client, "0167a0", "2026-05-06")
+
+    assert result == []
+    client.get_daily_candles.assert_awaited_once_with(
+        "0167A0", "20260506", "20260526", period="D"
+    )
+
+
+@pytest.mark.asyncio
 async def test_fetch_negative_lookback():
     """lookback_days < 0 → ValueError."""
     client = _mock_client([])

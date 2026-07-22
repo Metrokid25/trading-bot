@@ -201,7 +201,7 @@ async def search(
     limit: int = 8,
     master: StockMaster = Depends(get_master),
 ) -> list[dict]:
-    """종목 자동완성 후보. q는 한글/영문/6자리 코드."""
+    """종목 자동완성 후보. q는 한글/영문/6자리 KRX 영숫자 코드."""
     results = await master.search(q, limit=limit)
     return [
         {"code": code, "name": name, "type": master.instrument_type(code)}

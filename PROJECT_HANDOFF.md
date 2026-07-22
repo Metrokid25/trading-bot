@@ -1485,3 +1485,19 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 검증: `pytest tests/ -q` → **393 passed, 1 existing warning**.
 - 상태: `813d78e`로 `main` 커밋·push 완료. 미니PC는 아직 미배포이며, 장중 상주를
   끊지 말고 장 마감 후 pull한 뒤 웹앱을 반드시 WMI로 재기동.
+
+---
+
+## 2026-07-22 영문 혼합 신형 ETF 코드 지원 (배포 대기)
+
+- 추가 재현: `SOL AI반도체TOP2플러스 (0167A0)`가 검색되지 않음. 운용사 공식
+  페이지와 KIS `kospi_code.mst`에서 코드/이름/ETF 그룹(`EF`)을 확인했다.
+- 원인: 종목코드 검증이 `숫자 6자리`만 허용해 `숫자4+영문1+숫자1` 신형 코드를
+  파서에서 제외. 실제 KIS 마스터에 같은 형식 ETF가 **279개** 존재했다.
+- 수정: KRX 단축코드 패턴 `\\d{4}[0-9A-Z]\\d`, 소문자 입력 대문자 정규화,
+  StockMaster 파싱·검색·resolve와 일봉 수집 검증을 함께 지원. 캐시를 v3로 올려
+  미니PC의 기존 v2 캐시도 첫 검색에서 강제 갱신한다.
+- 실측: ETF 1,143개(영문 혼합 279개), `0167A0 → SOL AI반도체TOP2플러스`,
+  운영 KIS 경로 시세 정상·일봉 82개, 로컬 웹 검색/ETF 배지/등록 현황까지 확인.
+- 검증: `pytest tests/ -q` → **397 passed, 1 existing warning**.
+  브랜치 `fix/alphanumeric-etf-codes`, 미커밋·미배포.

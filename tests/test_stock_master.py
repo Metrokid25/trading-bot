@@ -28,11 +28,13 @@ def test_parse_kis_master_includes_only_etf_group():
         _master_row("005930", "삼성전자", "ST"),
         _master_row("069500", "KODEX 200", "EF"),
         _master_row("229200", "KODEX 코스닥150", "EF"),
+        _master_row("0167A0", "SOL AI반도체TOP2플러스", "EF"),
     )
 
     assert StockMaster._parse_kis_etf_master(payload) == {
         "069500": "KODEX 200",
         "229200": "KODEX 코스닥150",
+        "0167A0": "SOL AI반도체TOP2플러스",
     }
 
 
@@ -41,7 +43,10 @@ async def test_refresh_merges_stocks_and_etfs(tmp_path, monkeypatch):
     stock_html = """
     <tr><td>삼성전자</td><td>유가</td><td>005930</td></tr>
     """
-    etf_zip = _master_zip(_master_row("069500", "KODEX 200", "EF"))
+    etf_zip = _master_zip(
+        _master_row("069500", "KODEX 200", "EF"),
+        _master_row("0167A0", "SOL AI반도체TOP2플러스", "EF"),
+    )
 
     async def fake_get(_client, url, **_kwargs):
         if url.endswith("kospi_code.mst.zip"):
@@ -53,14 +58,87 @@ async def test_refresh_merges_stocks_and_etfs(tmp_path, monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     master = StockMaster(tmp_path / "master.json")
 
-    assert await master.refresh() == 2
+    assert await master.refresh() == 3
     assert await master.search("KODEX") == [("069500", "KODEX 200")]
+    assert await master.search("0167a0") == [("0167A0", "SOL AI반도체TOP2플러스")]
     assert master.instrument_type("069500") == "etf"
+    assert master.instrument_type("0167A0") == "etf"
     assert master.instrument_type("005930") == "stock"
 
     saved = json.loads((tmp_path / "master.json").read_text(encoding="utf-8"))
-    assert saved["version"] == 2
+    assert saved["version"] == 3
     assert saved["types"]["069500"] == "etf"
+    assert saved["types"]["0167A0"] == "etf"
+
+
+@pytest.mark.asyncio
+async def test_v2_cache_refreshes_to_include_alphanumeric_etf(tmp_path, monkeypatch):
+    cache = tmp_path / "master.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "by_code": {"005930": "삼성전자", "069500": "KODEX 200"},
+                "types": {"005930": "stock", "069500": "etf"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    stock_html = "<tr><td>삼성전자</td><td>유가</td><td>005930</td></tr>"
+    etf_zip = _master_zip(
+        _master_row("069500", "KODEX 200", "EF"),
+        _master_row("0167A0", "SOL AI반도체TOP2플러스", "EF"),
+    )
+
+    async def fake_get(_client, url, **_kwargs):
+        if url.endswith("kospi_code.mst.zip"):
+            return httpx.Response(200, content=etf_zip, request=httpx.Request("GET", url))
+        return httpx.Response(
+            200, content=stock_html.encode("euc-kr"), request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    master = StockMaster(cache)
+
+    assert master._loaded is False
+    assert await master.search("0167A0") == [
+        ("0167A0", "SOL AI반도체TOP2플러스")
+    ]
+    saved = json.loads(cache.read_text(encoding="utf-8"))
+    assert saved["version"] == 3
+    assert saved["types"]["0167A0"] == "etf"
+
+
+@pytest.mark.asyncio
+async def test_v2_cache_is_not_promoted_when_etf_refresh_fails(tmp_path, monkeypatch):
+    cache = tmp_path / "master.json"
+    original = {
+        "version": 2,
+        "by_code": {"005930": "삼성전자", "069500": "KODEX 200"},
+        "types": {"005930": "stock", "069500": "etf"},
+    }
+    cache.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+    stock_html = "<tr><td>삼성전자</td><td>유가</td><td>005930</td></tr>"
+    calls: list[str] = []
+
+    async def fake_get(_client, url, **_kwargs):
+        calls.append(url)
+        if url.endswith("kospi_code.mst.zip"):
+            raise httpx.ConnectError("ETF source offline")
+        return httpx.Response(
+            200, content=stock_html.encode("euc-kr"), request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    master = StockMaster(cache)
+
+    assert await master.search("0167A0") == []
+    assert master._loaded is False
+    assert json.loads(cache.read_text(encoding="utf-8")) == original
+
+    assert await master.search("0167A0") == []
+    assert len(calls) == 6  # 새 요청에서 KRX 2개 + KIS ETF를 다시 시도
 
 
 @pytest.mark.asyncio
@@ -69,7 +147,7 @@ async def test_refresh_keeps_cached_etf_when_etf_download_fails(tmp_path, monkey
     cache.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "by_code": {"069500": "KODEX 200"},
                 "types": {"069500": "etf"},
             },
@@ -121,7 +199,7 @@ async def test_partial_krx_failure_does_not_replace_existing_master(tmp_path, mo
     cache.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "by_code": {"005930": "삼성전자", "035720": "카카오", "069500": "KODEX 200"},
                 "types": {"005930": "stock", "035720": "stock", "069500": "etf"},
             },

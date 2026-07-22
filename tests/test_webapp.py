@@ -134,6 +134,7 @@ class FakeMaster:
         "000660": "SK하이닉스",
         "042700": "한미반도체",
         "069500": "KODEX 200",
+        "0167A0": "SOL AI반도체TOP2플러스",
     }
 
     def __init__(self):
@@ -145,7 +146,7 @@ class FakeMaster:
         self.loaded = True
 
     def instrument_type(self, code: str):
-        return "etf" if self.loaded and code == "069500" else "stock"
+        return "etf" if self.loaded and code in {"069500", "0167A0"} else "stock"
 
     async def search(self, query: str, limit: int = 8):
         await self.ensure_loaded()
@@ -228,6 +229,25 @@ async def test_search_and_register_etf(client):
     picks = (await client.get("/api/picks")).json()
     etf = next(s for p in picks for s in p["stocks"] if s["code"] == "069500")
     assert etf["name"] == "KODEX 200"
+    assert etf["type"] == "etf"
+
+
+@pytest.mark.asyncio
+async def test_search_and_register_alphanumeric_etf(client):
+    search = await client.get("/api/search", params={"q": "0167A0"})
+    assert search.status_code == 200
+    assert search.json() == [
+        {"code": "0167A0", "name": "SOL AI반도체TOP2플러스", "type": "etf"}
+    ]
+
+    registered = await client.post(
+        "/api/picks",
+        json={"sector_name": "AI반도체ETF", "stocks": [{"code": "0167A0"}]},
+    )
+    assert registered.status_code == 200
+    picks = (await client.get("/api/picks")).json()
+    etf = next(s for p in picks for s in p["stocks"] if s["code"] == "0167A0")
+    assert etf["name"] == "SOL AI반도체TOP2플러스"
     assert etf["type"] == "etf"
 
 

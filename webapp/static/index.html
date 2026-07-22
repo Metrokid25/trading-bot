@@ -487,7 +487,7 @@ async function doSearch(q){
 }
 function renderDropdown(){
   if (!lastResults.length){
-    $("dropdown").innerHTML = `<div class="dd-empty"><b>${esc(lastQuery)}</b> 검색 결과가 없습니다.<br>ETF는 종목명 또는 6자리 코드를 확인해 주세요.</div>`;
+    $("dropdown").innerHTML = `<div class="dd-empty"><b>${esc(lastQuery)}</b> 검색 결과가 없습니다.<br>ETF는 종목명 또는 6자리 영숫자 코드를 확인해 주세요.</div>`;
     $("dropdown").style.display="block";
     $("search").setAttribute("aria-expanded", "true");
     $("search").removeAttribute("aria-activedescendant");
