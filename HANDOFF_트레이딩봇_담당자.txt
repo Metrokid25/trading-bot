@@ -12,10 +12,10 @@
 
 1. 지금 가장 중요한 상태
 ========================
-- 현재 작업 브랜치: fix/alphanumeric-etf-codes (origin/main 기준 분기)
-- 영문 혼합 ETF 지원 변경은 아직 미커밋·미배포
-- 최신 커밋: 52978b9 docs: record ETF web rollout status
-- 기능 커밋: 813d78e feat: support ETF registration and mobile web UI
+- 현재 Git 브랜치: main
+- origin/main에 영문 혼합 ETF 지원 기능 커밋 1fb64af push 완료
+- ETF/모바일 UI 기반 기능 커밋: 813d78e
+- 영문 혼합 ETF 후속 기능 커밋: 1fb64af
 - 전체 테스트: 397 passed, 기존 경고 1건
 - 독립 코드 재리뷰: 추가 결함 없음, 승인 가능 판정
 - ETF/모바일 웹앱 코드는 main과 origin/main에 반영됐지만 미니PC에는 아직 미배포다.

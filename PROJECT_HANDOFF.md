@@ -1500,4 +1500,5 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 실측: ETF 1,143개(영문 혼합 279개), `0167A0 → SOL AI반도체TOP2플러스`,
   운영 KIS 경로 시세 정상·일봉 82개, 로컬 웹 검색/ETF 배지/등록 현황까지 확인.
 - 검증: `pytest tests/ -q` → **397 passed, 1 existing warning**.
-  브랜치 `fix/alphanumeric-etf-codes`, 미커밋·미배포.
+- 상태: 기능 커밋 `1fb64af`를 `main`에 fast-forward하고 origin push 완료.
+  미니PC는 아직 미배포이며 장 마감 후 pull + uvicorn WMI 재기동 필요.
