@@ -203,12 +203,19 @@ async def search(
 ) -> list[dict]:
     """종목 자동완성 후보. q는 한글/영문/6자리 코드."""
     results = await master.search(q, limit=limit)
-    return [{"code": code, "name": name} for code, name in results]
+    return [
+        {"code": code, "name": name, "type": master.instrument_type(code)}
+        for code, name in results
+    ]
 
 
 @app.get("/api/picks")
-async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
+async def list_picks(
+    store: SectorStore = Depends(get_store),
+    master: StockMaster = Depends(get_master),
+) -> list[dict]:
     """활성 픽 + 종목 현황."""
+    await master.ensure_loaded()
     picks = await store.get_active_picks()
     out: list[dict] = []
     for pick in picks:
@@ -225,6 +232,7 @@ async def list_picks(store: SectorStore = Depends(get_store)) -> list[dict]:
                         "code": s.stock_code,
                         "name": s.stock_name,
                         "sector": s.sector_name,
+                        "type": master.instrument_type(s.stock_code),
                     }
                     for s in stocks
                 ],

@@ -129,9 +129,26 @@ class FakeKis:
 class FakeMaster:
     """네트워크 없는 결정적 종목 마스터 (KRX 다운로드 회피)."""
 
-    _M = {"005930": "삼성전자", "000660": "SK하이닉스", "042700": "한미반도체"}
+    _M = {
+        "005930": "삼성전자",
+        "000660": "SK하이닉스",
+        "042700": "한미반도체",
+        "069500": "KODEX 200",
+    }
+
+    def __init__(self):
+        self.ensure_loaded_calls = 0
+        self.loaded = False
+
+    async def ensure_loaded(self):
+        self.ensure_loaded_calls += 1
+        self.loaded = True
+
+    def instrument_type(self, code: str):
+        return "etf" if self.loaded and code == "069500" else "stock"
 
     async def search(self, query: str, limit: int = 8):
+        await self.ensure_loaded()
         q = query.strip()
         if not q:
             return []
@@ -139,6 +156,7 @@ class FakeMaster:
         return out[:limit]
 
     async def resolve(self, query: str):
+        await self.ensure_loaded()
         q = query.strip()
         if q in self._M:
             return q, self._M[q]
@@ -178,7 +196,47 @@ async def test_search_returns_candidates(client):
     res = await client.get("/api/search", params={"q": "삼성"})
     assert res.status_code == 200
     data = res.json()
-    assert {"code": "005930", "name": "삼성전자"} in data
+    assert {"code": "005930", "name": "삼성전자", "type": "stock"} in data
+
+
+@pytest.mark.asyncio
+async def test_index_exposes_keyboard_accessible_search(client):
+    res = await client.get("/")
+    assert res.status_code == 200
+    html = res.text
+    assert 'role="combobox"' in html
+    assert 'role="listbox"' in html
+    assert 'role="option"' in html
+    assert 'e.key === "ArrowDown"' in html
+    assert 'e.key === "Enter"' in html
+
+
+@pytest.mark.asyncio
+async def test_search_and_register_etf(client):
+    search = await client.get("/api/search", params={"q": "KODEX"})
+    assert search.status_code == 200
+    assert search.json() == [
+        {"code": "069500", "name": "KODEX 200", "type": "etf"}
+    ]
+
+    registered = await client.post(
+        "/api/picks",
+        json={"sector_name": "지수ETF", "stocks": [{"code": "069500"}]},
+    )
+    assert registered.status_code == 200
+    app.dependency_overrides[get_master]().loaded = False  # 재시작 직후 기존 ETF 픽 상황
+    picks = (await client.get("/api/picks")).json()
+    etf = next(s for p in picks for s in p["stocks"] if s["code"] == "069500")
+    assert etf["name"] == "KODEX 200"
+    assert etf["type"] == "etf"
+
+
+@pytest.mark.asyncio
+async def test_list_picks_ensures_master_loaded(client):
+    master = app.dependency_overrides[get_master]()
+    res = await client.get("/api/picks")
+    assert res.status_code == 200
+    assert master.ensure_loaded_calls == 1
 
 
 @pytest.mark.asyncio

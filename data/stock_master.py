@@ -1,13 +1,15 @@
-"""한글 종목명 ↔ 종목코드 매핑.
+"""국내 주식·ETF 한글 종목명 ↔ 종목코드 매핑.
 
-KRX `kind.krx.co.kr/corpgeneral/corpList.do` 마스터를 내려받아 로컬 JSON으로 캐시한다.
-KOSPI + KOSDAQ 전 종목을 포함. KIS 공식 API에는 이름 검색 엔드포인트가 없어 보완 목적.
+KRX 상장법인 목록과 KIS ETF 마스터를 내려받아 로컬 JSON으로 캐시한다.
+KOSPI + KOSDAQ 주식과 ETF를 포함한다.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import re
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -20,6 +22,12 @@ _ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.DOTALL)
 _TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _KRX_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType={mkt}"
+_KIS_KOSPI_MASTER_URL = (
+    "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
+)
+_KIS_MASTER_TAIL_LEN = 228
+_ETF_GROUP_CODE = "EF"
+_CACHE_VERSION = 2
 
 
 class StockMaster:
@@ -28,8 +36,12 @@ class StockMaster:
     def __init__(self, cache_path: Path | None = None) -> None:
         self._by_name: dict[str, str] = {}  # normalized name → code
         self._by_code: dict[str, str] = {}  # code → original name
+        self._types: dict[str, str] = {}  # code → stock | etf
         self._cache_path = cache_path or Path(settings.DB_PATH).parent / "stock_master.json"
         self._lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
+        self._load_task_lock = asyncio.Lock()
+        self._load_task: asyncio.Task[int] | None = None
         self._loaded = False
         self._load_disk()
 
@@ -43,9 +55,14 @@ class StockMaster:
         try:
             data = json.loads(self._cache_path.read_text(encoding="utf-8"))
             self._by_code = data.get("by_code", {})
+            saved_types = data.get("types", {})
+            self._types = {
+                code: saved_types.get(code, "stock") for code in self._by_code
+            }
             self._by_name = {self._norm(n): c for c, n in self._by_code.items()}
-            self._loaded = bool(self._by_code)
-            logger.info(f"[StockMaster] 캐시 로드: {len(self._by_code)}종목")
+            self._loaded = bool(self._by_code) and data.get("version") == _CACHE_VERSION
+            suffix = "" if self._loaded else " (구버전 — 첫 검색 시 갱신)"
+            logger.info(f"[StockMaster] 캐시 로드: {len(self._by_code)}종목{suffix}")
         except Exception as e:
             logger.warning(f"[StockMaster] 캐시 로드 실패: {e}")
 
@@ -53,31 +70,84 @@ class StockMaster:
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             self._cache_path.write_text(
-                json.dumps({"by_code": self._by_code}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "version": _CACHE_VERSION,
+                        "by_code": self._by_code,
+                        "types": self._types,
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="utf-8",
             )
         except Exception as e:
             logger.warning(f"[StockMaster] 캐시 저장 실패: {e}")
 
     async def refresh(self) -> int:
-        """KRX에서 KOSPI+KOSDAQ 마스터를 재다운로드해 캐시를 갱신한다."""
-        by_code: dict[str, str] = {}
+        """KRX 상장법인 + KIS ETF 마스터를 병합해 캐시를 갱신한다.
+
+        KRX corpList에는 ETF가 없어서 KIS 공식 KOSPI 마스터의 EF 상품군을
+        별도로 읽는다. ETF 다운로드만 실패하면 직전 ETF 캐시를 유지한다.
+        """
+        async with self._refresh_lock:
+            return await self._refresh_unlocked()
+
+    async def _refresh_unlocked(self) -> int:
+        """호출자가 ``_refresh_lock``을 보유한 상태에서 실제 갱신 수행."""
+        stocks: dict[str, str] = {}
+        etfs: dict[str, str] | None = None
+        stock_sources_ok = True
         async with httpx.AsyncClient(timeout=30.0) as client:
             for mkt in ("stockMkt", "kosdaqMkt"):
                 try:
                     r = await client.get(_KRX_URL.format(mkt=mkt))
                     r.encoding = "euc-kr"
-                    by_code.update(self._parse(r.text))
+                    parsed = self._parse(r.text)
+                    if not parsed:
+                        raise ValueError("주식 0종목")
+                    stocks.update(parsed)
                 except Exception as e:
+                    stock_sources_ok = False
                     logger.warning(f"[StockMaster] KRX {mkt} 다운로드 실패: {e}")
-        if not by_code:
+            try:
+                r = await client.get(_KIS_KOSPI_MASTER_URL)
+                r.raise_for_status()
+                etfs = self._parse_kis_etf_master(r.content)
+                if not etfs:
+                    raise ValueError("ETF 0종목")
+            except Exception as e:
+                logger.warning(f"[StockMaster] KIS ETF 마스터 다운로드 실패: {e}")
+
+        # 한 시장만 성공한 부분 마스터로 기존 KOSPI/KOSDAQ 전체를 덮지 않는다.
+        if not stock_sources_ok:
             return 0
+
+        cached_etfs = {
+            code: name
+            for code, name in self._by_code.items()
+            if self._types.get(code) == "etf"
+        }
+        if etfs is None:
+            etfs = cached_etfs
+        cache_complete = bool(etfs)
+        by_code = {**stocks, **etfs}
         async with self._lock:
             self._by_code = by_code
+            self._types = {
+                **{code: "stock" for code in stocks},
+                **{code: "etf" for code in etfs},
+            }
             self._by_name = {self._norm(n): c for c, n in by_code.items()}
-            self._loaded = True
-            self._save_disk()
-        logger.info(f"[StockMaster] KRX 마스터 갱신: {len(by_code)}종목")
+            self._loaded = cache_complete
+            # 최초 ETF 수신 실패를 정상 v2 캐시로 굳히지 않는다. 메모리의 주식
+            # 검색은 허용하되 다음 검색에서 ETF 다운로드를 다시 시도한다.
+            if cache_complete:
+                self._save_disk()
+            else:
+                logger.warning("[StockMaster] ETF 없는 불완전 캐시 — 저장하지 않고 재시도")
+        logger.info(
+            f"[StockMaster] 마스터 갱신: 주식 {len(stocks)} + ETF {len(etfs)}"
+        )
         return len(by_code)
 
     @staticmethod
@@ -94,9 +164,55 @@ class StockMaster:
                 out[code] = name
         return out
 
+    @staticmethod
+    def _parse_kis_etf_master(payload: bytes) -> dict[str, str]:
+        """KIS kospi_code.mst ZIP에서 ETF(EF) 단축코드와 한글명을 추출."""
+        out: dict[str, str] = {}
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = [name for name in archive.namelist() if name.endswith("kospi_code.mst")]
+            if not names:
+                raise ValueError("kospi_code.mst 없음")
+            raw = archive.read(names[0]).decode("cp949")
+
+        for row in raw.splitlines():
+            if len(row) <= _KIS_MASTER_TAIL_LEN + 21:
+                continue
+            prefix = row[:-_KIS_MASTER_TAIL_LEN]
+            tail = row[-_KIS_MASTER_TAIL_LEN:]
+            # 실파일은 고정폭 꼬리 앞에 구분 공백 1자가 붙는다. 테스트용/과거
+            # 변형처럼 공백이 없는 레코드도 함께 허용한다.
+            group_code = tail[1:3] if tail.startswith(" ") else tail[:2]
+            if group_code != _ETF_GROUP_CODE:
+                continue
+            code = prefix[:9].strip()
+            name = prefix[21:].strip()
+            if _CODE_RE.match(code) and name:
+                out[code] = name
+        return out
+
+    def instrument_type(self, code: str) -> str:
+        """검색 UI 표시용 상품 유형. 알 수 없는 코드는 stock으로 호환 처리."""
+        return self._types.get(code, "stock")
+
+    async def ensure_loaded(self) -> None:
+        """동시에 들어온 최초 요청들이 하나의 갱신 작업을 공유하도록 보장."""
+        if self._loaded:
+            return
+        async with self._load_task_lock:
+            if self._load_task is None or self._load_task.done():
+                self._load_task = asyncio.create_task(self.refresh())
+            task = self._load_task
+        try:
+            # 한 HTTP 요청이 취소돼도 다른 대기자의 공용 갱신은 계속한다.
+            await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._load_task_lock:
+                    if self._load_task is task:
+                        self._load_task = None
+
     async def _ensure_loaded(self) -> None:
-        if not self._loaded:
-            await self.refresh()
+        await self.ensure_loaded()
 
     async def resolve(self, query: str) -> tuple[str, str] | None:
         """입력을 (code, name)으로 해석. 실패 시 None.

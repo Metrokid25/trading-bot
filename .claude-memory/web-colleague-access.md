@@ -13,3 +13,15 @@
   적용(TCP 8000, InterfaceAlias Tailscale + RemoteAddress 100.64.0.0/10 — 관리자 필요해 오너 실행) →
   Tailscale 공유·동료(chojaesng97@gmail.com) 초대 수락. 스모크 9항목 통과(401/200/registered_by/삭제/IP 바인딩).
   잔여: 동료 폰 Tailscale 앱 연결만. 상세 `HANDOFF_웹공유.md` 상단 갱신 블록.
+
+## 2026-07-22 ETF·모바일 개편 (배포 대기)
+
+- 브랜치 `feature/web-etf-mobile-ui`, 아직 미커밋·미니PC 미배포.
+- ETF 검색 실패 원인: KRX corpList는 상장법인만 포함. KIS 공식 KOSPI 마스터의
+  `EF` 그룹(실측 864 ETF)을 기존 주식 마스터와 병합하고 캐시 v2/유형 배지 추가.
+- 모바일 ≤640px: 종목표를 카드형으로 바꾸고 첫 섹터만 펼침. 390px 실측
+  `scrollWidth=375`로 가로 넘침 제거. 1280px 핵심 표 891px/행 59px.
+- 섹터 필터·접기, 등록 설정 접기, 검색 0건 안내, 보이는 미니차트만 지연 조회.
+- 독립 리뷰 후 최초 마스터 single-flight, ETF 유형 선로딩, 미니차트 재그리기,
+  빈 필터/`all` 충돌, 키보드 자동완성, 실패 갱신 공유·검색 장애 상태 초기화를 보강함.
+- 전체 테스트 393 passed. 승인 후 배포 시 **장 마감 후 WMI로 웹앱 재기동**.
