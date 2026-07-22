@@ -1483,5 +1483,5 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
   1회 결과를 공유하고, 검색 장애 시 이전 숨은 결과 선택을 차단. 모바일 375px 및
   상태 전환 재실측.
 - 검증: `pytest tests/ -q` → **393 passed, 1 existing warning**.
-- 상태: `feature/web-etf-mobile-ui` 미커밋·미배포. 오너 승인 후 커밋/머지/push,
-  미니PC pull은 장중 상주를 끊지 말고 장 마감 후 웹앱을 반드시 WMI로 재기동.
+- 상태: `813d78e`로 `main` 커밋·push 완료. 미니PC는 아직 미배포이며, 장중 상주를
+  끊지 말고 장 마감 후 pull한 뒤 웹앱을 반드시 WMI로 재기동.
