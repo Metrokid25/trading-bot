@@ -60,6 +60,23 @@ async def test_upsert_same_sector_merges(store: SectorStore):
 
 
 @pytest.mark.asyncio
+async def test_upsert_sector_is_case_insensitive(store: SectorStore):
+    """영문 대소문자만 다른 섹터명은 기존 표기를 유지하며 같은 Pick에 합친다."""
+    r1 = await store.upsert_sector(
+        "ai솔루션", [_stock("ai솔루션", "005930", "삼성전자")], _pick()
+    )
+    r2 = await store.upsert_sector(
+        "  AI솔루션  ", [_stock("AI솔루션", "000660", "SK하이닉스")], _pick()
+    )
+
+    assert r2.is_new_pick is False
+    assert r2.pick_id == r1.pick_id
+    rows = await store.get_stocks_by_sector(r1.pick_id, "AI솔루션")
+    assert {row.stock_code for row in rows} == {"005930", "000660"}
+    assert {row.sector_name for row in rows} == {"ai솔루션"}
+
+
+@pytest.mark.asyncio
 async def test_upsert_deduplicates_stocks(store: SectorStore):
     """중복 stock_code 재입력 시 skipped_stocks에 담기고 DB엔 1개만."""
     stocks_1 = [_stock("반도체", "005930", "삼성전자"), _stock("반도체", "000660", "SK하이닉스")]
@@ -87,6 +104,155 @@ async def test_upsert_different_sector_creates_new(store: SectorStore):
     assert r1.is_new_pick is True
     assert r2.is_new_pick is True
     assert r1.pick_id != r2.pick_id
+
+
+@pytest.mark.asyncio
+async def test_consolidate_case_insensitive_sectors_preserves_historical_tracking(
+    store: SectorStore,
+):
+    """활성 행은 복제하되 이전 종목·이벤트·추적 연결은 원래 Pick에 보존한다."""
+    now = datetime.now().astimezone()
+    older = SectorPick(
+        pick_date="2026-07-01",
+        created_at=now - timedelta(minutes=2),
+        expires_at=now + timedelta(days=30),
+    )
+    newer = SectorPick(
+        pick_date="2026-07-01",
+        created_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(days=30),
+    )
+    older_id = await store.insert_pick(older, [
+        _stock("ai솔루션", "005930", "삼성전자", 1),
+        _stock("ai솔루션", "000660", "SK하이닉스", 2),
+    ])
+    newer_id = await store.insert_pick(newer, [
+        _stock("AI솔루션", "000660", "SK하이닉스", 1),
+        _stock("AI솔루션", "042700", "한미반도체", 2),
+    ])
+    moved_before = (await store.get_stocks_by_sector(older_id, "AI솔루션"))[0]
+    await store._db.execute(
+        "CREATE TABLE sector_pick_events ("
+        "event_id INTEGER PRIMARY KEY, pick_id INTEGER NOT NULL, sector_name TEXT NOT NULL)"
+    )
+    await store._db.execute(
+        "CREATE TABLE pick_daily_tracking ("
+        "id INTEGER PRIMARY KEY, stock_pick_id INTEGER NOT NULL, event_id INTEGER NOT NULL)"
+    )
+    await store._db.execute(
+        "INSERT INTO sector_pick_events(event_id, pick_id, sector_name) VALUES (1, ?, ?)",
+        (older_id, "ai솔루션"),
+    )
+    await store._db.execute(
+        "INSERT INTO pick_daily_tracking(id, stock_pick_id, event_id) VALUES (1, ?, 1)",
+        (moved_before.id,),
+    )
+
+    result = await store.consolidate_case_insensitive_sectors()
+
+    assert result["AI솔루션"]["target_id"] == newer_id
+    assert result["AI솔루션"]["merged_ids"] == [older_id]
+    active_ids = {pick.id for pick in await store.get_active_picks()}
+    assert newer_id in active_ids
+    assert older_id not in active_ids
+    rows = await store.get_stocks_by_sector(newer_id, "ai솔루션")
+    assert {row.stock_code for row in rows} == {"005930", "000660", "042700"}
+    assert {row.sector_name for row in rows} == {"AI솔루션"}
+    moved_after = next(row for row in rows if row.stock_code == "005930")
+    assert moved_after.id != moved_before.id
+    old_row = await store._db.execute(
+        "SELECT pick_id, sector_name FROM sector_stocks WHERE id = ?",
+        (moved_before.id,),
+    )
+    assert await old_row.fetchone() == (older_id, "ai솔루션")
+    linked = await store._db.execute(
+        "SELECT COUNT(*) FROM pick_daily_tracking pdt "
+        "JOIN sector_pick_events spe ON spe.event_id = pdt.event_id "
+        "JOIN sector_stocks ss ON ss.id = pdt.stock_pick_id "
+        "AND ss.pick_id = spe.pick_id AND ss.sector_name = spe.sector_name"
+    )
+    assert (await linked.fetchone())[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_consolidate_normalizes_whitespace_within_one_pick(store: SectorStore):
+    now = datetime.now().astimezone()
+    pick = SectorPick(
+        pick_date="2026-07-01",
+        created_at=now,
+        expires_at=now + timedelta(days=30),
+    )
+    pick_id = await store.insert_pick(
+        pick, [_stock("  AI   솔루션  ", "005930", "삼성전자")]
+    )
+    await store._db.execute(
+        "CREATE TABLE sector_pick_events ("
+        "event_id INTEGER PRIMARY KEY, pick_id INTEGER NOT NULL, sector_name TEXT NOT NULL)"
+    )
+    await store._db.execute(
+        "INSERT INTO sector_pick_events(event_id, pick_id, sector_name) VALUES (1, ?, ?)",
+        (pick_id, "  AI   솔루션  "),
+    )
+
+    result = await store.consolidate_case_insensitive_sectors()
+
+    assert result["AI 솔루션"]["target_id"] == pick_id
+    rows = await store.get_stocks_by_sector(pick_id, "ai 솔루션")
+    assert [row.sector_name for row in rows] == ["AI 솔루션"]
+    event = await store._db.execute(
+        "SELECT sector_name FROM sector_pick_events WHERE event_id = 1"
+    )
+    assert (await event.fetchone())[0] == "AI 솔루션"
+
+
+@pytest.mark.asyncio
+async def test_consolidate_preserves_same_spelling_repick_picks(store: SectorStore):
+    """표기가 같은 여러 Pick은 정상 재픽업 이력일 수 있으므로 합치지 않는다."""
+    now = datetime.now().astimezone()
+    first = SectorPick(
+        pick_date="2026-07-01",
+        created_at=now - timedelta(minutes=2),
+        expires_at=now + timedelta(days=30),
+    )
+    second = SectorPick(
+        pick_date="2026-07-02",
+        created_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(days=30),
+    )
+    first_id = await store.insert_pick(
+        first, [_stock("AI솔루션", "005930", "삼성전자")]
+    )
+    second_id = await store.insert_pick(
+        second, [_stock("AI솔루션", "000660", "SK하이닉스")]
+    )
+
+    assert await store.consolidate_case_insensitive_sectors() == {}
+    active_ids = {pick.id for pick in await store.get_active_picks()}
+    assert {first_id, second_id} <= active_ids
+
+
+@pytest.mark.asyncio
+async def test_consolidate_skips_case_variant_mixed_with_repick_history(
+    store: SectorStore,
+):
+    """AI, AI 정상 재픽과 ai 변형이 섞이면 모호하므로 모두 보존한다."""
+    now = datetime.now().astimezone()
+    ids = []
+    for minutes, name, code in [
+        (3, "AI", "005930"),
+        (2, "AI", "000660"),
+        (1, "ai", "042700"),
+    ]:
+        pick = SectorPick(
+            pick_date="2026-07-01",
+            created_at=now - timedelta(minutes=minutes),
+            expires_at=now + timedelta(days=30),
+        )
+        ids.append(await store.insert_pick(pick, [_stock(name, code, code)]))
+
+    assert await store.consolidate_case_insensitive_sectors() == {}
+    active_ids = {pick.id for pick in await store.get_active_picks()}
+    assert set(ids) <= active_ids
 
 
 # ---------- merge ----------

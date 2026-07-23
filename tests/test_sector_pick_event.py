@@ -142,6 +142,58 @@ async def test_repick_friday_to_monday(store: SectorStore):
     assert r2[8] == "2026-04-27"     # pick_date
 
 
+@pytest.mark.asyncio
+async def test_repick_sector_name_is_case_insensitive(store: SectorStore):
+    """대소문자 표기가 달라도 동일 섹터 이벤트 체인을 이어간다."""
+    pid1 = await _new_pick_id(store, "2026-04-21")
+    id1 = await store._record_sector_pick_event(
+        "ai솔루션", _ts("2026-04-21"), date(2026, 4, 21), pid1
+    )
+    pid2 = await _new_pick_id(store, "2026-04-28")
+    await store._record_sector_pick_event(
+        "AI솔루션", _ts("2026-04-28"), date(2026, 4, 28), pid2
+    )
+
+    rows = await _get_events(store)
+    assert len(rows) == 2
+    second = rows[1]
+    assert second[3] == 1
+    assert second[4] == id1
+    assert second[5] == 7
+    assert second[7] == 2
+
+
+@pytest.mark.asyncio
+async def test_repick_count_repairs_split_legacy_case_chains(store: SectorStore):
+    """과거 대소문자별 total=1 두 건 뒤 새 이벤트는 실제 세 번째로 센다."""
+    pid1 = await _new_pick_id(store, "2026-04-14")
+    pid2 = await _new_pick_id(store, "2026-04-21")
+    await store._db.execute(
+        "INSERT INTO sector_pick_events "
+        "(pick_id, sector_name, registered_at_kst, pick_date, "
+        "is_sector_repick, total_sector_pick_count) "
+        "VALUES (?, 'AI', ?, '2026-04-14', 0, 1)",
+        (pid1, _ts("2026-04-14")),
+    )
+    await store._db.execute(
+        "INSERT INTO sector_pick_events "
+        "(pick_id, sector_name, registered_at_kst, pick_date, "
+        "is_sector_repick, total_sector_pick_count) "
+        "VALUES (?, 'ai', ?, '2026-04-21', 0, 1)",
+        (pid2, _ts("2026-04-21")),
+    )
+    pid3 = await _new_pick_id(store, "2026-04-28")
+
+    await store._record_sector_pick_event(
+        "Ai", _ts("2026-04-28"), date(2026, 4, 28), pid3
+    )
+
+    rows = await _get_events(store)
+    assert rows[-1][3] == 1
+    assert rows[-1][4] == rows[-2][0]
+    assert rows[-1][7] == 3
+
+
 # ---------- TC3: 재픽업 (자연일 7, 거래일 5 — 한 주 후) ----------
 
 @pytest.mark.asyncio

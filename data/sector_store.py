@@ -23,6 +23,16 @@ class AlertResult(Enum):
     INSERT_FAILED = "insert_failed"
 
 
+def normalize_sector_name(value: str) -> str:
+    """섹터 표시명을 정리한다. 단어 사이 공백은 하나로 유지한다."""
+    return " ".join(value.split())
+
+
+def sector_key(value: str) -> str:
+    """대소문자와 불필요한 공백을 무시하는 섹터 식별 키."""
+    return normalize_sector_name(value).casefold()
+
+
 class SectorStore:
     """픽 이벤트 + 섹터-종목 매핑 저장소."""
 
@@ -33,6 +43,7 @@ class SectorStore:
     async def open(self) -> None:
         # isolation_level=None: 자동 트랜잭션 비활성. BEGIN/COMMIT/ROLLBACK을 명시적으로 관리.
         self._db = await aiosqlite.connect(self.db_path, isolation_level=None)
+        await self._db.create_function("sector_key", 1, sector_key, deterministic=True)
         await self.init_tables()
         await self._migrate_alert_history_v2()
         await self._migrate_sector_stocks_repick()
@@ -194,16 +205,16 @@ class SectorStore:
         cur = await self._db.execute(
             "SELECT event_id, pick_date "
             "FROM sector_pick_events "
-            "WHERE sector_name = ? AND pick_date IS NOT NULL AND pick_date < ? "
+            "WHERE sector_key(sector_name) = ? AND pick_date IS NOT NULL AND pick_date < ? "
             "ORDER BY pick_date DESC, event_id DESC LIMIT 1",
-            (sector_name, pick_date.isoformat()),
+            (sector_key(sector_name), pick_date.isoformat()),
         )
         prev_row = await cur.fetchone()
 
         cur_total = await self._db.execute(
-            "SELECT COALESCE(MAX(total_sector_pick_count), 0) "
-            "FROM sector_pick_events WHERE sector_name = ?",
-            (sector_name,),
+            "SELECT COUNT(*) "
+            "FROM sector_pick_events WHERE sector_key(sector_name) = ?",
+            (sector_key(sector_name),),
         )
         total_count = (await cur_total.fetchone())[0] + 1
 
@@ -232,6 +243,22 @@ class SectorStore:
         if event_id is None:
             raise RuntimeError("lastrowid missing after sector_pick_events insert")
         return event_id
+
+    async def _normalize_pick_event_sector_name(
+        self, pick_id: int, key: str, canonical_name: str
+    ) -> None:
+        """해당 Pick의 이벤트 섹터명을 맞춘다. Phase2.5 테이블이 없으면 no-op."""
+        cur = await self._db.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sector_pick_events'"
+        )
+        if await cur.fetchone() is None:
+            return
+        await self._db.execute(
+            "UPDATE sector_pick_events SET sector_name = ? "
+            "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+            (canonical_name, pick_id, key),
+        )
 
     async def _compute_repick_metadata(
         self,
@@ -317,31 +344,48 @@ class SectorStore:
         pick_template: SectorPick,
         record_pick_event: bool = False,
     ) -> UpsertResult:
-        """섹터 단위 UPSERT: 동일 sector_name의 활성 픽이 있으면 종목만 추가, 없으면 새 픽 생성."""
+        """섹터 단위 UPSERT: 대소문자를 무시한 동일 활성 섹터에 종목을 추가한다."""
         if not self._db:
             raise RuntimeError("SectorStore not open")
 
+        requested_sector_name = normalize_sector_name(sector_name)
+        if not requested_sector_name:
+            raise ValueError("sector_name must not be blank")
+        normalized_key = sector_key(requested_sector_name)
         now_iso = to_db_iso(now_kst())
         pick_created_at_iso = to_db_iso(pick_template.created_at)
         tracking_end_date_iso = add_trading_days(pick_template.created_at.date(), 20).isoformat()
         await self._db.execute("BEGIN IMMEDIATE")
         try:
             cur = await self._db.execute(
-                "SELECT ss.pick_id FROM sector_stocks ss "
+                "SELECT ss.pick_id, ss.sector_name FROM sector_stocks ss "
                 "JOIN sector_picks sp ON sp.id = ss.pick_id "
-                "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ? "
+                "WHERE sector_key(ss.sector_name) = ? AND sp.status = ? AND sp.expires_at > ? "
                 "ORDER BY sp.created_at DESC LIMIT 1",
-                (sector_name, PickStatus.ACTIVE.value, now_iso),
+                (normalized_key, PickStatus.ACTIVE.value, now_iso),
             )
             row = await cur.fetchone()
 
             if row:
                 pick_id: int = row[0]
+                canonical_sector_name: str = normalize_sector_name(row[1])
                 is_new_pick = False
 
+                # 기존 공백 변형도 같은 표시명으로 맞추고, 해당 Pick의 이벤트명도
+                # 함께 바꿔 event↔stock 정확 일치 조인을 유지한다.
+                await self._db.execute(
+                    "UPDATE sector_stocks SET sector_name = ? "
+                    "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+                    (canonical_sector_name, pick_id, normalized_key),
+                )
+                await self._normalize_pick_event_sector_name(
+                    pick_id, normalized_key, canonical_sector_name
+                )
+
                 cur2 = await self._db.execute(
-                    "SELECT stock_code FROM sector_stocks WHERE pick_id = ? AND sector_name = ?",
-                    (pick_id, sector_name),
+                    "SELECT stock_code FROM sector_stocks "
+                    "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+                    (pick_id, normalized_key),
                 )
                 existing_codes = {r[0] for r in await cur2.fetchall()}
 
@@ -355,6 +399,7 @@ class SectorStore:
                 skipped: list[SectorStock] = []
                 seen_new: set[str] = set()
                 for s in stocks:
+                    s.sector_name = canonical_sector_name
                     if s.stock_code in existing_codes or s.stock_code in seen_new:
                         skipped.append(s)
                     else:
@@ -387,6 +432,7 @@ class SectorStore:
                 total = len(existing_codes) + len(added)
 
             else:
+                canonical_sector_name = requested_sector_name
                 is_new_pick = True
                 skipped = []
 
@@ -409,6 +455,7 @@ class SectorStore:
                 seen_in_batch: set[str] = set()
                 stocks_deduped: list[SectorStock] = []
                 for s in stocks:
+                    s.sector_name = canonical_sector_name
                     if s.stock_code not in seen_in_batch:
                         seen_in_batch.add(s.stock_code)
                         stocks_deduped.append(s)
@@ -452,7 +499,10 @@ class SectorStore:
             try:
                 await self._db.execute("BEGIN")
                 await self._record_sector_pick_event(
-                    sector_name, pick_created_at_iso, date.fromisoformat(pick_template.pick_date), pick_id
+                    canonical_sector_name,
+                    pick_created_at_iso,
+                    date.fromisoformat(pick_template.pick_date),
+                    pick_id,
                 )
                 await self._db.execute("COMMIT")
             except Exception:
@@ -473,6 +523,171 @@ class SectorStore:
             skipped_stocks=skipped,
             total_count=total,
         )
+
+    async def consolidate_case_insensitive_sectors(self) -> dict[str, dict]:
+        """대소문자만 다른 활성 섹터 픽을 최신 표기/픽으로 통합한다.
+
+        웹 등록은 섹터별로 별도 Pick을 만들므로, 다른 섹터가 섞이지 않은 Pick만
+        자동 통합한다. 이전 Pick의 종목 행은 과거 이벤트·추적 연결 보존을 위해
+        그대로 두고, 최신 활성 Pick에 없는 종목만 새 행으로 복제한다. 같은 종목은
+        최신 Pick의 행을 유지하고 이전 Pick을 archive해 활성 유니버스 중복을 제거한다.
+        """
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+
+        now_iso = to_db_iso(now_kst())
+        cur = await self._db.execute(
+            "SELECT ss.id, ss.pick_id, ss.sector_name, ss.stock_code, sp.created_at, "
+            "ss.stock_name, ss.is_repick, ss.prev_pick_id, ss.days_since_last_pick, "
+            "ss.total_pick_count, ss.tracking_status, ss.tracking_start_date, "
+            "ss.tracking_end_date "
+            "FROM sector_stocks ss "
+            "JOIN sector_picks sp ON sp.id = ss.pick_id "
+            "WHERE sp.status = ? AND sp.expires_at > ? "
+            "ORDER BY sp.created_at DESC, ss.id ASC",
+            (PickStatus.ACTIVE.value, now_iso),
+        )
+        rows = await cur.fetchall()
+
+        grouped: dict[str, list[tuple]] = {}
+        keys_by_pick: dict[int, set[str]] = {}
+        for row in rows:
+            stock_id, pick_id, name, code, created_at = row[:5]
+            key = sector_key(name)
+            grouped.setdefault(key, []).append(row)
+            keys_by_pick.setdefault(pick_id, set()).add(key)
+
+        results: dict[str, dict] = {}
+        for key, group_rows in grouped.items():
+            pick_ids = list(dict.fromkeys(row[1] for row in group_rows))
+            spellings = {normalize_sector_name(row[2]) for row in group_rows}
+            has_unclean_name = any(row[2] != normalize_sector_name(row[2]) for row in group_rows)
+            # 같은 표기의 여러 Pick은 정상적인 재픽업 이력일 수 있다. 자동 병합은
+            # 대소문자 표기가 실제로 갈렸거나 공백 정리가 필요한 그룹에만 한정한다.
+            if len(spellings) < 2 and not has_unclean_name:
+                continue
+
+            target_id = pick_ids[0]
+            canonical_name = normalize_sector_name(group_rows[0][2])
+            duplicate_ids = pick_ids[1:]
+
+            picks_by_spelling: dict[str, set[int]] = {}
+            for row in group_rows:
+                picks_by_spelling.setdefault(
+                    normalize_sector_name(row[2]), set()
+                ).add(row[1])
+            if any(len(ids) > 1 for ids in picks_by_spelling.values()):
+                logger.warning(
+                    "대소문자 중복 섹터 자동 병합 보류: 정상 재픽 이력과 혼재 "
+                    "(sector=%s, spellings=%s)",
+                    canonical_name,
+                    {name: sorted(ids) for name, ids in picks_by_spelling.items()},
+                )
+                continue
+
+            # 여러 섹터가 한 Pick에 섞인 레거시 데이터는 전체 Pick archive가
+            # 다른 섹터까지 숨길 수 있으므로 자동 병합하지 않는다.
+            if any(keys_by_pick[pick_id] != {key} for pick_id in duplicate_ids):
+                logger.warning(
+                    "대소문자 중복 섹터 자동 병합 보류: 다른 섹터가 섞인 pick (sector=%s, picks=%s)",
+                    canonical_name,
+                    duplicate_ids,
+                )
+                continue
+
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._db.execute(
+                    "UPDATE sector_stocks SET sector_name = ? "
+                    "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+                    (canonical_name, target_id, key),
+                )
+                await self._normalize_pick_event_sector_name(
+                    target_id, key, canonical_name
+                )
+                cur_existing = await self._db.execute(
+                    "SELECT stock_code FROM sector_stocks "
+                    "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+                    (target_id, key),
+                )
+                existing_codes = {row[0] for row in await cur_existing.fetchall()}
+                cur_order = await self._db.execute(
+                    "SELECT COALESCE(MAX(added_order), 0) FROM sector_stocks WHERE pick_id = ?",
+                    (target_id,),
+                )
+                next_order = (await cur_order.fetchone())[0]
+
+                copied = 0
+                for row in group_rows:
+                    (
+                        _stock_id,
+                        pick_id,
+                        _name,
+                        code,
+                        _created_at,
+                        stock_name,
+                        is_repick,
+                        prev_pick_id,
+                        days_since_last_pick,
+                        total_pick_count,
+                        tracking_status,
+                        tracking_start_date,
+                        tracking_end_date,
+                    ) = row
+                    if pick_id == target_id or code in existing_codes:
+                        continue
+                    next_order += 1
+                    await self._db.execute(
+                        "INSERT INTO sector_stocks "
+                        "(pick_id, sector_name, stock_code, stock_name, added_order, "
+                        "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+                        "tracking_status, tracking_start_date, tracking_end_date) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            target_id,
+                            canonical_name,
+                            code,
+                            stock_name,
+                            next_order,
+                            is_repick,
+                            prev_pick_id,
+                            days_since_last_pick,
+                            total_pick_count,
+                            tracking_status,
+                            tracking_start_date,
+                            tracking_end_date,
+                        ),
+                    )
+                    existing_codes.add(code)
+                    copied += 1
+
+                await self._db.executemany(
+                    "UPDATE sector_picks SET status = ? WHERE id = ?",
+                    [(PickStatus.ARCHIVED.value, pick_id) for pick_id in duplicate_ids],
+                )
+                await self._db.execute("COMMIT")
+            except Exception:
+                await self._db.execute("ROLLBACK")
+                logger.exception(
+                    "대소문자 중복 섹터 병합 실패 (sector=%s)", canonical_name
+                )
+                raise
+
+            results[canonical_name] = {
+                "target_id": target_id,
+                "merged_ids": duplicate_ids,
+                "copied_stocks": copied,
+                "total_stocks": len(existing_codes),
+            }
+            logger.info(
+                "대소문자 중복 섹터 통합: sector=%s target=%s merged=%s total=%s",
+                canonical_name,
+                target_id,
+                duplicate_ids,
+                len(existing_codes),
+            )
+
+        return results
 
     async def get_active_picks(self) -> list[SectorPick]:
         if not self._db:
@@ -540,9 +755,9 @@ class SectorStore:
             "SELECT id, pick_id, sector_name, stock_code, stock_name, added_order, "
             "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
             "tracking_status, tracking_start_date, tracking_end_date "
-            "FROM sector_stocks WHERE pick_id = ? AND sector_name = ? "
+            "FROM sector_stocks WHERE pick_id = ? AND sector_key(sector_name) = ? "
             "ORDER BY added_order",
-            (pick_id, sector_name),
+            (pick_id, sector_key(sector_name)),
         )
         rows = await cur.fetchall()
         return [
@@ -627,17 +842,18 @@ class SectorStore:
             "SELECT ss.pick_id, COUNT(ss.id) "
             "FROM sector_stocks ss "
             "JOIN sector_picks sp ON sp.id = ss.pick_id "
-            "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ? "
+            "WHERE sector_key(ss.sector_name) = ? AND sp.status = ? AND sp.expires_at > ? "
             "GROUP BY ss.pick_id "
             "ORDER BY sp.created_at ASC",
-            (sector_name, PickStatus.ACTIVE.value, now_iso),
+            (sector_key(sector_name), PickStatus.ACTIVE.value, now_iso),
         )
         rows = await cur.fetchall()
         result = []
         for pick_id, sector_cnt in rows:
             cur2 = await self._db.execute(
-                "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ? AND sector_name != ?",
-                (pick_id, sector_name),
+                "SELECT COUNT(*) FROM sector_stocks "
+                "WHERE pick_id = ? AND sector_key(sector_name) != ?",
+                (pick_id, sector_key(sector_name)),
             )
             other_cnt = (await cur2.fetchone())[0]
             result.append({
@@ -661,16 +877,17 @@ class SectorStore:
             cur = await self._db.execute(
                 "SELECT DISTINCT ss.pick_id FROM sector_stocks ss "
                 "JOIN sector_picks sp ON sp.id = ss.pick_id "
-                "WHERE ss.sector_name = ? AND sp.status = ? AND sp.expires_at > ?",
-                (sector_name, PickStatus.ACTIVE.value, now_iso),
+                "WHERE sector_key(ss.sector_name) = ? AND sp.status = ? AND sp.expires_at > ?",
+                (sector_key(sector_name), PickStatus.ACTIVE.value, now_iso),
             )
             affected_picks = [r[0] for r in await cur.fetchall()]
 
             auto_archived: list[int] = []
             for pick_id in affected_picks:
                 await self._db.execute(
-                    "DELETE FROM sector_stocks WHERE pick_id = ? AND sector_name = ?",
-                    (pick_id, sector_name),
+                    "DELETE FROM sector_stocks "
+                    "WHERE pick_id = ? AND sector_key(sector_name) = ?",
+                    (pick_id, sector_key(sector_name)),
                 )
                 cur2 = await self._db.execute(
                     "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ?",
@@ -705,16 +922,18 @@ class SectorStore:
             cur = await self._db.execute(
                 "SELECT DISTINCT ss.pick_id FROM sector_stocks ss "
                 "JOIN sector_picks sp ON sp.id = ss.pick_id "
-                "WHERE ss.sector_name = ? AND ss.stock_code = ? AND sp.status = ? AND sp.expires_at > ?",
-                (sector_name, stock_code, PickStatus.ACTIVE.value, now_iso),
+                "WHERE sector_key(ss.sector_name) = ? AND ss.stock_code = ? "
+                "AND sp.status = ? AND sp.expires_at > ?",
+                (sector_key(sector_name), stock_code, PickStatus.ACTIVE.value, now_iso),
             )
             affected_picks = [r[0] for r in await cur.fetchall()]
 
             auto_archived: list[int] = []
             for pick_id in affected_picks:
                 await self._db.execute(
-                    "DELETE FROM sector_stocks WHERE pick_id = ? AND sector_name = ? AND stock_code = ?",
-                    (pick_id, sector_name, stock_code),
+                    "DELETE FROM sector_stocks WHERE pick_id = ? "
+                    "AND sector_key(sector_name) = ? AND stock_code = ?",
+                    (pick_id, sector_key(sector_name), stock_code),
                 )
                 cur2 = await self._db.execute(
                     "SELECT COUNT(*) FROM sector_stocks WHERE pick_id = ?",

@@ -22,13 +22,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from config.settings import settings
 from core.kis_api import KISClient
 from core.time_utils import now_kst
 from data.sector_models import SectorPick, SectorStock
-from data.sector_store import SectorStore
+from data.sector_store import SectorStore, normalize_sector_name
 from data.stock_master import StockMaster
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -123,6 +123,7 @@ def _clear_runtime_caches() -> None:
 async def lifespan(app: FastAPI):
     store = SectorStore()
     await store.open()
+    await store.consolidate_case_insensitive_sectors()
     master = StockMaster()
     kis = KISClient()
     http = httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"})
@@ -178,20 +179,30 @@ class StockIn(BaseModel):
     name: str | None = None
 
 
-class RegisterIn(BaseModel):
+class _SectorNameIn(BaseModel):
     sector_name: str = Field(min_length=1)
+
+    @field_validator("sector_name")
+    @classmethod
+    def normalize_and_require_sector_name(cls, value: str) -> str:
+        normalized = normalize_sector_name(value)
+        if not normalized:
+            raise ValueError("섹터명을 입력하세요")
+        return normalized
+
+
+class RegisterIn(_SectorNameIn):
     pick_date: str | None = None
     stocks: list[StockIn] = Field(min_length=1)
     author: str = Field(default="", max_length=20)  # 빈 값이면 핸들러가 DEFAULT_AUTHOR로
 
 
-class RemoveStockIn(BaseModel):
-    sector_name: str = Field(min_length=1)
+class RemoveStockIn(_SectorNameIn):
     stock_code: str = Field(min_length=1)
 
 
-class RemoveSectorIn(BaseModel):
-    sector_name: str = Field(min_length=1)
+class RemoveSectorIn(_SectorNameIn):
+    pass
 
 
 # ----- API -----

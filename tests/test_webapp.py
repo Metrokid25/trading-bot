@@ -455,6 +455,32 @@ async def test_register_and_list_roundtrip(client):
 
 
 @pytest.mark.asyncio
+async def test_register_sector_case_insensitive_roundtrip(client):
+    first = await client.post(
+        "/api/picks",
+        json={"sector_name": "ai솔루션", "stocks": [{"code": "005930"}]},
+    )
+    second = await client.post(
+        "/api/picks",
+        json={"sector_name": "AI솔루션", "stocks": [{"code": "000660"}]},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["is_new_pick"] is False
+    assert second.json()["total"] == 2
+    picks = (await client.get("/api/picks")).json()
+    matching = [
+        stock
+        for pick in picks
+        for stock in pick["stocks"]
+        if stock["sector"].casefold() == "ai솔루션".casefold()
+    ]
+    assert {stock["code"] for stock in matching} == {"005930", "000660"}
+    assert {stock["sector"] for stock in matching} == {"ai솔루션"}
+
+
+@pytest.mark.asyncio
 async def test_remove_stock(client):
     await client.post(
         "/api/picks",
@@ -470,6 +496,21 @@ async def test_remove_stock(client):
     picks = (await client.get("/api/picks")).json()
     codes = {s["code"] for p in picks for s in p["stocks"]}
     assert codes == {"000660"}  # 005930 제거됨
+
+
+@pytest.mark.asyncio
+async def test_remove_stock_sector_is_case_insensitive(client):
+    await client.post(
+        "/api/picks",
+        json={"sector_name": "ai솔루션", "stocks": [{"code": "005930"}]},
+    )
+    res = await client.post(
+        "/api/picks/remove-stock",
+        json={"sector_name": "AI솔루션", "stock_code": "005930"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["removed_from_picks"]
 
 
 @pytest.mark.asyncio
@@ -533,6 +574,16 @@ async def test_register_empty_stocks_rejected_by_validation(client):
         json={"sector_name": "반도체", "stocks": []},
     )
     # pydantic min_length=1 → 422
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_register_blank_sector_rejected_by_validation(client):
+    res = await client.post(
+        "/api/picks",
+        json={"sector_name": "   ", "stocks": [{"code": "005930"}]},
+    )
+
     assert res.status_code == 422
 
 
