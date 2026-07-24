@@ -249,3 +249,5 @@ def test_v2_equivalent_single_shot():
     assert v4r[0].entry == v2.entry
     assert v4r[0].reason == v2.reason == "1TP/BE"
     assert v4r[0].exit == v2.exit
+    assert v2.entry_time.endswith("09:15:00+09:00")
+    assert v2.exit_time.endswith("09:21:00+09:00")

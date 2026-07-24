@@ -151,6 +151,22 @@ def test_bench_continuing_member_includes_overnight(bench_con, fake_daily_cache)
     assert day_ret == pytest.approx((110 / 100 - 1 + 95 / 100 - 1) / 2)
 
 
+def test_joined_bench_uses_explicit_membership_boundary(
+        bench_con, fake_daily_cache):
+    # 현재 snapshot 로그에 A가 있어도 corrected 경계에서 신규면 시가→종가여야 한다.
+    _mark_prev_member(bench_con, "A")
+    day_ret, n, excluded = bench_day(
+        bench_con, D, [("A", "에이", "")], prev_members=set())
+    assert (n, excluded) == (1, 0)
+    assert day_ret == pytest.approx(110 / 105 - 1)
+
+
+def test_joined_bench_empty_day_carries_zero_return(
+        bench_con, fake_daily_cache):
+    assert bench_day(
+        bench_con, D, [], prev_members={"A"}) == (0.0, 0, 0)
+
+
 def test_bench_prev_member_without_prev_bar_falls_back(bench_con, fake_daily_cache):
     # B 는 전일 멤버였지만 전일 봉이 없음 → open→close 폴백
     _mark_prev_member(bench_con, "B")
@@ -170,6 +186,145 @@ def test_bench_dedups_same_code_across_sectors(bench_con, fake_daily_cache):
 def test_bench_all_missing_returns_zero(bench_con, fake_daily_cache):
     day_ret, n, excluded = bench_day(bench_con, D, [("C", "씨", "섹터1")])
     assert (day_ret, n, excluded) == (0.0, 0, 1)
+
+
+# ---------------- v2 공유현금 포트폴리오 ----------------
+
+def test_v2_portfolio_uses_known_strength_caps_and_cash():
+    def row(code, sector, strength, ret, entry, exit_):
+        return {"code": code, "sector": sector, "signal_strength": strength,
+                "ret_net": ret, "entry_time": entry, "exit_time": exit_}
+
+    rows = [
+        # 같은 09:30 진입에서 동일 섹터 세 번째 종목(C)은 상한 2 때문에 제외.
+        row("A", "AI", 0.10, 0.05, "2026-07-06T09:30:00+09:00",
+            "2026-07-06T10:00:00+09:00"),
+        row("B", "ai ", 0.09, -0.04, "2026-07-06T09:30:00+09:00",
+            "2026-07-06T11:00:00+09:00"),
+        row("C", "Ai", 0.08, 0.50, "2026-07-06T09:30:00+09:00",
+            "2026-07-06T12:00:00+09:00"),
+        row("D", "바이오", 0.07, 0.02, "2026-07-06T09:30:00+09:00",
+            "2026-07-06T13:00:00+09:00"),
+        # D의 다른 섹터 중복행 — 고유 종목은 한 슬롯만 사용
+        row("D", "헬스케어", 0.06, 0.02, "2026-07-06T09:30:00+09:00",
+            "2026-07-06T13:00:00+09:00"),
+    ]
+    day_ret, selected, skipped = paper_runner.v2_portfolio_day(rows)
+
+    assert [r["code"] for r in selected] == ["A", "B", "D"]
+    assert skipped == 1
+    # 5개 슬롯 중 3개만 사용: 빈 40%는 현금, 미래 ret은 순위에 쓰지 않는다.
+    assert day_ret == pytest.approx(
+        paper_runner.V2_PORTFOLIO_SLOT_WEIGHT * (0.05 - 0.04 + 0.02))
+
+
+def test_v2_portfolio_never_selects_more_than_five():
+    rows = [
+        {"code": f"C{i}", "sector": f"S{i}", "signal_strength": 1 - i / 10,
+         "ret_net": 0.01, "entry_time": "2026-07-06T09:30:00+09:00",
+         "exit_time": "2026-07-06T15:30:00+09:00"}
+        for i in range(7)
+    ]
+    day_ret, selected, skipped = paper_runner.v2_portfolio_day(rows)
+
+    assert len(selected) == paper_runner.V2_PORTFOLIO_MAX_POSITIONS == 5
+    assert skipped == 2
+    assert day_ret == pytest.approx(0.01)
+
+
+def test_v2_portfolio_late_signal_cannot_evict_earlier_trade():
+    rows = [
+        {"code": "EARLY", "sector": "S1", "signal_strength": 0.05,
+         "ret_net": 0.01, "entry_time": "2026-07-06T09:30:00+09:00",
+         "exit_time": "2026-07-06T15:30:00+09:00"},
+        *[
+            {"code": f"F{i}", "sector": f"S{i+2}", "signal_strength": 0.04 - i / 100,
+             "ret_net": 0.0, "entry_time": "2026-07-06T09:31:00+09:00",
+             "exit_time": "2026-07-06T15:30:00+09:00"}
+            for i in range(4)
+        ],
+        {"code": "LATE", "sector": "S9", "signal_strength": 0.99,
+         "ret_net": 0.50, "entry_time": "2026-07-06T10:00:00+09:00",
+         "exit_time": "2026-07-06T15:30:00+09:00"},
+    ]
+    _ret, selected, skipped = paper_runner.v2_portfolio_day(rows)
+    assert [r["code"] for r in selected] == ["EARLY", "F0", "F1", "F2", "F3"]
+    assert skipped == 1
+
+
+def test_v2_portfolio_reuses_slot_after_exit():
+    rows = [
+        {"code": "A", "sector": "S1", "signal_strength": 0.1,
+         "ret_net": 0.10, "entry_time": "2026-07-06T09:30:00+09:00",
+         "exit_time": "2026-07-06T10:00:00+09:00"},
+        {"code": "B", "sector": "S2", "signal_strength": 0.1,
+         "ret_net": -0.05, "entry_time": "2026-07-06T10:01:00+09:00",
+         "exit_time": "2026-07-06T11:00:00+09:00"},
+    ]
+    day_ret, selected, skipped = paper_runner.v2_portfolio_day(rows)
+    assert [r["code"] for r in selected] == ["A", "B"]
+    assert skipped == 0
+    assert day_ret == pytest.approx(0.2 * 0.10 + 0.2 * -0.05)
+
+
+def test_v2_portfolio_does_not_reuse_exit_cash_at_same_bar_timestamp():
+    rows = [
+        {
+            "code": f"OPEN{i}", "sector": f"S{i}", "signal_strength": 0.2,
+            "ret_net": 0.0, "entry_time": "2026-07-06T09:30:00+09:00",
+            "exit_time": "2026-07-06T10:00:00+09:00",
+        }
+        for i in range(5)
+    ]
+    rows.append({
+        "code": "NEW", "sector": "S9", "signal_strength": 0.99,
+        "ret_net": 0.5, "entry_time": "2026-07-06T10:00:00+09:00",
+        "exit_time": "2026-07-06T11:00:00+09:00",
+    })
+
+    day_ret, selected, skipped = paper_runner.v2_portfolio_day(rows)
+
+    assert [r["code"] for r in selected] == [
+        "OPEN0", "OPEN1", "OPEN2", "OPEN3", "OPEN4"]
+    assert skipped == 1
+    assert day_ret == pytest.approx(0.0)
+
+
+def test_portfolio_allocations_are_replaceable_audit_rows():
+    con = sqlite3.connect(":memory:")
+    con.execute(
+        "CREATE TABLE paper_portfolio_allocations ("
+        "day TEXT,strategy TEXT,code TEXT,name TEXT,sector TEXT,"
+        "entry_time TEXT,exit_time TEXT,weight REAL,ret_net REAL,pnl REAL,"
+        "detail TEXT,recorded_at TEXT,"
+        "PRIMARY KEY(day,strategy,code,entry_time))")
+    d = date(2026, 7, 6)
+    rows = [{
+        "code": "A", "name": "에이", "sector": "AI",
+        "entry_time": "2026-07-06T09:30:00+09:00",
+        "exit_time": "2026-07-06T10:00:00+09:00",
+        "weight": 0.2, "ret_net": 0.05, "pnl": 0.01, "detail": "1TP/BE",
+    }]
+    paper_runner._replace_portfolio_allocations(
+        con, d, "v2_portfolio", rows, "recorded")
+    paper_runner._replace_portfolio_allocations(
+        con, d, "v2_portfolio", rows, "recorded-again")
+
+    saved = con.execute(
+        "SELECT code,weight,pnl,recorded_at FROM paper_portfolio_allocations"
+    ).fetchall()
+    assert saved == [("A", 0.2, 0.01, "recorded-again")]
+
+
+def test_paper_conn_creates_portfolio_audit_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_runner, "PAPER_DB", tmp_path / "paper.db")
+    con = paper_runner.paper_conn()
+    try:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "paper_portfolio_allocations" in tables
+    finally:
+        con.close()
 
 
 # ---------------- v4r 관찰 축 (2026-07-19) ----------------
@@ -227,6 +382,94 @@ def test_run_v4r_replay_wiring(monkeypatch):
     assert len(keys) == len(rows)
 
 
+def test_membership_windows_use_append_only_events_and_split_reentry(tmp_path):
+    """snapshot 결측을 추측하지 않고 이벤트 시각을 보수적 거래일 경계로 바꾼다."""
+    db = tmp_path / "trading.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE universe_membership_events ("
+        "id INTEGER PRIMARY KEY,occurred_at TEXT,action TEXT,"
+        "stock_code TEXT,stock_name TEXT,source TEXT)")
+    con.executemany(
+        "INSERT INTO universe_membership_events VALUES (?,?,?,?,?,?)",
+        [
+            (1, "2026-07-06T07:00:00+09:00", "activate", "A", "에이", "test"),
+            (2, "2026-07-06T09:00:00+09:00", "activate", "B", "비", "test"),
+            (3, "2026-07-08T10:00:00+09:00", "deactivate", "A", "에이", "test"),
+            (4, "2026-07-09T09:00:00+09:00", "activate", "A", "에이새이름", "test"),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    d1, d2, d4, d5 = (
+        date(2026, 7, 6), date(2026, 7, 7),
+        date(2026, 7, 9), date(2026, 7, 10))
+    windows = paper_runner.load_membership_windows(str(db), d1, d5)
+    assert windows == [
+        ("A", "에이", d1, d2),
+        ("B", "비", d2, d5),
+        ("A", "에이새이름", d5, d5),
+    ]
+
+
+def test_membership_windows_missing_event_table_is_unavailable(tmp_path):
+    db = tmp_path / "legacy.db"
+    sqlite3.connect(db).close()
+    assert paper_runner.load_membership_windows(
+        str(db), date(2026, 7, 6), date(2026, 7, 10)) is None
+
+
+def test_membership_universe_uses_same_conservative_day_boundary():
+    d1, d2, d3 = date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)
+    windows = [
+        ("A", "에이", d1, d2),
+        ("B", "비", d2, d3),
+    ]
+
+    assert paper_runner.membership_universe_on(windows, d1) == [
+        ("A", "에이", "")]
+    assert paper_runner.membership_universe_on(windows, d2) == [
+        ("A", "에이", ""), ("B", "비", "")]
+    assert paper_runner.membership_universe_on(windows, d3) == [
+        ("B", "비", "")]
+
+
+def test_missing_data_skips_when_corrected_universe_is_still_active():
+    joined = [("A", "에이", "")]
+    assert paper_runner._must_skip_for_missing_market_data(
+        False, [], joined) is True
+
+
+def test_missing_data_allows_carry_only_when_both_universes_are_empty():
+    assert paper_runner._must_skip_for_missing_market_data(
+        False, [], []) is False
+
+
+def test_v4r_membership_windows_bound_each_replay(monkeypatch):
+    """v4r은 종목의 실제 활성 구간별 start/end만 backtest에 넘긴다."""
+    calls = []
+
+    def fake_backtest(cache, code, name, start, end, *, mode, **params):
+        calls.append((code, name, start, end, mode))
+        return []
+
+    monkeypatch.setattr(paper_runner, "backtest_symbol", fake_backtest)
+    monkeypatch.setattr(paper_runner, "_cache_conn", lambda: type(
+        "C", (), {"close": lambda self: None})())
+    d1, d2, d4 = date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 9)
+    windows = [("A", "에이", d1, d2), ("A", "에이", d4, d4)]
+
+    paper_runner.run_v4r_replay(
+        d1, d4, [("A", "에이", "섹터")],
+        membership_windows=windows)
+
+    assert calls == [
+        ("A", "에이", d1, d2, "v4r"),
+        ("A", "에이", d4, d4, "v4r"),
+    ]
+
+
 # ---------------- gm_v3 변형 축 (GM3_VARIANTS, 2026-07-11) ----------------
 
 def test_gm3_replay_cfg_variant_changes_result(monkeypatch):
@@ -269,3 +512,28 @@ def test_gm3_replay_cfg_variant_changes_result(monkeypatch):
     assert "GM3_VARIANTS" in dir(paper_runner)
     assert [s for s, _f in paper_runner.GM3_VARIANTS] == [
         "gm_v3", "gm_v3_r13", "gm_v3_r14", "gm_v3_r13r14"]
+
+
+def test_gm3_membership_windows_become_action_bounds(monkeypatch):
+    """gm_v3 워밍업은 유지하되 신호/체결은 실제 편입~이탈 구간으로 제한한다."""
+    calls = []
+    bars = [_bar(date(2026, 6, 1) + timedelta(days=i), 100, 100)
+            for i in range(40)]
+
+    def fake_simulate(code, actual_bars, cfg, *, fill_mode, act_from, act_to):
+        calls.append((code, fill_mode, act_from, act_to, len(actual_bars)))
+        return [], []
+
+    monkeypatch.setattr(paper_runner, "_daily_cache", {"A": bars})
+    monkeypatch.setattr(paper_runner, "simulate", fake_simulate)
+    d1, d2, d4 = date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 9)
+    windows = [("A", "에이", d1, d2), ("A", "에이", d4, d4)]
+
+    paper_runner.run_gm3_replay(
+        d1, d4, [("A", "에이", "섹터")],
+        membership_windows=windows)
+
+    assert calls == [
+        ("A", "next_open", d1, d2, 40),
+        ("A", "next_open", d4, d4, 40),
+    ]

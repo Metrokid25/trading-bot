@@ -33,6 +33,34 @@ def sector_key(value: str) -> str:
     return normalize_sector_name(value).casefold()
 
 
+def materialize_expired_picks(db_path=None) -> int:
+    """시간 경과로 만료된 active pick과 멤버십 이탈 이벤트를 함께 확정한다.
+
+    이벤트 테이블과 상태 전환 트리거가 모두 설치된 DB에서만 갱신한다. 구버전
+    DB를 새 paper runner가 먼저 열어 이벤트 없이 상태만 바꾸지 않기 위해서다.
+    """
+    path = str(db_path or settings.DB_PATH)
+    con = sqlite3.connect(path, timeout=15)
+    try:
+        ready = con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE "
+            "(type='table' AND name='universe_membership_events') OR "
+            "(type='trigger' AND name='trg_universe_pick_off')"
+        ).fetchone()[0]
+        if ready != 2:
+            return 0
+        cur = con.execute(
+            "UPDATE sector_picks SET status=? "
+            "WHERE status=? AND expires_at<=?",
+            (PickStatus.EXPIRED.value, PickStatus.ACTIVE.value,
+             to_db_iso(now_kst())),
+        )
+        con.commit()
+        return cur.rowcount or 0
+    finally:
+        con.close()
+
+
 class SectorStore:
     """픽 이벤트 + 섹터-종목 매핑 저장소."""
 
@@ -47,6 +75,9 @@ class SectorStore:
         await self.init_tables()
         await self._migrate_alert_history_v2()
         await self._migrate_sector_stocks_repick()
+        # 레거시 sector_stocks 컬럼 마이그레이션 후에 트리거/부트스트랩을 설치한다.
+        await self._create_universe_event_triggers()
+        await self._bootstrap_universe_membership_events()
 
     async def close(self) -> None:
         if self._db:
@@ -100,6 +131,22 @@ class SectorStore:
             "CREATE INDEX IF NOT EXISTS idx_stocks_dup_check "
             "ON sector_stocks (pick_id, sector_name, stock_code)"
         )
+        # 페이퍼 forward의 실제 편입/이탈 경계. snapshot overwrite가 아니라
+        # 코드 단위 active 상태 전환만 append-only로 남긴다.
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS universe_membership_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('activate','deactivate')),
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                source TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_universe_events_code_time "
+            "ON universe_membership_events(stock_code, occurred_at, id)"
+        )
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS alert_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +163,305 @@ class SectorStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_alerts_sector_time "
             "ON alert_history (sector_name, triggered_at)"
+        )
+
+    async def _create_universe_event_triggers(self) -> None:
+        """active 코드 집합의 경계만 기록하는 SQLite 트리거를 설치한다."""
+        if not self._db:
+            return
+        trigger_names = (
+            "trg_universe_stock_insert", "trg_universe_stock_delete",
+            "trg_universe_tracking_off", "trg_universe_tracking_on",
+            "trg_universe_pick_off", "trg_universe_pick_on",
+            "trg_universe_pick_expiry_off", "trg_universe_pick_expiry_on",
+            "trg_universe_stock_identity_off", "trg_universe_stock_identity_on",
+            "trg_universe_pick_delete",
+        )
+        for name in trigger_names:
+            await self._db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        active_other_new = (
+            "SELECT 1 FROM sector_stocks x "
+            "JOIN sector_picks p ON p.id=x.pick_id "
+            "WHERE x.stock_code=NEW.stock_code AND x.id!=NEW.id "
+            "AND COALESCE(x.tracking_status,'active')='active' "
+            "AND p.status='active' "
+            "AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')"
+        )
+        active_other_old = (
+            "SELECT 1 FROM sector_stocks x "
+            "JOIN sector_picks p ON p.id=x.pick_id "
+            "WHERE x.stock_code=OLD.stock_code "
+            "AND COALESCE(x.tracking_status,'active')='active' "
+            "AND p.status='active' "
+            "AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')"
+        )
+        statements = [
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_stock_insert
+               AFTER INSERT ON sector_stocks
+               WHEN COALESCE(NEW.tracking_status,'active')='active'
+                AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=NEW.pick_id
+                           AND p.status='active'
+                           AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                AND NOT EXISTS(""" + active_other_new + """)
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'activate',NEW.stock_code,NEW.stock_name,'stock_insert');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_stock_delete
+               AFTER DELETE ON sector_stocks
+               WHEN COALESCE(OLD.tracking_status,'active')='active'
+                AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=OLD.pick_id
+                           AND p.status='active'
+                           AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                AND NOT EXISTS(""" + active_other_old + """)
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'deactivate',OLD.stock_code,OLD.stock_name,'stock_delete');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_tracking_off
+               AFTER UPDATE OF tracking_status ON sector_stocks
+               WHEN COALESCE(OLD.tracking_status,'active')='active'
+                AND COALESCE(NEW.tracking_status,'active')!='active'
+                AND NOT EXISTS(""" + active_other_new + """)
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'deactivate',NEW.stock_code,NEW.stock_name,'tracking_off');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_tracking_on
+               AFTER UPDATE OF tracking_status ON sector_stocks
+               WHEN COALESCE(OLD.tracking_status,'active')!='active'
+                AND COALESCE(NEW.tracking_status,'active')='active'
+                AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=NEW.pick_id
+                           AND p.status='active'
+                           AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                AND NOT EXISTS(""" + active_other_new + """)
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'activate',NEW.stock_code,NEW.stock_name,'tracking_on');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_pick_off
+               AFTER UPDATE OF status ON sector_picks
+               WHEN OLD.status='active' AND NEW.status!='active'
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT CASE WHEN NEW.status='expired' THEN (
+                            SELECT MAX(expiry_at) FROM (
+                              SELECT OLD.expires_at AS expiry_at
+                              UNION ALL
+                              SELECT p2.expires_at
+                              FROM sector_stocks x2
+                              JOIN sector_picks p2 ON p2.id=x2.pick_id
+                              WHERE x2.stock_code=s.stock_code
+                               AND COALESCE(x2.tracking_status,'active')='active'
+                               AND p2.status IN ('active','expired')
+                               AND p2.expires_at<=strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+                               AND p2.expires_at>=COALESCE((
+                                 SELECT MAX(e2.occurred_at)
+                                 FROM universe_membership_events e2
+                                 WHERE e2.stock_code=s.stock_code
+                                  AND e2.action='activate'
+                               ),'')
+                            )
+                          )
+                             ELSE strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours') END,
+                        'deactivate',s.stock_code,MAX(s.stock_name),
+                        CASE WHEN NEW.status='expired' THEN 'pick_expired'
+                             ELSE 'pick_off' END
+                 FROM sector_stocks s WHERE s.pick_id=NEW.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND COALESCE((
+                    SELECT e.action FROM universe_membership_events e
+                    WHERE e.stock_code=s.stock_code ORDER BY e.id DESC LIMIT 1
+                  ),'deactivate')='activate'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=NEW.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_pick_on
+               AFTER UPDATE OF status ON sector_picks
+               WHEN OLD.status!='active' AND NEW.status='active'
+                AND NEW.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'activate',s.stock_code,MAX(s.stock_name),'pick_on'
+                 FROM sector_stocks s WHERE s.pick_id=NEW.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=NEW.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_pick_expiry_off
+               AFTER UPDATE OF expires_at ON sector_picks
+               WHEN NEW.status='active'
+                AND OLD.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+                AND NEW.expires_at<=strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'deactivate',s.stock_code,MAX(s.stock_name),'expiry_shortened'
+                 FROM sector_stocks s WHERE s.pick_id=NEW.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=NEW.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_pick_expiry_on
+               AFTER UPDATE OF expires_at ON sector_picks
+               WHEN NEW.status='active'
+                AND OLD.expires_at<=strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+                AND NEW.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT (
+                          SELECT MAX(expiry_at) FROM (
+                            SELECT OLD.expires_at AS expiry_at
+                            UNION ALL
+                            SELECT p2.expires_at
+                            FROM sector_stocks x2
+                            JOIN sector_picks p2 ON p2.id=x2.pick_id
+                            WHERE x2.stock_code=s.stock_code
+                             AND COALESCE(x2.tracking_status,'active')='active'
+                             AND p2.status IN ('active','expired')
+                             AND p2.expires_at<=strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+                             AND p2.expires_at>=COALESCE((
+                               SELECT MAX(e2.occurred_at)
+                               FROM universe_membership_events e2
+                               WHERE e2.stock_code=s.stock_code
+                                AND e2.action='activate'
+                             ),'')
+                          )
+                        ),
+                        'deactivate',s.stock_code,MAX(s.stock_name),
+                        'expiry_elapsed_before_extension'
+                 FROM sector_stocks s WHERE s.pick_id=NEW.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND COALESCE((
+                    SELECT e.action FROM universe_membership_events e
+                    WHERE e.stock_code=s.stock_code ORDER BY e.id DESC LIMIT 1
+                  ),'deactivate')='activate'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=NEW.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'activate',s.stock_code,MAX(s.stock_name),'expiry_extended'
+                 FROM sector_stocks s WHERE s.pick_id=NEW.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=NEW.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_stock_identity_off
+               AFTER UPDATE OF pick_id,stock_code ON sector_stocks
+               WHEN COALESCE(OLD.tracking_status,'active')='active'
+                AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=OLD.pick_id
+                           AND p.status='active'
+                           AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                AND NOT EXISTS(SELECT 1 FROM sector_stocks x
+                    JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=OLD.stock_code
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'deactivate',OLD.stock_code,OLD.stock_name,'stock_identity_off');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_stock_identity_on
+               AFTER UPDATE OF pick_id,stock_code ON sector_stocks
+               WHEN COALESCE(NEW.tracking_status,'active')='active'
+                AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=NEW.pick_id
+                           AND p.status='active'
+                           AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                AND NOT (OLD.stock_code=NEW.stock_code
+                         AND COALESCE(OLD.tracking_status,'active')='active'
+                         AND EXISTS(SELECT 1 FROM sector_picks p WHERE p.id=OLD.pick_id
+                                    AND p.status='active'
+                                    AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')))
+                AND NOT EXISTS(""" + active_other_new + """)
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 VALUES(strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'activate',NEW.stock_code,NEW.stock_name,'stock_identity_on');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_universe_pick_delete
+               BEFORE DELETE ON sector_picks
+               WHEN OLD.status='active'
+                AND OLD.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours')
+               BEGIN
+                 INSERT INTO universe_membership_events
+                   (occurred_at,action,stock_code,stock_name,source)
+                 SELECT strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'),
+                        'deactivate',s.stock_code,MAX(s.stock_name),'pick_delete'
+                 FROM sector_stocks s WHERE s.pick_id=OLD.id
+                  AND COALESCE(s.tracking_status,'active')='active'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM sector_stocks x JOIN sector_picks p ON p.id=x.pick_id
+                    WHERE x.stock_code=s.stock_code AND x.pick_id!=OLD.id
+                     AND COALESCE(x.tracking_status,'active')='active'
+                     AND p.status='active'
+                     AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%f+09:00','now','+9 hours'))
+                 GROUP BY s.stock_code;
+               END""",
+        ]
+        for sql in statements:
+            await self._db.execute(sql)
+
+    async def _bootstrap_universe_membership_events(self) -> None:
+        """기존 DB 최초 도입 시 현재 active 코드만 '지금'부터 관찰 시작한다."""
+        if not self._db:
+            return
+        row = await (await self._db.execute(
+            "SELECT COUNT(*) FROM universe_membership_events")).fetchone()
+        if row and row[0]:
+            return
+        now_iso = to_db_iso(now_kst())
+        await self._db.execute(
+            "INSERT INTO universe_membership_events "
+            "(occurred_at,action,stock_code,stock_name,source) "
+            "SELECT ?, 'activate', ss.stock_code, MAX(ss.stock_name), 'bootstrap' "
+            "FROM sector_stocks ss JOIN sector_picks sp ON sp.id=ss.pick_id "
+            "WHERE sp.status='active' AND sp.expires_at>? "
+            "AND COALESCE(ss.tracking_status,'active')='active' "
+            "GROUP BY ss.stock_code",
+            (now_iso, now_iso),
         )
 
     async def _migrate_alert_history_v2(self) -> None:

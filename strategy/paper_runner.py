@@ -65,9 +65,10 @@ from backtest.run_premarket_pullback import (  # noqa: E402
 )
 from backtest.toss_client import TossClient  # noqa: E402
 from config import settings  # noqa: E402
-from core.market_calendar import is_trading_day  # noqa: E402
+from core.market_calendar import add_trading_days, is_trading_day  # noqa: E402
 from core.market_schedule import next_action  # noqa: E402
 from core.time_utils import now_kst, to_db_iso  # noqa: E402
+from data.sector_store import materialize_expired_picks, sector_key  # noqa: E402
 from strategy.paper_notify import fmt_outperf, notify_events  # noqa: E402
 from strategy.gm_v3.config import GmV3Config  # noqa: E402
 from strategy.gm_v3.data_source import (  # noqa: E402
@@ -78,6 +79,8 @@ from strategy.gm_v3.paper import simulate  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PAPER_DB = PROJECT_ROOT / "db" / "paper.db"
+
+MembershipWindow = tuple[str, str, date, date]  # code, name, active_from, active_to
 
 COST_PER_SIDE = 0.0025          # 0.25%/편도 (왕복 0.5%)
 GM3_WARMUP_DAYS = 90            # 지표 워밍업용 과거 일봉(달력 아님, 거래일 여유)
@@ -101,6 +104,12 @@ V2_PARAMS = dict(pre_surge=0.05, pullback_min=0.03, support_tol=0.005,
 # 승자 게이트 + 오버나이트 무기한. 채택 아님 — forward 관찰 전용.
 V4R_PARAMS = dict(**V2_PARAMS, max_entries=4, use_after=False, winner_gate=True)
 
+# v2 현실 포트폴리오 관찰축. 신호 자체는 바꾸지 않고 사전 관측 가능한 프리장
+# 상대강도로만 선별한다. 종목당 20% × 최대 5종목, 동일 섹터 최대 2종목.
+V2_PORTFOLIO_MAX_POSITIONS = 5
+V2_PORTFOLIO_MAX_PER_SECTOR = 2
+V2_PORTFOLIO_SLOT_WEIGHT = 1.0 / V2_PORTFOLIO_MAX_POSITIONS
+
 REGIME = "live_universe_v1"     # 2026-07-06 운영 전환(A안). 정의 변경 시 v2 로 올릴 것.
 
 ASSUMPTIONS = {
@@ -117,12 +126,22 @@ ASSUMPTIONS = {
     "after_hours_rules": "애프터 급변 취소/프리장 갭 보류 미반영(보수적)",
     "v2_params": {k: (list(v) if isinstance(v, tuple) else v)
                   for k, v in V2_PARAMS.items()},
+    "v2_portfolio": {
+        "axes": ["v2_portfolio", "v2_leader_portfolio"],
+        "ranking": "진입 전에 확정된 프리장 상승률 내림차순, code tie-break",
+        "max_positions": V2_PORTFOLIO_MAX_POSITIONS,
+        "max_per_sector": V2_PORTFOLIO_MAX_PER_SECTOR,
+        "slot_weight": V2_PORTFOLIO_SLOT_WEIGHT,
+        "cash": "빈 슬롯은 현금. 당일 전량 청산 v2만 공유현금 NAV 산출",
+    },
     "universe": "trading.db 라이브(active 미만료 pick × active tracking, "
                 "이 기기 웹앱에서 등록) — 당일 유니버스는 paper_universe_log 감사 기록. "
                 "결측일 소급 기록 시에도 현재 라이브 유니버스 사용(기기 꺼짐=픽 불변)",
-    "gm3_universe": "리플레이 = 현재 유니버스 + 과거 제외 종목(제외일까지 act, "
-                    "그 시점 EOR 동결) — 웹앱 제거로 과거 손실이 소멸하는 "
-                    "생존편향 채널 차단",
+    "gm3_universe": "기존 축은 현재 유니버스 + 과거 제외 종목을 paper_start부터 "
+                    "리플레이(비교 연속성용 legacy)",
+    "joined_axes": "gm_v3_joined/v4r_joined는 trading.db의 append-only "
+                   "universe_membership_events만 사용. 장중 경계의 일봉 모호성을 피하려고 "
+                   "활성은 다음 거래일부터, 비활성은 직전 거래일까지 보수 적용",
     "v4r": "관찰 축(채택 아님): v2+국소 스윙 기준선+재진입≤4+승자 게이트+"
            "오버나이트 무기한, 애프터 진입 제외. 전체 리플레이 멱등, "
            "removed 는 제거일까지. EOR 은 편도 비용·실청산 집계 제외 (gm_v3 동일). "
@@ -173,6 +192,14 @@ def paper_conn() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS paper_notified ("
         " key TEXT PRIMARY KEY, day TEXT NOT NULL, kind TEXT NOT NULL,"
         " sent_at TEXT NOT NULL)"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_portfolio_allocations ("
+        " day TEXT NOT NULL, strategy TEXT NOT NULL, code TEXT NOT NULL,"
+        " name TEXT, sector TEXT NOT NULL, entry_time TEXT NOT NULL,"
+        " exit_time TEXT NOT NULL, weight REAL NOT NULL, ret_net REAL NOT NULL,"
+        " pnl REAL NOT NULL, detail TEXT, recorded_at TEXT NOT NULL,"
+        " PRIMARY KEY(day, strategy, code, entry_time))"
     )
     return con
 
@@ -346,17 +373,103 @@ def run_v2_for_day(day: date, universe) -> list[dict]:
         trades = backtest_symbol(cache, code, name, day, day,
                                  mode="v2", **V2_PARAMS)
         for t in trades:
+            strength = ((t.pre_high - t.prev_close) / t.prev_close
+                        if t.prev_close else 0.0)
             out.append({"code": code, "name": name, "sector": sector,
                         "day": t.day, "ret_gross": t.ret,
                         "ret_net": t.ret - 2 * COST_PER_SIDE,
+                        "signal_strength": strength,
+                        "entry_time": t.entry_time,
+                        "exit_time": t.exit_time,
                         "entry": t.entry, "exit": t.exit,   # 알림용 진입/청산가
                         "reason": t.reason, "detail": t.reason})
     cache.close()
     return out
 
 
-def run_v4r_replay(paper_start: date, today: date, universe,
-                   removed: list[tuple[str, str, date]] = ()) -> list[dict]:
+def v2_portfolio_day(rows: list[dict]) -> tuple[float, list[dict], int]:
+    """진입·청산 시각 순으로 v2 공유현금 슬롯을 배분한다.
+
+    같은 진입시각의 경쟁 신호만 프리장 상대강도로 정렬한다. 이미 체결된 오전
+    거래를 더 늦게 나타난 신호가 사후 탈락시키지 않는다. 청산된 슬롯은 이후
+    신호에 재사용하며, 대소문자/공백을 무시한 섹터 키로 동시보유 상한을 건다.
+    """
+    unique: dict[tuple[str, str], dict] = {}
+    invalid = 0
+    for row in rows:
+        entry_s, exit_s = row.get("entry_time", ""), row.get("exit_time", "")
+        try:
+            entry_dt = datetime.fromisoformat(entry_s)
+            exit_dt = datetime.fromisoformat(exit_s)
+        except (TypeError, ValueError):
+            invalid += 1
+            continue
+        if exit_dt < entry_dt:
+            invalid += 1
+            continue
+        item = dict(row)
+        item["_entry_dt"] = entry_dt
+        item["_exit_dt"] = exit_dt
+        key = (item["code"], entry_s)
+        old = unique.get(key)
+        # 같은 종목·진입시각이 여러 섹터에 중복되면 정규화 키/표시명으로 결정적 선택.
+        if old is None or (sector_key(item.get("sector", "")), item.get("sector", "")) < (
+                sector_key(old.get("sector", "")), old.get("sector", "")):
+            unique[key] = item
+
+    ranked = sorted(
+        unique.values(),
+        key=lambda r: (r["_entry_dt"], -r.get("signal_strength", 0.0), r["code"]),
+    )
+    active: list[dict] = []
+    selected: list[dict] = []
+    cash = 1.0
+    skipped = invalid
+
+    for row in ranked:
+        entry_dt = row["_entry_dt"]
+        still_open: list[dict] = []
+        for pos in active:
+            # 3분봉 timestamp만으로는 봉 내부의 청산/신규 진입 선후를 알 수 없다.
+            # 같은 timestamp의 청산 자금은 보수적으로 다음 timestamp부터 재사용한다.
+            if pos["_exit_dt"] < entry_dt:
+                cash += pos["weight"] + pos["pnl"]
+            else:
+                still_open.append(pos)
+        active = still_open
+
+        active_codes = {p["code"] for p in active}
+        sec_key = sector_key(row.get("sector", ""))
+        sec_count = sum(1 for p in active if p["_sector_key"] == sec_key)
+        if (row["code"] in active_codes
+                or len(active) >= V2_PORTFOLIO_MAX_POSITIONS
+                or sec_count >= V2_PORTFOLIO_MAX_PER_SECTOR
+                or cash <= 0):
+            skipped += 1
+            continue
+
+        weight = min(V2_PORTFOLIO_SLOT_WEIGHT, cash)
+        cash -= weight
+        allocation = dict(row)
+        allocation["weight"] = weight
+        allocation["pnl"] = weight * row["ret_net"]
+        allocation["_sector_key"] = sec_key
+        active.append(allocation)
+        selected.append(allocation)
+
+    for pos in active:
+        cash += pos["weight"] + pos["pnl"]
+    for row in selected:
+        for private in ("_entry_dt", "_exit_dt", "_sector_key"):
+            row.pop(private, None)
+    return cash - 1.0, selected, skipped
+
+
+def run_v4r_replay(
+        paper_start: date, today: date, universe,
+        removed: list[tuple[str, str, date]] = (),
+        membership_windows: list[MembershipWindow] | None = None,
+        ) -> list[dict]:
     """v4r 전체 리플레이(결정적·멱등) — 오버나이트 멀티데이라 gm_v3 처럼
     매일 [paper_start, act_to] 를 통째로 재계산한다.
 
@@ -366,14 +479,19 @@ def run_v4r_replay(paper_start: date, today: date, universe,
     차감하고 equity 에 반영, 실청산 집계에서는 제외한다.
     """
     cache = _cache_conn()
-    targets: dict[str, tuple[str, date]] = {}
-    for code, name, _sector in universe:
-        targets.setdefault(code, (name, today))
-    for code, name, last_day in removed:
-        targets.setdefault(code, (name, min(last_day, today)))
+    if membership_windows is None:
+        targets: dict[str, tuple[str, date]] = {}
+        for code, name, _sector in universe:
+            targets.setdefault(code, (name, today))
+        for code, name, last_day in removed:
+            targets.setdefault(code, (name, min(last_day, today)))
+        windows = [(code, name, paper_start, end_d)
+                   for code, (name, end_d) in targets.items()]
+    else:
+        windows = membership_windows
     out: list[dict] = []
-    for code, (name, end_d) in targets.items():
-        trades = backtest_symbol(cache, code, name, paper_start, end_d,
+    for code, name, act_from, act_to in windows:
+        trades = backtest_symbol(cache, code, name, act_from, act_to,
                                  mode="v4r", **V4R_PARAMS)
         for t in trades:
             eor = t.reason.endswith("EOR")
@@ -393,7 +511,9 @@ def run_v4r_replay(paper_start: date, today: date, universe,
 
 def run_gm3_replay(paper_start: date, today: date, universe,
                    removed: list[tuple[str, str, date]] = (),
-                   cfg: GmV3Config | None = None) -> list[dict]:
+                   cfg: GmV3Config | None = None,
+                   membership_windows: list[MembershipWindow] | None = None,
+                   ) -> list[dict]:
     """gm_v3 전체 리플레이(결정적) — act 윈도우 [paper_start, act_to].
 
     상태를 DB에 영속하지 않고 매일 데이터에서 재구성 → 멱등.
@@ -404,20 +524,25 @@ def run_gm3_replay(paper_start: date, today: date, universe,
     cfg 로 룰 토글 변형(GM3_VARIANTS)을 주입한다 — None 이면 기본 gm_v3.
     """
     cfg = cfg if cfg is not None else GmV3Config()
-    targets: dict[str, tuple[str, date]] = {}
-    for code, name, _sector in universe:
-        targets.setdefault(code, (name, today))
-    for code, name, last_day in removed:
-        targets.setdefault(code, (name, min(last_day, today)))
+    if membership_windows is None:
+        targets: dict[str, tuple[str, date]] = {}
+        for code, name, _sector in universe:
+            targets.setdefault(code, (name, today))
+        for code, name, last_day in removed:
+            targets.setdefault(code, (name, min(last_day, today)))
+        windows = [(code, name, paper_start, act_to)
+                   for code, (name, act_to) in targets.items()]
+    else:
+        windows = membership_windows
     out: list[dict] = []
     skipped: list[str] = []
-    for code, (name, act_to) in targets.items():
+    for code, name, act_from, act_to in windows:
         bars = daily_bars(code)
         if len(bars) < 20:
             skipped.append(code)
             continue
         trades, _sigs = simulate(code, bars, cfg, fill_mode="next_open",
-                                 act_from=paper_start, act_to=act_to)
+                                 act_from=act_from, act_to=act_to)
         for t in trades:
             inv = min(t.max_invested, 1.0)   # 방어적 캡 (L5)
             # EOR = 아직 열린 포지션의 MTM 스냅샷 — 청산 비용은 실제 청산 시에만.
@@ -433,7 +558,8 @@ def run_gm3_replay(paper_start: date, today: date, universe,
     return out
 
 
-def bench_day(con: sqlite3.Connection, day: date, universe) -> tuple[float, int, int]:
+def bench_day(con: sqlite3.Connection, day: date, universe, *,
+              prev_members: set[str] | None = None) -> tuple[float, int, int]:
     """당일 유니버스 동일가중 일수익: (day_ret, 반영 종목수, 제외 종목수).
 
     2026-07-06 운영 전환(A안) 재정의 + 리뷰 F1 반영:
@@ -447,14 +573,15 @@ def bench_day(con: sqlite3.Connection, day: date, universe) -> tuple[float, int,
       - 무비용 기준선. 당일 봉 없는 종목(거래정지 등)은 그날 제외.
     equity 체인은 record_day 에서 _prev_equity × (1+day_ret) 로 잇는다.
     """
-    prev_log_day = con.execute(
-        "SELECT MAX(day) FROM paper_universe_log WHERE day<?",
-        (day.isoformat(),)).fetchone()[0]
-    prev_members: set[str] = set()
-    if prev_log_day:
-        prev_members = {r[0] for r in con.execute(
-            "SELECT DISTINCT code FROM paper_universe_log WHERE day=?",
-            (prev_log_day,))}
+    if prev_members is None:
+        prev_log_day = con.execute(
+            "SELECT MAX(day) FROM paper_universe_log WHERE day<?",
+            (day.isoformat(),)).fetchone()[0]
+        prev_members = set()
+        if prev_log_day:
+            prev_members = {r[0] for r in con.execute(
+                "SELECT DISTINCT code FROM paper_universe_log WHERE day=?",
+                (prev_log_day,))}
 
     rets: list[float] = []
     excluded = 0
@@ -517,6 +644,23 @@ def _upsert_daily(con, day: date, strategy: str, n: int, day_ret: float,
          REGIME, finalized))
 
 
+def _replace_portfolio_allocations(con: sqlite3.Connection, day: date,
+                                   strategy: str, rows: list[dict],
+                                   now_iso: str) -> None:
+    con.execute(
+        "DELETE FROM paper_portfolio_allocations WHERE day=? AND strategy=?",
+        (day.isoformat(), strategy))
+    con.executemany(
+        "INSERT INTO paper_portfolio_allocations "
+        "(day,strategy,code,name,sector,entry_time,exit_time,weight,ret_net,pnl,"
+        " detail,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(day.isoformat(), strategy, r["code"], r.get("name"),
+          r.get("sector", ""), r["entry_time"], r["exit_time"], r["weight"],
+          r["ret_net"], r["pnl"], r.get("detail"), now_iso)
+         for r in rows],
+    )
+
+
 def _removed_members(con: sqlite3.Connection, universe,
                      day: date) -> list[tuple[str, str, date]]:
     """과거 paper_universe_log 에 있었으나 현재 유니버스에 없는 종목과 마지막 등록일."""
@@ -526,6 +670,77 @@ def _removed_members(con: sqlite3.Connection, universe,
         "WHERE day<? GROUP BY code", (day.isoformat(),)).fetchall()
     return [(code, name or code, date.fromisoformat(last))
             for code, name, last in rows if code not in cur]
+
+
+def _previous_trading_day(d: date) -> date:
+    candidate = d - timedelta(days=1)
+    while not _is_trading_day_cached(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def load_membership_windows(db_path: str, paper_start: date,
+                            day: date) -> list[MembershipWindow] | None:
+    """append-only 활성/비활성 이벤트로 보수적 일봉 replay 구간을 만든다.
+
+    테이블이 아직 배포되지 않았으면 None을 반환해 corrected 축 기록을 건너뛴다.
+    과거 상태를 현재 snapshot으로 추측하거나 결측일에 소급 생성하지 않는다.
+    """
+    con = sqlite3.connect(f"file:{Path(db_path).resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        exists = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='universe_membership_events'").fetchone()
+        if not exists:
+            return None
+        rows = con.execute(
+            "SELECT occurred_at,action,stock_code,stock_name "
+            "FROM universe_membership_events WHERE occurred_at<? "
+            "ORDER BY occurred_at,id",
+            ((day + timedelta(days=1)).isoformat(),),
+        ).fetchall()
+    finally:
+        con.close()
+
+    active: dict[str, tuple[str, date]] = {}
+    windows: list[MembershipWindow] = []
+    for occurred_s, action, code, name in rows:
+        occurred = datetime.fromisoformat(occurred_s)
+        if action == "activate":
+            effective = (occurred.date() if occurred.time() <= dtime(8, 0)
+                         else add_trading_days(occurred.date(), 1))
+            effective = max(effective, paper_start)
+            if effective <= day and code not in active:
+                active[code] = (name or code, effective)
+        elif action == "deactivate" and code in active:
+            old_name, active_from = active.pop(code)
+            effective_end = (occurred.date() if occurred.time() >= dtime(20, 0)
+                             else _previous_trading_day(occurred.date()))
+            effective_end = min(effective_end, day)
+            if active_from <= effective_end:
+                windows.append((code, old_name, active_from, effective_end))
+
+    for code, (name, active_from) in active.items():
+        if active_from <= day:
+            windows.append((code, name, active_from, day))
+    return sorted(windows, key=lambda w: (w[2], w[0], w[3]))
+
+
+def membership_universe_on(
+        windows: list[MembershipWindow], day: date,
+        ) -> list[tuple[str, str, str]]:
+    """보수적 멤버십 구간과 정확히 같은 경계의 당일 벤치 유니버스."""
+    members: dict[str, str] = {}
+    for code, name, active_from, active_to in windows:
+        if active_from <= day <= active_to:
+            members[code] = name
+    return [(code, members[code], "") for code in sorted(members)]
+
+
+def _must_skip_for_missing_market_data(
+        has_market_data: bool, universe, joined_universe) -> bool:
+    """활성 관찰 대상이 하나라도 있으면 데이터 0건을 수익률 0으로 확정하지 않는다."""
+    return not has_market_data and bool(universe or joined_universe)
 
 
 def record_day(day: date) -> dict:
@@ -547,10 +762,18 @@ def record_day(day: date) -> dict:
             f"day({day}) < 마지막 기록일({last_rec}) — 소급 기록 불가. "
             "이력 재구축이 필요하면 paper.db 리셋 후 순서대로 재기록.")
 
+    expired = materialize_expired_picks(str(settings.DB_PATH))
+    if expired:
+        logger.info("[paper][universe] 시간 경과 만료 {}개 상태/이탈 이벤트 확정", expired)
     universe = load_universe()
-    if not universe:
+    membership_windows = load_membership_windows(
+        str(settings.DB_PATH), paper_start, day)
+    if not universe and not membership_windows:
         con.close()
         raise SystemExit("라이브 유니버스 0종목 — 웹앱 픽 등록/만료 상태 확인 필요")
+    if not universe:
+        logger.info(
+            "[paper][universe] 라이브 0종목 — 과거 멤버십 종료/벤치 carry만 기록")
     codes = [c for c, _n, _s in universe]
 
     now = now_kst()
@@ -575,14 +798,25 @@ def record_day(day: date) -> dict:
         "INSERT INTO paper_universe_log VALUES (?,?,?,?,?)",
         [(day.isoformat(), c, n, s, now_iso) for c, n, s in universe])
     con.commit()
+    joined_universe = (
+        membership_universe_on(membership_windows, day)
+        if membership_windows is not None else [])
+    cache_codes = sorted({
+        *codes,
+        *(code for code, _name, _sector in joined_universe),
+        *(code for code, _name, _start, _end in (membership_windows or [])),
+    })
 
     # 1) 당일 분봉 적재 (토스, 당일분은 tail 증분) — paper.db 트랜잭션 없음
-    ensure_day_cached(day, codes)
+    ensure_day_cached(day, cache_codes)
     _daily_cache.clear()                    # 새 데이터 반영해 일봉 재합성
 
     # 1.5) 시장 데이터 0건이면 기록하지 않는다 — 새벽 사이클/수집 전면 실패가
     #      day_ret=0 유령 행을 만들어 체인·M2 가드를 오염시키는 것 방지 (리뷰 F2)
-    if not any(b.day == day for c in set(codes) for b in daily_bars(c)):
+    has_market_data = any(
+        b.day == day for c in set(cache_codes) for b in daily_bars(c))
+    if _must_skip_for_missing_market_data(
+            has_market_data, universe, joined_universe):
         con.close()
         logger.info("[paper] {} 시장 데이터 0건 — 기록 스킵 (장 시작 전/수집 실패)", day)
         return {"day": day.isoformat(), "skipped": "no_market_data"}
@@ -615,7 +849,26 @@ def record_day(day: date) -> dict:
     }
     gm3_rows = gm3_by_strat["gm_v3"]     # 기존 소비자(알림 등)는 기본 축 유지
     v4r_rows = run_v4r_replay(paper_start, day, universe, removed)
+    joined_rows = None
+    if membership_windows is not None:
+        joined_rows = {
+            "gm_v3_joined": run_gm3_replay(
+                paper_start, day, universe, cfg=GmV3Config(),
+                membership_windows=membership_windows),
+            "v4r_joined": run_v4r_replay(
+                paper_start, day, universe,
+                membership_windows=membership_windows),
+        }
     b_ret, n_bench, n_excl = bench_day(con, day, universe)
+    joined_bench = None
+    if membership_windows:
+        joined_prev_day = _previous_trading_day(day)
+        joined_prev_members = {
+            code for code, _name, _sector
+            in membership_universe_on(membership_windows, joined_prev_day)
+        }
+        joined_bench = bench_day(
+            con, day, joined_universe, prev_members=joined_prev_members)
 
     # 확정 판정: 과거일 기록이거나 20:05(애프터 종료+버퍼) 이후만 확정치 (리뷰 F2)
     finalized = 1 if (day < now.date() or now.time() >= dtime(20, 5)) else 0
@@ -633,6 +886,23 @@ def record_day(day: date) -> dict:
         _upsert_daily(con, day, strat, len(rows), day_ret - 1, eq, note,
                       now_iso, finalized)
         summary[strat] = {"trades": len(rows), "day_ret": day_ret - 1, "equity": eq}
+
+    #    v2 공유현금 NAV 관찰축 — 기존 직렬복리 축은 비교/호환을 위해 그대로 둔다.
+    #    v2는 당일 전량 청산이라 일별 슬롯 배분만으로 현금·동시신호를 정확히 반영.
+    for strat, rows in (("v2_portfolio", v2_rows),
+                        ("v2_leader_portfolio", leader_rows)):
+        p_ret, selected, skipped = v2_portfolio_day(rows)
+        eq = _prev_equity(con, strat, day) * (1 + p_ret)
+        _replace_portfolio_allocations(con, day, strat, selected, now_iso)
+        sectors = ",".join(sorted({r["sector"] for r in selected})) or "-"
+        _upsert_daily(
+            con, day, strat, len(selected), p_ret, eq,
+            f"selected={len(selected)},skipped={skipped},sectors={sectors}",
+            now_iso, finalized)
+        summary[strat] = {
+            "trades": len(selected), "day_ret": p_ret, "equity": eq,
+            "skipped": skipped,
+        }
 
     #    gm_v3 (+변형 축) — 전체 리플레이 재기록(멱등). EOR(미청산 MTM)은 equity
     #    반영, 실청산 집계 제외 (H1). 제거 종목 이력은 removed 로 보존.
@@ -668,16 +938,67 @@ def record_day(day: date) -> dict:
     summary["v4r"] = {"closed_today": len(v4r_closed_today),
                       "open_positions": len(v4r_open), "equity": eq_v}
 
+    #    append-only 실제 편입 이벤트 기반 corrected 관찰축. 기존 축은 비교 연속성을
+    #    위해 보존하고, corrected 축만 등록 전/비활성 구간을 제외한다.
+    if joined_rows is not None and membership_windows:
+        for strat, rows in joined_rows.items():
+            con.execute("DELETE FROM paper_trades WHERE strategy=?", (strat,))
+            _upsert_trades(con, strat, rows, now_iso)
+            real_closed_today = [
+                r for r in rows
+                if not r["eor"] and str(r["closed_on"]) == day.isoformat()]
+            open_mtm = [r for r in rows if r["eor"]]
+            eq = _serial_equity(con, strat, day)
+            prev_eq = _prev_equity(con, strat, day)
+            _upsert_daily(
+                con, day, strat, len(real_closed_today),
+                eq / prev_eq - 1 if prev_eq else 0.0, eq,
+                f"open_mtm={len(open_mtm)},windows={len(membership_windows)}",
+                now_iso, finalized)
+            summary[strat] = {
+                "closed_today": len(real_closed_today),
+                "open_positions": len(open_mtm),
+                "equity": eq,
+            }
+
     #    벤치마크 — 당일 유니버스 일수익을 직전 레짐 equity 에 체인
     eq_b = _prev_equity(con, "bench_bh", day) * (1 + b_ret)
     _upsert_daily(con, day, "bench_bh", n_bench, b_ret, eq_b,
                   f"stocks={n_bench},excluded={n_excl}", now_iso, finalized)
     summary["bench_bh"] = {"equity": eq_b, "day_ret": b_ret,
                            "stocks": n_bench, "excluded": n_excl}
+    # v2_portfolio는 도입일부터 시작하므로 같은 시작점의 별도 벤치를 체인한다.
+    eq_bp = _prev_equity(con, "bench_v2_portfolio", day) * (1 + b_ret)
+    _upsert_daily(con, day, "bench_v2_portfolio", n_bench, b_ret, eq_bp,
+                  f"stocks={n_bench},excluded={n_excl},matched=v2_portfolio",
+                  now_iso, finalized)
+    summary["bench_v2_portfolio"] = {
+        "equity": eq_bp, "day_ret": b_ret, "stocks": n_bench,
+        "excluded": n_excl,
+    }
+    eq_joined = None
+    if (joined_rows is not None and membership_windows
+            and joined_bench is not None):
+        joined_ret, joined_n, joined_excl = joined_bench
+        eq_joined = (
+            _prev_equity(con, "bench_joined", day) * (1 + joined_ret))
+        _upsert_daily(
+            con, day, "bench_joined", joined_n, joined_ret, eq_joined,
+            f"stocks={joined_n},excluded={joined_excl},matched=joined_axes",
+            now_iso, finalized)
+        summary["bench_joined"] = {
+            "equity": eq_joined, "day_ret": joined_ret, "stocks": joined_n,
+            "excluded": joined_excl,
+        }
 
     # 4) 알파(초과수익) 스냅샷
     for strat in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
         summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_b
+    for strat in ("v2_portfolio", "v2_leader_portfolio"):
+        summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_bp
+    if eq_joined is not None:
+        for strat in ("gm_v3_joined", "v4r_joined"):
+            summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_joined
     summary["finalized"] = finalized
 
     con.commit()
@@ -756,9 +1077,20 @@ def report() -> None:
         bench = rows.get("bench_bh")
         if bench:
             print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
+            matched = rows.get("bench_v2_portfolio", 1.0)
             for s in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
                 if s in rows:
                     print(f"  {s:<13} {fmt_outperf(rows[s], bench)}")
+            for s in ("v2_portfolio", "v2_leader_portfolio"):
+                if s in rows:
+                    print(f"  {s:<20} {fmt_outperf(rows[s], matched)}"
+                          " (동시작 벤치)")
+            joined_bench = rows.get("bench_joined")
+            if joined_bench is not None:
+                for s in ("gm_v3_joined", "v4r_joined"):
+                    if s in rows:
+                        print(f"  {s:<20} {fmt_outperf(rows[s], joined_bench)}"
+                              " (실편입·동시작 벤치)")
     con.close()
 
 

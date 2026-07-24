@@ -129,7 +129,13 @@ def fmt_outperf(strat_eq: float, bench_eq: float) -> str:
 
 # summary dict 에서 전략이 아닌 메타 키 — 이 외 dict 값은 전부 전략으로 간주해
 # 출력하므로, 전략 축이 늘어나도(GM3_VARIANTS 등) 자동으로 요약에 포함된다.
-_SUMMARY_META_KEYS = {"day", "universe", "finalized", "skipped", "bench_bh"}
+_SUMMARY_META_KEYS = {
+    "day", "universe", "finalized", "skipped", "bench_bh",
+    # 신규 회계 관찰축은 paper.db/--report에서 먼저 검증한다. 기존 텔레그램의
+    # 매매·누적 통계 계약과 섞지 않는다.
+    "bench_v2_portfolio", "v2_portfolio", "v2_leader_portfolio",
+    "bench_joined", "gm_v3_joined", "v4r_joined",
+}
 
 # 전략 표시명 (미등록 축은 이름 그대로)
 _STRAT_LABEL = {
@@ -207,6 +213,7 @@ def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
     rows = con.execute(
         "SELECT strategy, COALESCE(name, code), ret_net, COALESCE(detail,'') "
         "FROM paper_trades WHERE closed_on=? AND detail NOT LIKE '%EOR%' "
+        "AND strategy NOT IN ('gm_v3_joined','v4r_joined') "
         "ORDER BY strategy, ret_net DESC", (day_s,)).fetchall()
     if rows:
         for strat, name, rn, det in rows[:_MAX_TRADE_LINES]:

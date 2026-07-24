@@ -1555,3 +1555,40 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 다음 작업자가 성과를 다시 볼 때 절대수익·동적 B&H뿐 아니라 동일 gross exposure 벤치,
   MDD, downside capture, 오버나이트 손익, 비용/슬리피지 민감도를 함께 보고한다.
 - 이번 진단은 파일·DB·주문·상주 프로세스를 변경하지 않았다.
+
+---
+
+## 2026-07-24 P0 forward 측정 신뢰도 보강 (승인·배포 대기)
+
+- 작업 브랜치: `fix/paper-membership-windows`. 아직 커밋·push·미니PC 배포하지 않았다.
+- **실제 편입 구간**: `trading.db`에 코드 단위 append-only
+  `universe_membership_events`를 추가했다. 등록·추적 상태·Pick 상태·만료 변경·종목
+  이동/삭제를 SQLite trigger로 기록한다. 기존 DB 최초 적용 시 현재 active 코드만
+  적용 시점부터 bootstrap하며 과거 편입일을 꾸며내지 않는다.
+- **만료 경계**: paper 실행 전 시간 경과 만료를 상태 전환해 이탈 이벤트를 확정한다.
+  이벤트 시각은 실제 `expires_at`이며, 같은 코드가 여러 active Pick에 있으면 마지막
+  Pick의 만료시각을 쓴다. 만료 후 연장도 비활성 구간을 먼저 복원한다.
+- **보수적 일봉 경계**: 08:00 이후 편입은 다음 거래일부터, 20:00 이전 이탈은 직전
+  거래일까지 적용한다. 신규 관찰축 `gm_v3_joined`, `v4r_joined`와
+  `bench_joined`가 동일한 멤버십 경계를 사용한다. 현재 snapshot으로 과거 빈 구간을
+  채우지 않는다.
+- **공유현금 NAV**: 기존 v2 직렬복리축은 비교 연속성을 위해 그대로 두고,
+  `v2_portfolio`, `v2_leader_portfolio`를 별도 관찰축으로 추가했다. 진입시각 순,
+  동시 최대 5종목, 종목당 20%, 정규화 섹터당 최대 2종목이다. 같은 3분봉 시각의
+  청산금은 봉 내부 순서를 모르므로 재사용하지 않는다. 실제 배분은
+  `paper_portfolio_allocations`에 감사 가능하게 저장한다.
+- 신규축은 검증 기간 동안 텔레그램 매매/요약에서 제외한다. 기존
+  `v2`, `v2_leader`, `gm_v3` 변형, `v4r`, `bench_bh` 계산 경로는 유지한다.
+- `bench_v2_portfolio`와 `bench_joined`는 **동일 시작점·동일 편입 경계 벤치**다.
+  아직 동일 gross exposure 벤치는 아니므로 성과 해석 시 혼동하지 않는다.
+- 라이브와 corrected 유니버스가 모두 빈 날만 0% carry를 허용한다. 어느 한쪽이라도
+  활성인데 시장 데이터가 0건이면 기존처럼 기록을 스킵해 수집 실패를 0수익으로
+  확정하지 않는다.
+- 검증: 전체 `tests\` **433 passed, 기존 warning 1건**, `git diff --check` 정상.
+  독립 리뷰 5회에서 snapshot 누수, 미래 신호 선별, 만료/다중 Pick 경계, 빈
+  corrected 벤치, 데이터 0건 확정 문제를 보강한 뒤 최종 승인받았다.
+- 배포 시 주의: 이 변경은 실제 `trading.db`에 이벤트 테이블/trigger와 만료 상태
+  이벤트를 쓰므로 오너의 별도 배포 승인이 필요하다. 장 마감 후 **웹앱을 먼저 WMI
+  재기동**해 schema/trigger/bootstrap을 설치한 뒤 **paper_runner만 WMI 재기동**한다.
+  주문 프로세스와 tracker는 건드리지 않는다. 이후 `--report`, 프로세스 부모,
+  이벤트 bootstrap, 기존 웹 유니버스를 스모크 확인한다.

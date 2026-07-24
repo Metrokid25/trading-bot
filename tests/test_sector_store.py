@@ -17,7 +17,7 @@ import pytest_asyncio
 import aiosqlite
 
 from data.sector_models import PickStatus, SectorPick, SectorStock
-from data.sector_store import AlertResult, SectorStore
+from data.sector_store import AlertResult, SectorStore, materialize_expired_picks
 
 
 # ---------- fixture ----------
@@ -39,6 +39,252 @@ def _pick(raw: str = "") -> SectorPick:
 def _stock(sector: str, code: str, name: str, order: int = 1) -> SectorStock:
     return SectorStock(pick_id=0, sector_name=sector, stock_code=code,
                        stock_name=name, added_order=order)
+
+
+# ---------- append-only universe membership events ----------
+
+@pytest.mark.asyncio
+async def test_membership_events_follow_code_level_active_boundary(store: SectorStore):
+    """같은 코드가 여러 섹터에 있으면 최초 활성/마지막 이탈만 기록한다."""
+    await store.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    await store.upsert_sector(
+        "반도체", [_stock("반도체", "005930", "삼성전자")], _pick())
+    await store.remove_stock_from_sector("AI", "005930")
+    await store.remove_stock_from_sector("반도체", "005930")
+
+    rows = await (await store._db.execute(
+        "SELECT action,stock_code,source FROM universe_membership_events "
+        "ORDER BY id")).fetchall()
+    assert rows == [
+        ("activate", "005930", "stock_insert"),
+        ("deactivate", "005930", "stock_delete"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_membership_events_record_pick_archive(store: SectorStore):
+    result = await store.upsert_sector(
+        "AI", [_stock("AI", "000660", "SK하이닉스")], _pick())
+    await store.archive_pick(result.pick_id)
+    # 이미 inactive인 과거 행을 정리해도 거짓 deactivate를 추가하면 안 된다.
+    await store._db.execute(
+        "DELETE FROM sector_stocks WHERE pick_id=?", (result.pick_id,))
+
+    rows = await (await store._db.execute(
+        "SELECT action,source FROM universe_membership_events ORDER BY id")).fetchall()
+    assert rows == [
+        ("activate", "stock_insert"),
+        ("deactivate", "pick_off"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_membership_bootstrap_runs_after_legacy_column_migration(tmp_path):
+    db = tmp_path / "legacy.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE sector_picks (id INTEGER PRIMARY KEY,pick_date TEXT,"
+        "created_at TEXT,expires_at TEXT,status TEXT,raw_input TEXT)")
+    con.execute(
+        "CREATE TABLE sector_stocks (id INTEGER PRIMARY KEY,pick_id INTEGER,"
+        "sector_name TEXT,stock_code TEXT,stock_name TEXT,added_order INTEGER)")
+    now = datetime.now().astimezone()
+    con.execute(
+        "INSERT INTO sector_picks VALUES (1,'2026-07-24',?,?, 'active','')",
+        (now.isoformat(), (now + timedelta(days=7)).isoformat()))
+    con.execute(
+        "INSERT INTO sector_stocks VALUES (1,1,'AI','005930','삼성전자',1)")
+    con.commit()
+    con.close()
+
+    legacy = SectorStore(db)
+    await legacy.open()
+    try:
+        rows = await (await legacy._db.execute(
+            "SELECT action,stock_code,source FROM universe_membership_events")
+        ).fetchall()
+        assert rows == [("activate", "005930", "bootstrap")]
+    finally:
+        await legacy.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_events_follow_expiry_shorten_and_extend(store: SectorStore):
+    result = await store.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    past = (datetime.now().astimezone() - timedelta(days=1)).isoformat()
+    future = (datetime.now().astimezone() + timedelta(days=7)).isoformat()
+
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?", (past, result.pick_id))
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?", (future, result.pick_id))
+
+    rows = await (await store._db.execute(
+        "SELECT action,source FROM universe_membership_events ORDER BY id")).fetchall()
+    assert rows == [
+        ("activate", "stock_insert"),
+        ("deactivate", "expiry_shortened"),
+        ("activate", "expiry_extended"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_materialize_natural_expiry_uses_expiry_time_and_no_duplicate(tmp_path):
+    db = tmp_path / "expiry.db"
+    s = SectorStore(db)
+    await s.open()
+    result = await s.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    activated_at = (datetime.now().astimezone() - timedelta(days=2)).isoformat()
+    expired_at = (datetime.now().astimezone() - timedelta(days=1)).isoformat()
+    await s._db.execute(
+        "UPDATE universe_membership_events SET occurred_at=?",
+        (activated_at,))
+    # 자연 시간 경과를 재현하려고 expires_at UPDATE 감지 트리거만 잠시 제거한다.
+    await s._db.execute("DROP TRIGGER trg_universe_pick_expiry_off")
+    await s._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (expired_at, result.pick_id))
+    await s.close()
+
+    assert materialize_expired_picks(db) == 1
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT occurred_at,action,source FROM universe_membership_events "
+            "ORDER BY id").fetchall()
+        status = con.execute(
+            "SELECT status FROM sector_picks WHERE id=?",
+            (result.pick_id,)).fetchone()[0]
+    finally:
+        con.close()
+    assert rows[0][1:] == ("activate", "stock_insert")
+    assert rows[1] == (expired_at, "deactivate", "pick_expired")
+    assert status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_extending_elapsed_pick_backfills_inactive_gap(store: SectorStore):
+    result = await store.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    activated_at = (datetime.now().astimezone() - timedelta(days=2)).isoformat()
+    expired_at = (datetime.now().astimezone() - timedelta(days=1)).isoformat()
+    future = (datetime.now().astimezone() + timedelta(days=7)).isoformat()
+    await store._db.execute(
+        "UPDATE universe_membership_events SET occurred_at=?",
+        (activated_at,))
+    await store._db.execute("DROP TRIGGER trg_universe_pick_expiry_off")
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (expired_at, result.pick_id))
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (future, result.pick_id))
+
+    rows = await (await store._db.execute(
+        "SELECT occurred_at,action,source FROM universe_membership_events "
+        "ORDER BY id")).fetchall()
+    assert rows[0][1:] == ("activate", "stock_insert")
+    assert rows[1] == (
+        expired_at, "deactivate", "expiry_elapsed_before_extension")
+    assert rows[2][1:] == ("activate", "expiry_extended")
+
+
+@pytest.mark.asyncio
+async def test_multi_pick_natural_expiry_uses_last_code_expiry(tmp_path):
+    db = tmp_path / "multi-expiry.db"
+    s = SectorStore(db)
+    await s.open()
+    first = await s.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    second = await s.upsert_sector(
+        "반도체", [_stock("반도체", "005930", "삼성전자")], _pick())
+    activated_at = (datetime.now().astimezone() - timedelta(days=3)).isoformat()
+    earlier = (datetime.now().astimezone() - timedelta(days=2)).isoformat()
+    later = (datetime.now().astimezone() - timedelta(days=1)).isoformat()
+    await s._db.execute(
+        "UPDATE universe_membership_events SET occurred_at=?",
+        (activated_at,))
+    await s._db.execute("DROP TRIGGER trg_universe_pick_expiry_off")
+    await s._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (earlier, first.pick_id))
+    await s._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (later, second.pick_id))
+    await s.close()
+
+    assert materialize_expired_picks(db) == 2
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT occurred_at,action,source FROM universe_membership_events "
+            "ORDER BY id").fetchall()
+    finally:
+        con.close()
+    assert rows[0][1:] == ("activate", "stock_insert")
+    assert rows[1] == (later, "deactivate", "pick_expired")
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_multi_pick_elapsed_extension_uses_last_code_expiry(store: SectorStore):
+    first = await store.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    second = await store.upsert_sector(
+        "반도체", [_stock("반도체", "005930", "삼성전자")], _pick())
+    activated_at = (datetime.now().astimezone() - timedelta(days=3)).isoformat()
+    earlier = (datetime.now().astimezone() - timedelta(days=2)).isoformat()
+    later = (datetime.now().astimezone() - timedelta(days=1)).isoformat()
+    future = (datetime.now().astimezone() + timedelta(days=7)).isoformat()
+    await store._db.execute(
+        "UPDATE universe_membership_events SET occurred_at=?",
+        (activated_at,))
+    await store._db.execute("DROP TRIGGER trg_universe_pick_expiry_off")
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (earlier, first.pick_id))
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (later, second.pick_id))
+    await store._db.execute(
+        "UPDATE sector_picks SET expires_at=? WHERE id=?",
+        (future, first.pick_id))
+
+    rows = await (await store._db.execute(
+        "SELECT occurred_at,action,source FROM universe_membership_events "
+        "ORDER BY id")).fetchall()
+    assert rows[0][1:] == ("activate", "stock_insert")
+    assert rows[1] == (
+        later, "deactivate", "expiry_elapsed_before_extension")
+    assert rows[2][1:] == ("activate", "expiry_extended")
+
+
+@pytest.mark.asyncio
+async def test_membership_events_cover_direct_stock_identity_and_pick_delete(
+        store: SectorStore):
+    first = await store.upsert_sector(
+        "AI", [_stock("AI", "005930", "삼성전자")], _pick())
+    second = await store.upsert_sector(
+        "바이오", [_stock("바이오", "000660", "SK하이닉스")], _pick())
+    await store._db.execute(
+        "UPDATE sector_stocks SET stock_code='035420',stock_name='NAVER' "
+        "WHERE pick_id=?", (first.pick_id,))
+    await store._db.execute(
+        "DELETE FROM sector_picks WHERE id=?", (second.pick_id,))
+
+    rows = await (await store._db.execute(
+        "SELECT action,stock_code,source FROM universe_membership_events "
+        "ORDER BY id")).fetchall()
+    assert rows == [
+        ("activate", "005930", "stock_insert"),
+        ("activate", "000660", "stock_insert"),
+        ("activate", "035420", "stock_identity_on"),
+        ("deactivate", "005930", "stock_identity_off"),
+        ("deactivate", "000660", "pick_delete"),
+    ]
 
 
 # ---------- UPSERT ----------

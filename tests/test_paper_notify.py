@@ -222,6 +222,29 @@ def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
     assert "gm_v3+R13" in msg                         # 변형 축 라벨
 
 
+def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
+    con_ = _make_con()
+    con_.execute(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        ("gm_v3_joined", "A", "교정축종목", DAY.isoformat(), DAY.isoformat(),
+         0.01, 0.005, "R8", "t"))
+    summ = {
+        "v2_portfolio": {"trades": 2, "equity": 1.01},
+        "v2_leader_portfolio": {"trades": 1, "equity": 1.02},
+        "gm_v3_joined": {"closed_today": 1, "equity": 1.03},
+        "v4r_joined": {"closed_today": 1, "equity": 0.99},
+        "bench_v2_portfolio": {"equity": 0.98},
+        "bench_joined": {"equity": 0.97},
+        "bench_bh": {"day_ret": 0.0, "equity": 0.9, "stocks": 70},
+    }
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "v2_portfolio" not in msg
+    assert "gm_v3_joined" not in msg
+    assert "v4r_joined" not in msg
+    assert "교정축종목" not in msg
+
+
 def test_fmt_trade_has_prices():
     msg = _fmt_trade(DAY, _trade("005930", "삼성전자", entry=71000, exit_=74550, ret=0.05))
     assert "71,000" in msg and "74,550" in msg and "+5.00%" in msg

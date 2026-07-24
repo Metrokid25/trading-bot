@@ -49,6 +49,7 @@ class Trade:
     # v4r(오버나이트) 전용 — 기존 모드는 기본값 유지(생성부 불변)
     exit_day: date | None = None
     entry_time: str = ""     # 진입 봉 ts ISO — 당일 재진입 구분(paper PK 유니크)
+    exit_time: str = ""      # 청산 봉 ts ISO — 공유현금 슬롯 해제 시각
 
 
 # ---------------- 캐시 ----------------
@@ -238,9 +239,12 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     if entry is None or entry <= 0:
         return None
 
-    exit_avg, reason, _, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct)
+    exit_avg, reason, _, exit_i = _split_exit(
+        bars3, entry_i, entry, tp_levels, stop_pct)
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
-                 int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
+                 int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry,
+                 entry_time=bars3[entry_i].ts.isoformat(),
+                 exit_time=bars3[exit_i].ts.isoformat())
 
 
 def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
@@ -505,8 +509,8 @@ def evaluate_day_v3(symbol: str, name: str, day_bars: list[Bar], prev_close: int
         return None
 
     stop_floor = pullback_low * (1 - support_tol)  # 지지 이탈 = 정리 (89144)
-    exit_avg, reason, _, _ = _split_exit(bars3, entry_i, entry, tp_levels, stop_pct,
-                                         stop_floor)
+    exit_avg, reason, _, _ = _split_exit(
+        bars3, entry_i, entry, tp_levels, stop_pct, stop_floor)
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
                  int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry)
 
