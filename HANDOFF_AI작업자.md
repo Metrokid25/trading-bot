@@ -1,15 +1,27 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
-## 최우선 최신 갱신 — 2026-07-22
+## 최우선 최신 갱신 — 2026-07-26
 
-- 영문 혼합 ETF 지원 기능 커밋 `1fb64af`가 origin/main에 push됐고 미니PC 배포 대기다.
+- 노트북 작업자는 이 문서 전체를 읽은 다음 `HANDOFF_노트북_작업자.md`를 읽고
+  역할 경계와 시작 절차를 적용한다. 별도 프롬프트 없이 이 두 Markdown 문서가
+  노트북 작업의 단일 인수인계 진입점이다.
+- origin/main 기준 커밋은 `540949a`이며 전체 테스트 기준은
+  **433 passed, 기존 warning 1개**다.
+- P0 forward 측정 신뢰도 보강으로 실제 편입 이벤트 기반
+  `gm_v3_joined`/`v4r_joined`/`bench_joined`와 공유현금
+  `v2_portfolio`/`v2_leader_portfolio` 관찰축이 추가됐다.
+- 2026-07-24 미니PC는 `540949a` pull과 전체 테스트까지 완료했으나 당시
+  장중이라 웹앱·paper runner 재기동은 보류했다. 현재 배포 상태는 다시 실측한다.
+- 노트북은 개발 기기다. `paper.db` 기록, 운영 `trading.db` 쓰기, 주문 및 상주
+  프로세스 변경을 하지 않는다. 미니PC 작업은 승인 게이트가 있는 공용 브리지로
+  담당 Codex에 직접 지시한다.
+
 - 최신 상세 인수인계는 `HANDOFF_트레이딩봇_담당자.txt`와
   `PROJECT_HANDOFF.md` 마지막 3~4개 섹션을 함께 읽는다.
 - ETF 웹앱은 숫자 코드뿐 아니라 `0167A0` 같은 영문 혼합 KRX 코드도 지원한다.
   StockMaster 캐시는 v3이며, KIS 실측 ETF 1,143개(영문 혼합 279개)를 포함한다.
-- 최신 전체 테스트 기준은 **397 passed, 기존 warning 1개**다.
-- 미니PC 배포 전후에는 운영 `trading.db`를 보존하고 웹앱 uvicorn만 장 마감 후
-  WMI로 재기동한다. tracker/paper_runner를 코드 반영 목적으로 끊지 않는다.
+- 웹앱·paper 변경 배포 전후에는 운영 `trading.db`를 보존한다. 필요한 프로세스만
+  장 마감 후 WMI로 재기동하며, 변경과 무관한 tracker·주문 프로세스는 끊지 않는다.
 
 ### 오너 표준 호출 문구
 
@@ -70,10 +82,12 @@
   trading-bot python 필터). 죽어 있으면 WMI 재기동 — paper 는 리플레이 멱등이라
   기록은 복구된다(단 장중 라이브 관측은 유실).
 
-### 페이퍼 전략 축 (paper.db, 8축 병행)
+### 페이퍼 전략 축 (paper.db, 기존축 + 신규 측정 관찰축)
 `v2`(당일치기) / `v2_leader`(주도섹터만 — "주도주만 거래" 컨셉의 본체) /
 `gm_v3` + `gm_v3_r13/r14/r13r14`(멘토룰 R1~R16, GM3_VARIANTS) /
-`v4r`(재폭등 관찰 축, 채택 아님) / `bench_bh`(당일 유니버스 동일가중 무비용).
+`v4r`(재폭등 관찰 축, 채택 아님) / `bench_bh`(당일 유니버스 동일가중 무비용) /
+`gm_v3_joined`·`v4r_joined`·`bench_joined`(실제 편입경계) /
+`v2_portfolio`·`v2_leader_portfolio`·`bench_v2_portfolio`(공유현금 측정).
 - 장중 기록은 임시(finalized=0), **20:05 이후 확정(finalized=1)** + 텔레그램
   요약 자동 발송(@zzapmoneying_bot, 전 축 + 오늘 매매 상세 + 건수·평균·승률).
 - 성과 보고 규칙: 절대손익 단독 금지 — "시드 x% (시장보다 y%p …)" 병기,
@@ -124,7 +138,7 @@
   서브에이전트) → 수정 → 커밋 → 오너 승인 → main FF 머지 → push.**
   force push 금지, main 직접 커밋 금지(문서 전용은 오너가 관례 승인해 옴).
 - pytest: `$env:PYTHONUTF8="1"` + **`tests\` 디렉토리만**(루트 test_*.py 는
-  requests 없어 수집 깨짐). 현재 383 passed 유지가 기준.
+  requests 없어 수집 깨짐). 현재 433 passed, 기존 warning 1건이 기준.
 - 실행: `.venv\Scripts\python.exe`(미니PC=3.12, 노트북=3.14),
   출력 스크립트는 `PYTHONIOENCODING=utf-8`.
 - **장중(08~16시) 도는 상주를 끊는 재시작 금지** — 죽은 걸 살리는 복구는 OK.

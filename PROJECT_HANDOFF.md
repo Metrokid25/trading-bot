@@ -1558,9 +1558,10 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 
 ---
 
-## 2026-07-24 P0 forward 측정 신뢰도 보강 (승인·배포 대기)
+## 2026-07-24 P0 forward 측정 신뢰도 보강 (커밋·pull 완료, 재기동 확인 대기)
 
-- 작업 브랜치: `fix/paper-membership-windows`. 아직 커밋·push·미니PC 배포하지 않았다.
+- 기능 커밋 `540949a`가 origin/main에 push됐고 미니PC도 2026-07-24에
+  ff-only pull과 전체 테스트를 완료했다. 당시 장중이라 새 프로세스 재기동은 보류했다.
 - **실제 편입 구간**: `trading.db`에 코드 단위 append-only
   `universe_membership_events`를 추가했다. 등록·추적 상태·Pick 상태·만료 변경·종목
   이동/삭제를 SQLite trigger로 기록한다. 기존 DB 최초 적용 시 현재 active 코드만
@@ -1587,8 +1588,26 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 검증: 전체 `tests\` **433 passed, 기존 warning 1건**, `git diff --check` 정상.
   독립 리뷰 5회에서 snapshot 누수, 미래 신호 선별, 만료/다중 Pick 경계, 빈
   corrected 벤치, 데이터 0건 확정 문제를 보강한 뒤 최종 승인받았다.
-- 배포 시 주의: 이 변경은 실제 `trading.db`에 이벤트 테이블/trigger와 만료 상태
-  이벤트를 쓰므로 오너의 별도 배포 승인이 필요하다. 장 마감 후 **웹앱을 먼저 WMI
+- 운영 반영 시 주의: 이 변경은 실제 `trading.db`에 이벤트 테이블/trigger와 만료 상태
+  이벤트를 쓴다. 현재 상태를 재확인하고 오너 승인 후 장 마감에 **웹앱을 먼저 WMI
   재기동**해 schema/trigger/bootstrap을 설치한 뒤 **paper_runner만 WMI 재기동**한다.
   주문 프로세스와 tracker는 건드리지 않는다. 이후 `--report`, 프로세스 부모,
   이벤트 bootstrap, 기존 웹 유니버스를 스모크 확인한다.
+
+---
+
+## 2026-07-26 노트북 작업자 인수인계 표준화
+
+- 노트북 `C:\trading-bot`은 `main`/`540949a`, origin 대비 ahead/behind `0/0`으로
+  동기화된 것을 실측했다. 미추적 `tmp\`는 보존했다.
+- `HANDOFF_노트북_작업자.md`를 신설해 노트북을 개발·백테스트·리뷰 기기로
+  한정하고, paper/trading 운영 DB 쓰기·주문·상주 프로세스 변경을 금지했다.
+- 별도 복붙 프롬프트는 사용하지 않는다. pull 후 `HANDOFF_AI작업자.md`가
+  `HANDOFF_노트북_작업자.md`로 안내하며, 두 문서만 읽으면 fetch/status,
+  ff-only pull, 역할 경계, 실제 Git 상태 보고와 오너 지시 대기까지 이해한다.
+- 미니PC 작업은 공용 브리지
+  `C:\Users\재승\.codex\scripts\invoke-mini-bot-codex.ps1`를 사용한다. 기본은
+  읽기 전용이고 오너가 정확한 범위를 승인했을 때만 mutation gate를 연다.
+- 마지막 미니PC 실측은 2026-07-24 09:48: `540949a` pull, 433 tests 통과,
+  `AGENTS.md` 보존. 당시 장중이라 웹앱·paper runner 재기동은 보류됐으므로
+  현재 실제 배포 여부는 다음 작업자가 다시 확인한다.
