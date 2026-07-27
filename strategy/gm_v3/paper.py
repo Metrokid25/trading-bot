@@ -38,6 +38,7 @@ def simulate(code: str, bars: list[DailyBar], cfg: GmV3Config, *,
              fill_mode: str = "next_open",
              act_from: Date | None = None,
              act_to: Date | None = None,
+             entry_gate=None,
              ) -> tuple[list[PaperTrade], list[Signal]]:
     """일봉 시퀀스에 룰 엔진을 돌려 (완결 트레이드, 발동 시그널) 반환.
 
@@ -113,7 +114,8 @@ def simulate(code: str, bars: list[DailyBar], cfg: GmV3Config, *,
                 do_sell(bar.close, top.weight, top.rule, bar.day)
             else:
                 pending_sells.append(top)
-        for s in (s for s in sigs if s.type == SignalType.BUY):
+        for s in (s for s in sigs if s.type == SignalType.BUY
+                  and (entry_gate is None or entry_gate(code, s.day))):
             if fill_mode == "close":
                 if st.position is None:
                     opened_on = bar.day

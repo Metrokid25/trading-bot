@@ -251,3 +251,20 @@ def test_v2_equivalent_single_shot():
     assert v4r[0].exit == v2.exit
     assert v2.entry_time.endswith("09:15:00+09:00")
     assert v2.exit_time.endswith("09:21:00+09:00")
+
+
+def test_v4r_entry_gate_blocks_qualified_setup():
+    day = [
+        _b(D1, 8, 0, 10800, 11000, 10700, 10900),
+        _b(D1, 9, 0, 10800, 10900, 10600, 10700),
+        _b(D1, 9, 3, 10700, 10710, 10500, 10520),
+        _b(D1, 9, 6, 10520, 10540, 10505, 10530),
+        _b(D1, 9, 9, 10530, 10550, 10510, 10540),
+        _b(D1, 9, 12, 10540, 10560, 10520, 10550),
+        _b(D1, 9, 15, 10600, 11100, 10590, 11050),
+        _b(D1, 15, 27, 11000, 11010, 10990, 11000),
+    ]
+    trades = _run_v4r(
+        {D0: _prev_day(), D1: day},
+        entry_gate=lambda _code, _day: False)
+    assert trades == []

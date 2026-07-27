@@ -35,6 +35,15 @@ def test_fill_next_open_uses_next_bar_open():
     assert t.forced_eor and t.exit_rules == ["EOR"]
 
 
+def test_entry_gate_blocks_buy_without_hiding_signal():
+    rows = BASE + [(11150, 11300, 11100, 11250, 100)]
+    trades, sigs = simulate(
+        "X", make_bars(rows), CFG,
+        entry_gate=lambda _code, _signal_day: False)
+    assert any(s.rule == "R1" for s in sigs)
+    assert trades == []
+
+
 def test_fill_close_uses_signal_bar_close():
     rows = BASE + [(11150, 11300, 11100, 11250, 100)]
     trades, _ = simulate("X", make_bars(rows), CFG, fill_mode="close")

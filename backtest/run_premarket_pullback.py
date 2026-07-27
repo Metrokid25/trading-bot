@@ -50,6 +50,13 @@ class Trade:
     exit_day: date | None = None
     entry_time: str = ""     # 진입 봉 ts ISO — 당일 재진입 구분(paper PK 유니크)
     exit_time: str = ""      # 청산 봉 ts ISO — 공유현금 슬롯 해제 시각
+    quality_score: int = 0   # v2 진입 당시 구조품질 점수(매매 판정에는 영향 없음)
+    quality_tags: tuple[str, ...] = ()
+
+
+def v2_volume_quality_score(tags: tuple[str, ...]) -> int:
+    """v2 검증 통과 특징만 사용한 점수: 마름 2점 + 돌파 거래량 1점."""
+    return 2 * int("dryup" in tags) + int("breakout_volume" in tags)
 
 
 # ---------------- 캐시 ----------------
@@ -186,7 +193,11 @@ def _gate_and_resample(day_bars: list[Bar], prev_close: int,
 def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int,
                     *, pre_surge: float, pullback_min: float, support_tol: float,
                     tp_levels: tuple[float, ...], stop_pct: float,
-                    consol_bars: int = 3, **_ignore) -> Trade | None:
+                    consol_bars: int = 3, max_surge: float = 0.0,
+                    vol_dryup_max: float = 0.0,
+                    vol_confirm_ratio: float = 0.0,
+                    entry_until: time | None = None,
+                    **_ignore) -> Trade | None:
     """저점 지지 + 다지기 + 재폭등 돌파 진입 + 분할 익절 청산 (당일 스캘핑).
 
     ① 프리장 급등(전일종가 대비 +pre_surge%) 게이트.
@@ -204,13 +215,21 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     if gated is None:
         return None
     pre_high, bars3 = gated
+    if max_surge > 0 and (pre_high - prev_close) / prev_close > max_surge:
+        return None
 
     day_high = float(pre_high)        # 아침 고점(프리장 고점부터 누적)
     breakout_level: float | None = None   # 눌림 직전 고점 = 재돌파 기준선
     pullback_low: float | None = None     # 지지 저점
     hold = 0                              # 지지 유지(다지기) 봉수
+    impulse_vols: list[int] = []
+    down_vols: list[int] = []
+    consol_vols: list[int] = []
+    consol_lows: list[float] = []
     entry = None
     entry_i = -1
+    quality_score = 0
+    quality_tags: list[str] = []
     for i, b in enumerate(bars3):
         prev_high = day_high              # 현재봉 반영 전 고점
         day_high = max(day_high, b.high)
@@ -220,22 +239,72 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
                 pullback_low = float(b.low)
                 breakout_level = prev_high
                 hold = 0
+                down_vols = [b.volume]
+                consol_vols = []
+                consol_lows = []
+            else:
+                impulse_vols.append(b.volume)
             continue
         # ③ 지지 이탈 → 저점 하향 + 다지기 리셋
         if b.low < pullback_low * (1 - support_tol):
             pullback_low = float(b.low)
             hold = 0
+            down_vols += consol_vols + [b.volume]
+            consol_vols = []
+            consol_lows = []
             continue
         # ④ 재폭등: 아침고점 종가 재돌파 (직전까지 다지기 consol_bars봉 이상)
         if b.close > breakout_level:
-            if hold >= consol_bars:
+            down_avg = sum(down_vols) / len(down_vols) if down_vols else 0.0
+            consol_avg = (
+                sum(consol_vols) / len(consol_vols) if consol_vols else 0.0)
+            dry_ok = (
+                vol_dryup_max <= 0
+                or (down_avg > 0 and 0 < consol_avg <= vol_dryup_max * down_avg)
+            )
+            confirm_ok = (
+                vol_confirm_ratio <= 0
+                or (consol_avg > 0 and b.volume >= vol_confirm_ratio * consol_avg)
+            )
+            time_ok = entry_until is None or b.ts.time() <= entry_until
+            if hold >= consol_bars and dry_ok and confirm_ok and time_ok:
+                impulse_avg = (
+                    sum(impulse_vols) / len(impulse_vols)
+                    if impulse_vols else 0.0)
+                mid = max(1, len(consol_lows) // 2)
+                higher_low = (
+                    len(consol_lows) >= 3
+                    and min(consol_lows[mid:]) > min(consol_lows[:mid]) * 1.001
+                )
+                if down_avg > 0 and 0 < consol_avg <= 0.80 * down_avg:
+                    quality_score += 2
+                    quality_tags.append("dryup")
+                if consol_avg > 0 and b.volume >= 1.50 * consol_avg:
+                    quality_score += 2
+                    quality_tags.append("breakout_volume")
+                if higher_low:
+                    quality_score += 1
+                    quality_tags.append("higher_low")
+                if hold >= max(5, consol_bars + 2):
+                    quality_score += 1
+                    quality_tags.append("long_base")
+                if (pre_high - prev_close) / prev_close >= 0.12:
+                    quality_score -= 1
+                    quality_tags.append("overheated")
+                if (impulse_avg > 0
+                        and down_avg >= 1.20 * impulse_avg):
+                    quality_score -= 2
+                    quality_tags.append("decline_volume")
                 entry, entry_i = float(b.close), i
                 break
             # 다지기 미완 재돌파 = 기회 소멸 → 새 눌림 대기 (추격 금지)
             pullback_low, breakout_level = None, None
+            impulse_vols, down_vols, consol_vols, consol_lows = [], [], [], []
             continue
         pullback_low = min(pullback_low, b.low)
         hold += 1
+        consol_vols.append(b.volume)
+        consol_lows.append(float(b.low))
     if entry is None or entry <= 0:
         return None
 
@@ -244,7 +313,9 @@ def evaluate_day_v2(symbol: str, name: str, day_bars: list[Bar], prev_close: int
     return Trade(symbol, name, bars3[0].ts.date(), prev_close, int(pre_high),
                  int(entry), int(round(exit_avg)), reason, (exit_avg - entry) / entry,
                  entry_time=bars3[entry_i].ts.isoformat(),
-                 exit_time=bars3[exit_i].ts.isoformat())
+                 exit_time=bars3[exit_i].ts.isoformat(),
+                 quality_score=quality_score,
+                 quality_tags=tuple(quality_tags))
 
 
 def _split_exit(bars3: list[Bar], entry_i: int, entry: float,
@@ -852,7 +923,8 @@ def simulate_symbol_v4r(symbol: str, name: str, days: dict[date, list[Bar]],
                         tp_levels: tuple[float, ...], stop_pct: float,
                         consol_bars: int = 3, max_entries: int = 4,
                         aft_stop_pct: float = 0.03, use_after: bool = True,
-                        winner_gate: bool = True, **_ignore) -> list[Trade]:
+                        winner_gate: bool = True, entry_gate=None,
+                        **_ignore) -> list[Trade]:
     """v4재폭등: v2 승계 + 국소 기준선 + 하루 max_entries회 재진입 + 승자 게이트
     + 애프터장 탐색/청산 + 오버나이트 무기한 보유(TP 소진/스탑까지).
 
@@ -882,7 +954,8 @@ def simulate_symbol_v4r(symbol: str, name: str, days: dict[date, list[Bar]],
         gate_high: float | None = None
         if start <= d <= end:
             pc = _prev_close(days, ordered, di)
-            gate_high = _v4r_gate(days[d], pc, pre_surge)
+            if entry_gate is None or entry_gate(symbol, d):
+                gate_high = _v4r_gate(days[d], pc, pre_surge)
             prev_close_d = pc
         entries_today = 0
         day_blocked = False           # 승자 게이트: 0TP 청산 발생 시 그날 종료

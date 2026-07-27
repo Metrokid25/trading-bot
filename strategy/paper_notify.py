@@ -16,6 +16,7 @@ POST 하므로 폴링 소비자 충돌이 없다(발송 전용).
 """
 from __future__ import annotations
 
+import html
 import sqlite3
 import time as _time
 from datetime import timedelta
@@ -29,6 +30,7 @@ from core.time_utils import now_kst, to_db_iso
 DAILY_CAP = 40         # 하루 개별 트레이드 알림 상한 (요약 제외)
 RETENTION_DAYS = 90    # paper_notified 보관 일수 (무한증가 방지)
 _SEND_ATTEMPTS = 3     # 전송 재시도 (429/5xx/네트워크) — 한 호출 내에서만
+TELEGRAM_TEXT_LIMIT = 4096
 
 _client: httpx.Client | None = None
 
@@ -39,6 +41,43 @@ def _get_client() -> httpx.Client:
     if _client is None:
         _client = httpx.Client(timeout=8.0)
     return _client
+
+
+def _split_telegram_text(text: str) -> list[str]:
+    """텔레그램 글자 제한 안에서 줄 단위로 나누되 내용을 생략하지 않는다."""
+    if len(text) <= TELEGRAM_TEXT_LIMIT:
+        return [text]
+    if "<pre>" in text and "</pre>" in text:
+        before, rest = text.split("<pre>", 1)
+        table, after = rest.split("</pre>", 1)
+        chunks = _split_plain_text(before, TELEGRAM_TEXT_LIMIT)
+        table_limit = TELEGRAM_TEXT_LIMIT - len("<pre></pre>")
+        chunks += [
+            f"<pre>{chunk}</pre>"
+            for chunk in _split_plain_text(table, table_limit)
+        ]
+        chunks += _split_plain_text(after, TELEGRAM_TEXT_LIMIT)
+        return [chunk for chunk in chunks if chunk]
+    return _split_plain_text(text, TELEGRAM_TEXT_LIMIT)
+
+
+def _split_plain_text(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if current and len(current) + len(line) > limit:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        current += line
+    if current:
+        chunks.append(current.rstrip("\n"))
+    return chunks
 
 
 def _send(text: str) -> bool:
@@ -54,32 +93,39 @@ def _send(text: str) -> bool:
         logger.warning("[paper][tg] 토큰/채널 미설정 — 알림 스킵")
         return False
     url = f"https://api.telegram.org/bot{tok}/sendMessage"
-    payload = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
-    for attempt in range(_SEND_ATTEMPTS):
-        try:
-            r = _get_client().post(url, json=payload)
-            if r.status_code == 200:
-                return True
-            if r.status_code == 429 or r.status_code >= 500:
-                # 레이트리밋/서버오류만 재시도 (retry_after 있으면 상한 5s)
-                wait = 1.0 * (attempt + 1)
-                try:
-                    wait = min(float(r.json().get("parameters", {})
-                                     .get("retry_after", wait)), 5.0)
-                except Exception:
-                    pass
+    use_html = "<pre>" in text and "</pre>" in text
+    for chunk in _split_telegram_text(text):
+        payload = {"chat_id": chat, "text": chunk, "disable_web_page_preview": True}
+        if use_html:
+            payload["parse_mode"] = "HTML"
+        for attempt in range(_SEND_ATTEMPTS):
+            try:
+                r = _get_client().post(url, json=payload)
+                if r.status_code == 200:
+                    break
+                if r.status_code == 429 or r.status_code >= 500:
+                    # 레이트리밋/서버오류만 재시도 (retry_after 있으면 상한 5s)
+                    wait = 1.0 * (attempt + 1)
+                    try:
+                        wait = min(float(r.json().get("parameters", {})
+                                         .get("retry_after", wait)), 5.0)
+                    except Exception:
+                        pass
+                    if attempt < _SEND_ATTEMPTS - 1:
+                        _time.sleep(wait)
+                        continue
+                logger.error("[paper][tg] 발송 실패 HTTP {}: {}",
+                             r.status_code, r.text[:200])
+                return False
+            except Exception as exc:
                 if attempt < _SEND_ATTEMPTS - 1:
-                    _time.sleep(wait)
+                    _time.sleep(0.6 * (attempt + 1))
                     continue
-            logger.error("[paper][tg] 발송 실패 HTTP {}: {}", r.status_code, r.text[:200])
+                logger.error("[paper][tg] 발송 예외: {}", exc)
+                return False
+        else:
             return False
-        except Exception as exc:
-            if attempt < _SEND_ATTEMPTS - 1:
-                _time.sleep(0.6 * (attempt + 1))
-                continue
-            logger.error("[paper][tg] 발송 예외: {}", exc)
-            return False
-    return False
+    return True
 
 
 def _reason_kr(reason: str) -> str:
@@ -134,6 +180,7 @@ _SUMMARY_META_KEYS = {
     # 신규 회계 관찰축은 paper.db/--report에서 먼저 검증한다. 기존 텔레그램의
     # 매매·누적 통계 계약과 섞지 않는다.
     "bench_v2_portfolio", "v2_portfolio", "v2_leader_portfolio",
+    "v2_qv", "v2_qv_portfolio",
     "bench_joined", "gm_v3_joined", "v4r_joined",
 }
 
@@ -148,10 +195,18 @@ _STRAT_LABEL = {
     "v4r": "v4r (재폭등·관찰)",
 }
 
+_TABLE_LABEL = {
+    "v2": "v2",
+    "v2_leader": "v2_lead",
+    "gm_v3": "BASE",
+    "gm_v3_r13": "+R13",
+    "gm_v3_r14": "+R14",
+    "gm_v3_r13r14": "+R13R14",
+    "v4r": "v4r",
+}
+_SUMMARY_ORDER = tuple(_TABLE_LABEL)
+
 _WEEKDAY_KR = "월화수목금토일"
-
-_MAX_TRADE_LINES = 12   # 요약 내 당일 매매 나열 상한 (초과분은 "외 N건")
-
 
 def _gm3_reason_kr(detail: str) -> str:
     """gm_v3 exit_rules 문자열(R10, R8/R7 등) → 사람이 읽는 사유."""
@@ -205,57 +260,80 @@ def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
         f"📊 페이퍼 마감 {day_s[5:]}({wd}) — {tag}",
         f"🌊 시장(등록 {bench.get('stocks', 0)}종목 보유 시): "
         f"오늘 {bench.get('day_ret', 0.0):+.2%} · 누적 {bench_abs:+.2%}",
-        "",
-        "📌 오늘 매매",
     ]
 
-    # ① 당일 실현 매매 (전 전략, EOR 제외)
+    v2 = summary.get("v2")
+    if isinstance(v2, dict):
+        v2_today = int(v2.get("trades", 0))
+        v2_status = (
+            f"페이퍼 가동 중 · 오늘 {v2_today}건 매매"
+            if v2_today
+            else "페이퍼 가동 중 · 오늘 매매 없음(관망)"
+        )
+    else:
+        v2_status = "상태 확인 불가(당일 요약 없음)"
+    lines += ["", f"⚙️ v2 상태: {v2_status}", "", "📌 오늘 매매"]
+
+    # ① 당일 실현 매매 (전 전략, EOR 제외). 사용자가 누락 없이 검토할 수 있도록
+    # 요약 내부에서는 건수 상한을 두지 않는다.
     rows = con.execute(
         "SELECT strategy, COALESCE(name, code), ret_net, COALESCE(detail,'') "
         "FROM paper_trades WHERE closed_on=? AND detail NOT LIKE '%EOR%' "
-        "AND strategy NOT IN ('gm_v3_joined','v4r_joined') "
+        "AND strategy NOT IN ('v2_qv','gm_v3_joined','v4r_joined') "
         "ORDER BY strategy, ret_net DESC", (day_s,)).fetchall()
     if rows:
-        for strat, name, rn, det in rows[:_MAX_TRADE_LINES]:
+        for strat, name, rn, det in rows:
             label = _STRAT_LABEL.get(strat, strat).split(" ")[0]
-            lines.append(f"· [{label}] {name}: {rn:+.1%} "
+            lines.append(f"· [{label}] {html.escape(str(name))}: {rn:+.1%} "
                          f"{_trade_reason_kr(strat, det, rn)}")
-        if len(rows) > _MAX_TRADE_LINES:
-            lines.append(f"· … 외 {len(rows) - _MAX_TRADE_LINES}건")
     else:
         lines.append("· 없음 — 진입 조건 충족 종목 없어 관망")
 
-    # ② 누적 성적 — 시장 대비 직관 표현 + 건별 통계(승률)
-    lines += ["", "📈 누적 성적 (시장과 비교)"]
-    for name, s in summary.items():
+    # ② 누적 성적 — 모바일에서도 열 정렬이 유지되는 고정폭 코드 블록.
+    table = ["모드       건수  승률     평균      누적"]
+    market_rows: list[str] = []
+    holding_rows: list[str] = []
+    strategy_names = [
+        *[name for name in _SUMMARY_ORDER if name in summary],
+        *[name for name in summary
+          if name not in _SUMMARY_ORDER and name not in _SUMMARY_META_KEYS],
+    ]
+    for name in strategy_names:
+        s = summary[name]
         if name in _SUMMARY_META_KEYS or not isinstance(s, dict):
             continue
-        label = _STRAT_LABEL.get(name, name)
         # 실현 트레이드 건별 통계 (EOR=미청산 MTM 스냅샷 제외)
         n, avg, wins = con.execute(
             "SELECT COUNT(*), COALESCE(AVG(ret_net),0), "
             "COALESCE(SUM(ret_net > 0),0) FROM paper_trades "
             "WHERE strategy=? AND closed_on<=? AND detail NOT LIKE '%EOR%'",
             (name, day_s)).fetchone()
-        stats = (f"{n}건 · 평균 {avg:+.2%} · 승률 {wins / n:.0%}"
-                 if n else "아직 매매 없음")
+        avg_s = f"{avg:+.2%}" if n else "-"
+        win_s = f"{wins / n:.0%}" if n else "-"
+        label = _TABLE_LABEL.get(name, name)
         if "trades" in s:
             # v2 계열: 직렬복리 누적은 착시(전액 재투입 가정)라 건별 통계만
-            lines.append(f"· {label}: {stats}")
+            table.append(
+                f"{label:<8} {n:>3} {win_s:>5} {avg_s:>8} {'건별':>9}"
+            )
             continue
         strat_abs = s.get("equity", 1.0) - 1.0
         alpha = s.get("equity", 1.0) - bench_eq
-        if alpha >= 0.0005:
-            vs = f"시장보다 {alpha * 100:.1f}%p 덜 잃음" if strat_abs < 0 \
-                else f"시장보다 {alpha * 100:.1f}%p 앞섬"
-        elif alpha <= -0.0005:
-            vs = f"시장보다 {-alpha * 100:.1f}%p 뒤짐"
-        else:
-            vs = "시장과 동률"
         hold = s.get("open_positions", 0)
-        hold_s = f" · 보유 {hold}종목" if hold else ""
-        lines.append(f"· {label}: 시드 {strat_abs:+.2%} ({vs})\n"
-                     f"   ↳ {stats}{hold_s}")
+        table.append(
+            f"{label:<8} {n:>3} {win_s:>5} {avg_s:>8} {strat_abs:>+9.2%}"
+        )
+        market_rows.append(f"{label} {alpha * 100:+.1f}p")
+        if hold:
+            holding_rows.append(f"{label} {hold}종목")
+    lines += ["", "📈 누적 성적", "<pre>" + "\n".join(table) + "</pre>"]
+    if market_rows:
+        lines.append("시장차: " + " · ".join(market_rows))
+    lines.append("보유: " + (" · ".join(holding_rows) if holding_rows else "없음"))
+    lines += [
+        "※ 시장차 +는 시장보다 양호, -는 부진",
+        "※ v2 계열 시드는 전액 재투자 가정 왜곡을 피하려고 건별 통계만 표시",
+    ]
     return "\n".join(lines)
 
 

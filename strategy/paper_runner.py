@@ -3,6 +3,7 @@
 운영 헌장(우선순위 2) 구현:
   매 거래일 16:00 이후 실행되어 아래 4개를 db/paper.db(WAL)에 기록한다.
     v2          — 프리장 급등→눌림 지지·다지기→아침고점 재돌파 (당일 스캘핑)
+    v2_qv       — v2 + 눌림 거래량 마름 + 돌파 거래량 확인(관찰 후보)
     v2_leader   — v2 + 주도섹터 필터(신호일 d-1 기준 최근 5거래일 수익률 1위 섹터만)
     gm_v3       — 멘토 룰엔진 R1~R12 (일봉 스윙, 다음날 시가 체결)
     gm_v3_r13 / gm_v3_r14 / gm_v3_r13r14 — Tier1 변형 축 (GM3_VARIANTS, 07-11)
@@ -62,6 +63,7 @@ from loguru import logger  # noqa: E402
 
 from backtest.run_premarket_pullback import (  # noqa: E402
     _cache_conn, _ensure_cached, _load_bars, backtest_symbol,
+    v2_volume_quality_score,
 )
 from backtest.toss_client import TossClient  # noqa: E402
 from config import settings  # noqa: E402
@@ -127,7 +129,7 @@ ASSUMPTIONS = {
     "v2_params": {k: (list(v) if isinstance(v, tuple) else v)
                   for k, v in V2_PARAMS.items()},
     "v2_portfolio": {
-        "axes": ["v2_portfolio", "v2_leader_portfolio"],
+        "axes": ["v2_portfolio", "v2_leader_portfolio", "v2_qv_portfolio"],
         "ranking": "진입 전에 확정된 프리장 상승률 내림차순, code tie-break",
         "max_positions": V2_PORTFOLIO_MAX_POSITIONS,
         "max_per_sector": V2_PORTFOLIO_MAX_PER_SECTOR,
@@ -382,9 +384,18 @@ def run_v2_for_day(day: date, universe) -> list[dict]:
                         "entry_time": t.entry_time,
                         "exit_time": t.exit_time,
                         "entry": t.entry, "exit": t.exit,   # 알림용 진입/청산가
-                        "reason": t.reason, "detail": t.reason})
+                        "reason": t.reason, "detail": t.reason,
+                        "quality_score": t.quality_score,
+                        "quality_tags": t.quality_tags,
+                        "volume_quality_score":
+                            v2_volume_quality_score(t.quality_tags)})
     cache.close()
     return out
+
+
+def select_v2_qv(rows: list[dict]) -> list[dict]:
+    """마름 2점 + 돌파 거래량 1점을 모두 충족한 v2 관찰 후보."""
+    return [row for row in rows if row.get("volume_quality_score") == 3]
 
 
 def v2_portfolio_day(rows: list[dict]) -> tuple[float, list[dict], int]:
@@ -825,6 +836,9 @@ def record_day(day: date) -> dict:
 
     # 2) 전략 계산 — 쓰기 전에 전부 계산해 쓰기 트랜잭션을 최소화
     v2_rows = run_v2_for_day(day, universe)
+    # v2_qv: 백테스트에서 양 반기 플러스였던 두 거래량 특징을 모두 만족한
+    # 별도 관찰축. 기존 v2 신호/운영축은 불변이다.
+    v2_qv_rows = select_v2_qv(v2_rows)
     leader = _leader_sector(universe, day)
     leader_rows = [r for r in v2_rows if r["sector"] == leader] if leader else []
     # 주도섹터 필터 관찰성: 유니버스/트레이드 양쪽에서 채택·스킵을 명시 로그
@@ -874,7 +888,11 @@ def record_day(day: date) -> dict:
     finalized = 1 if (day < now.date() or now.time() >= dtime(20, 5)) else 0
 
     # 3) 기록 — 단일 짧은 트랜잭션
-    for strat, rows in (("v2", v2_rows), ("v2_leader", leader_rows)):
+    for strat, rows in (
+            ("v2", v2_rows),
+            ("v2_leader", leader_rows),
+            ("v2_qv", v2_qv_rows),
+            ):
         con.execute("DELETE FROM paper_trades WHERE strategy=? AND closed_on=?",
                     (strat, day.isoformat()))
         _upsert_trades(con, strat, rows, now_iso)
@@ -882,7 +900,12 @@ def record_day(day: date) -> dict:
         for r in rows:
             day_ret *= (1 + r["ret_net"])
         eq = _serial_equity(con, strat, day)
-        note = f"leader={leader}" if strat == "v2_leader" else ""
+        if strat == "v2_leader":
+            note = f"leader={leader}"
+        elif strat == "v2_qv":
+            note = "dryup<=0.8x,breakout_volume>=1.5x"
+        else:
+            note = ""
         _upsert_daily(con, day, strat, len(rows), day_ret - 1, eq, note,
                       now_iso, finalized)
         summary[strat] = {"trades": len(rows), "day_ret": day_ret - 1, "equity": eq}
@@ -890,7 +913,8 @@ def record_day(day: date) -> dict:
     #    v2 공유현금 NAV 관찰축 — 기존 직렬복리 축은 비교/호환을 위해 그대로 둔다.
     #    v2는 당일 전량 청산이라 일별 슬롯 배분만으로 현금·동시신호를 정확히 반영.
     for strat, rows in (("v2_portfolio", v2_rows),
-                        ("v2_leader_portfolio", leader_rows)):
+                        ("v2_leader_portfolio", leader_rows),
+                        ("v2_qv_portfolio", v2_qv_rows)):
         p_ret, selected, skipped = v2_portfolio_day(rows)
         eq = _prev_equity(con, strat, day) * (1 + p_ret)
         _replace_portfolio_allocations(con, day, strat, selected, now_iso)
@@ -992,9 +1016,12 @@ def record_day(day: date) -> dict:
         }
 
     # 4) 알파(초과수익) 스냅샷
-    for strat in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
+    for strat in (
+            "v2", "v2_leader", "v2_qv",
+            *(s for s, _f in GM3_VARIANTS), "v4r",
+            ):
         summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_b
-    for strat in ("v2_portfolio", "v2_leader_portfolio"):
+    for strat in ("v2_portfolio", "v2_leader_portfolio", "v2_qv_portfolio"):
         summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_bp
     if eq_joined is not None:
         for strat in ("gm_v3_joined", "v4r_joined"):
@@ -1078,10 +1105,15 @@ def report() -> None:
         if bench:
             print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
             matched = rows.get("bench_v2_portfolio", 1.0)
-            for s in ("v2", "v2_leader", *(s for s, _f in GM3_VARIANTS), "v4r"):
+            for s in (
+                    "v2", "v2_leader", "v2_qv",
+                    *(s for s, _f in GM3_VARIANTS), "v4r",
+                    ):
                 if s in rows:
                     print(f"  {s:<13} {fmt_outperf(rows[s], bench)}")
-            for s in ("v2_portfolio", "v2_leader_portfolio"):
+            for s in (
+                    "v2_portfolio", "v2_leader_portfolio", "v2_qv_portfolio",
+                    ):
                 if s in rows:
                     print(f"  {s:<20} {fmt_outperf(rows[s], matched)}"
                           " (동시작 벤치)")

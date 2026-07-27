@@ -7,6 +7,7 @@ import pytest
 from strategy import paper_notify
 from strategy.paper_notify import (
     notify_events, _fmt_trade, _fmt_summary, _reason_kr, fmt_outperf,
+    _split_telegram_text,
 )
 
 DAY = date(2026, 7, 6)
@@ -115,6 +116,14 @@ def test_reason_kr_mapping():
     assert _reason_kr("EOD") == "⏹정리"
 
 
+def test_long_summary_splits_without_omitting_text(monkeypatch):
+    monkeypatch.setattr(paper_notify, "TELEGRAM_TEXT_LIMIT", 20)
+    text = "첫 번째 줄입니다\n두 번째 줄입니다\n세 번째 줄은 조금 더 깁니다"
+    chunks = _split_telegram_text(text)
+    assert all(len(chunk) <= 20 for chunk in chunks)
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
 def test_fmt_outperf_pure_avoidance():
     # 전략 flat(거래 0) + 벤치 하락 → 초과수익 전량 손실회피
     s = fmt_outperf(1.0, 0.902)
@@ -136,7 +145,7 @@ def test_fmt_outperf_real_gain_no_tag():
 
 
 def test_summary_intuitive_market_comparison(sent):
-    """'초과 %p' 용어 없이 시장 대비 직관 표현 + 시드 절대수익 병기."""
+    """누적 성적을 모바일 고정폭 표로 보여준다."""
     con_ = _make_con()
     summ = {"v2_leader": {"trades": 0, "day_ret": -0.0559, "equity": 0.955},
             "gm_v3": {"closed_today": 0, "open_positions": 0, "equity": 1.0},
@@ -144,12 +153,13 @@ def test_summary_intuitive_market_comparison(sent):
             "bench_bh": {"day_ret": -0.0559, "equity": 0.902, "stocks": 72}}
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "초과" not in msg                          # 용어 제거 (오너 피드백)
-    assert "시장(등록 72종목 보유 시)" in msg          # 벤치 병기 (헌장 ②)
-    assert "아직 매매 없음" in msg                     # v2_leader = 건별 통계 경로
-    assert "시드 -4.50%" in msg                       # gm3 변형 절대수익
-    assert "시장보다 5.3%p 덜 잃음" in msg             # 직관 비교 (마이너스 쪽)
-    assert "시장보다 9.8%p 앞섬" in msg                # gm_v3 (플러스 쪽 표현)
+    assert "시장(등록 72종목 보유 시)" in msg
+    assert "<pre>모드       건수  승률     평균      누적" in msg
+    assert "v2_lead" in msg and "건별" in msg
+    assert "BASE" in msg and "+0.00%" in msg
+    assert "+R13" in msg and "-4.50%" in msg
+    assert "시장차: BASE +9.8p · +R13 +5.3p" in msg
+    assert "시장차 +는 시장보다 양호, -는 부진" in msg
 
 
 def test_summary_lists_today_trades_with_reason(sent):
@@ -170,7 +180,8 @@ def test_summary_lists_today_trades_with_reason(sent):
     assert "잇츠한불: -0.9% 🔴손절" in msg
     assert "한국콜마: +0.5% 🟢익절" in msg
     assert "카카오" not in msg                        # EOR 제외
-    assert "보유 1종목" in msg
+    assert "BASE" in msg and "-0.90%" in msg and "-1.00%" in msg
+    assert "보유: BASE 1종목" in msg
 
 
 def test_summary_gm3_shows_winrate(sent):
@@ -190,8 +201,9 @@ def test_summary_gm3_shows_winrate(sent):
             "bench_bh": {"day_ret": 0.0, "equity": 0.9, "stocks": 70}}
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "2건 · 평균 +1.80% · 승률 50%" in msg       # EOR·미래 제외한 2건
-    assert "시드 +3.50%" in msg                        # 누적/시장비교 유지
+    assert "BASE" in msg and "+1.80%" in msg and "+3.50%" in msg
+    assert "시장차: BASE +13.5p" in msg
+    assert "보유: BASE 1종목" in msg
 
 
 def test_summary_no_trades_says_watching(sent):
@@ -201,6 +213,41 @@ def test_summary_no_trades_says_watching(sent):
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
     assert "관망" in msg
+
+
+def test_summary_lists_every_today_trade_without_ellipsis(sent):
+    con_ = _make_con()
+    con_.executemany(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        [("gm_v3", f"{i:06d}", f"종목{i}", DAY.isoformat(), DAY.isoformat(),
+          -0.01, -0.009, "R10", "t") for i in range(17)])
+    summ = {
+        "v2": {"trades": 0, "day_ret": 0.0, "equity": 1.0},
+        "gm_v3": {"closed_today": 17, "open_positions": 0, "equity": 0.9},
+        "bench_bh": {"day_ret": 0.0, "equity": 0.9, "stocks": 70},
+    }
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert "종목0" in msg and "종목16" in msg
+    assert "… 외" not in msg
+
+
+@pytest.mark.parametrize(
+    ("trades", "expected"),
+    [
+        (0, "⚙️ v2 상태: 페이퍼 가동 중 · 오늘 매매 없음(관망)"),
+        (3, "⚙️ v2 상태: 페이퍼 가동 중 · 오늘 3건 매매"),
+    ],
+)
+def test_summary_shows_v2_runtime_status(sent, trades, expected):
+    con_ = _make_con()
+    summ = {
+        "v2": {"trades": trades, "day_ret": 0.0, "equity": 1.0},
+        "bench_bh": {"day_ret": 0.0, "equity": 1.0, "stocks": 70},
+    }
+    notify_events(con_, DAY, 1, [], [], summ)
+    msg = next(t for t in sent if "페이퍼 마감" in t)
+    assert expected in msg
 
 
 def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
@@ -217,9 +264,10 @@ def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
     }
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "3건" in msg and "승률 67%" in msg
+    assert "v2" in msg and "3" in msg and "67%" in msg
+    assert "+2.00%" in msg and "건별" in msg
     assert "+51" not in msg                           # 착시 누적치 미표기
-    assert "gm_v3+R13" in msg                         # 변형 축 라벨
+    assert "+R13" in msg                              # 변형 축 축약 라벨
 
 
 def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
@@ -228,9 +276,15 @@ def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
         "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
         ("gm_v3_joined", "A", "교정축종목", DAY.isoformat(), DAY.isoformat(),
          0.01, 0.005, "R8", "t"))
+    con_.execute(
+        "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
+        ("v2_qv", "B", "품질축종목", DAY.isoformat(), DAY.isoformat(),
+         0.02, 0.015, "1TP/BE", "t"))
     summ = {
         "v2_portfolio": {"trades": 2, "equity": 1.01},
         "v2_leader_portfolio": {"trades": 1, "equity": 1.02},
+        "v2_qv": {"trades": 1, "equity": 1.01},
+        "v2_qv_portfolio": {"trades": 1, "equity": 1.01},
         "gm_v3_joined": {"closed_today": 1, "equity": 1.03},
         "v4r_joined": {"closed_today": 1, "equity": 0.99},
         "bench_v2_portfolio": {"equity": 0.98},
@@ -240,9 +294,11 @@ def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
     assert "v2_portfolio" not in msg
+    assert "v2_qv" not in msg
     assert "gm_v3_joined" not in msg
     assert "v4r_joined" not in msg
     assert "교정축종목" not in msg
+    assert "품질축종목" not in msg
 
 
 def test_fmt_trade_has_prices():

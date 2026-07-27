@@ -1,6 +1,6 @@
 # 노트북 AI 작업자 인수인계
 
-기준일: 2026-07-26
+기준일: 2026-07-27
 
 작업 경로: `C:\trading-bot`
 
@@ -58,7 +58,8 @@ $env:PYTHONIOENCODING='utf-8'
 git diff --check
 ```
 
-- 현재 기준은 `433 passed`, 기존 `pandas_market_calendars` 경고 1건이다.
+- 2026-07-27 테스트 기준은 `447 passed`, 기존
+  `pandas_market_calendars` 경고 1건이다.
 - 비자명 변경은 커밋 전에 독립 리뷰어가 전체 diff와 실제 결함을 검토해야 한다.
 - 커밋·`main` fast-forward·push는 오너 승인 후에만 한다.
 - force push, `git reset --hard`, 사용자 변경 폐기는 금지한다.
@@ -74,6 +75,11 @@ git diff --check
 - 종목당 20%, 동시 5종목, 정규화 섹터당 최대 2종목
 - `paper_portfolio_allocations` 감사 테이블
 - 신규 관찰축의 기존 텔레그램 알림 격리
+- `v2_qv`/`v2_qv_portfolio`: 눌림 거래량 `<=0.8x` + 돌파 거래량 `>=1.5x`.
+  현재 76종목 공유현금 회고 NAV `+5.51%`, MDD `-4.57%`; 직렬복리
+  `+50.5%`를 실계좌 성과로 해석하지 않는다.
+- top-down 연구 코드는 있으나 GM/R13/v4r paper 축에는 아직 연결하지 않았다.
+  기존 v2에는 시장 게이트를 적용하지 않는다.
 
 이 축들은 forward 측정 신뢰도를 높이기 위한 **관찰축**이다. 기존 v2 직렬복리를
 실계좌 수익률로 해석하지 말고, 신규 벤치도 아직 동일 gross exposure 벤치는
@@ -87,6 +93,15 @@ git diff --check
 ```powershell
 & "$env:USERPROFILE\.codex\scripts\invoke-mini-bot-codex.ps1" `
   -Bot trading -Prompt "<읽기 전용 확인 지시>"
+```
+
+2026-07-26 실측 기준으로 SSH 성공 계정은 `미니PC@100.100.141.24`다.
+`jason@100.100.141.24`는 같은 키로 거절되므로, 브리지 기본 설정이 `jason`이면
+다음처럼 `-SshUser "미니PC"`를 명시한다.
+
+```powershell
+& "$env:USERPROFILE\.codex\scripts\invoke-mini-bot-codex.ps1" `
+  -Bot trading -SshUser "미니PC" -Prompt "<읽기 전용 확인 지시>"
 ```
 
 기본 호출은 읽기 전용이다. pull, 파일/DB 쓰기, 테스트 중 상태 변경, 재기동 등은
@@ -106,6 +121,9 @@ git diff --check
 - 장중 08:00~16:00에는 코드 반영 목적 재기동 금지.
 - 주문, 예약 작업, 시크릿, DB 쓰기는 각각 명시적 승인 없이는 금지.
 - 원격 출력과 rc를 그대로 보고하고, 연결 실패 시 오너에게 수동 복붙을 요구하지 않는다.
+- 2026-07-26 현재 브리지 스크립트가 원격 `codex` CLI 인자를 한 덩어리로 전달해
+  실패할 수 있다. 이 경우 같은 SSH 계정으로 `powershell -EncodedCommand`를 보내
+  읽기 전용 명령만 직접 실측하고, 브리지 스크립트 파싱 문제는 별도로 고친다.
 
 ## 6. 마지막 확인 상태와 다음 확인
 
@@ -115,6 +133,14 @@ git diff --check
 - 전체 테스트 `433 passed`, 기존 경고 1건
 - 미추적 `AGENTS.md` 보존
 - 장중이어서 웹앱과 paper runner 재기동은 보류
+
+2026-07-26 추가 실측:
+
+- SSH `미니PC@100.100.141.24 hostname` 성공, 출력 `DESKTOP-NFN1RCA`
+- `C:\trading-bot`은 `main` HEAD `540949a`, origin 대비 ahead/behind `0/0`
+- 미추적 `AGENTS.md` 존재 및 보존 필요
+- 상주 3프로세스 생존: tracker, paper runner, uvicorn 8000
+- `strategy.paper_runner --report` exit code 0
 
 이는 과거 실측이다. 다음 작업자는 현재 상태를 다시 확인해야 한다. 새 코드의 운영
 반영 여부가 불명확하면 읽기 전용으로 다음을 확인한다.
