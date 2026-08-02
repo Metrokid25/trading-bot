@@ -1,10 +1,11 @@
 # 노트북 AI 작업자 인수인계
 
-기준일: 2026-07-27
+기준일: 2026-08-02
 
 작업 경로: `C:\trading-bot`
 
-기준 브랜치/커밋: `main` / `540949a`
+기준 브랜치/커밋: `main` / 이 문서를 포함한 최신 `origin/main`
+(직전 기능 기준 `3f5cf21`)
 
 > 이 문서는 별도 시작 프롬프트 없이 작동하는 노트북 인수인계 본문이다.
 > `HANDOFF_AI작업자.md`를 먼저 읽은 작업자는 이 문서를 끝까지 읽고 아래 시작
@@ -58,7 +59,7 @@ $env:PYTHONIOENCODING='utf-8'
 git diff --check
 ```
 
-- 2026-07-27 테스트 기준은 `447 passed`, 기존
+- 2026-08-02 테스트 기준은 `463 passed`, 기존
   `pandas_market_calendars` 경고 1건이다.
 - 비자명 변경은 커밋 전에 독립 리뷰어가 전체 diff와 실제 결함을 검토해야 한다.
 - 커밋·`main` fast-forward·push는 오너 승인 후에만 한다.
@@ -67,7 +68,8 @@ git diff --check
 
 ## 4. 현재 구현 상태
 
-`540949a fix: make paper metrics membership aware`까지 origin/main에 반영됐다.
+`3f5cf21 feat: improve paper reporting and v2 quality research`까지 origin/main에
+반영됐고, 이 인수인계 커밋에는 아래 `gm_regime_v1` 연구 파일도 포함된다.
 
 - append-only 실제 편입·이탈 이벤트
 - `gm_v3_joined`, `v4r_joined`, `bench_joined`
@@ -80,6 +82,16 @@ git diff --check
   `+50.5%`를 실계좌 성과로 해석하지 않는다.
 - top-down 연구 코드는 있으나 GM/R13/v4r paper 축에는 아직 연결하지 않았다.
   기존 v2에는 시장 게이트를 적용하지 않는다.
+- `strategy/gm_regime_v1.py`, `backtest/run_gm_regime_v1.py`,
+  `tests/test_gm_regime_v1.py`, `docs/research/gm_regime_v1.md`는 연구 전용이다.
+  기존 `v2_qv` 공유현금 결과에 장세별 100%/50%/20% 노출 배수를 적용하지만
+  paper runner·텔레그램·주문에는 연결하지 않았다.
+- `gm_regime_v1`은 새 알파로 NO-GO다. 섹터 `pick_date` 근사 표본은 거래 0건이라
+  판정 불가이고, 고정 유니버스 소급 탐색은 선택·생존편향이 있다. 출력하는
+  피크노출×일봉 비교도 동일노출 벤치나 초과수익이 아니다. 숫자와 다음 검증 조건은
+  연구 문서를 따른다.
+- 월별 진단상 현재 전략군에는 강한 상승 추세를 오래 보유하는 수익 엔진이 부족하다.
+  다음 후보는 `gm_trend_v1`이지만 아직 구현 승인이 아니므로 오너 지시를 기다린다.
 
 이 축들은 forward 측정 신뢰도를 높이기 위한 **관찰축**이다. 기존 v2 직렬복리를
 실계좌 수익률로 해석하지 말고, 신규 벤치도 아직 동일 gross exposure 벤치는
@@ -152,3 +164,16 @@ git diff --check
 
 재기동이 여전히 필요하면 오너 승인 후 장 마감에 웹앱을 WMI로 먼저 재기동하고,
 그 다음 paper runner만 WMI로 재기동한다. tracker와 주문 프로세스는 건드리지 않는다.
+
+## 7. 2026-08-02 노트북 전달 체크포인트
+
+- 전달 전 로컬 `main`과 `origin/main`은 `3f5cf21`에서 ahead/behind `0/0`이었다.
+- 신규 연구 테스트 16 passed, 전체 `tests\` 463 passed, 기존 warning 1건,
+  `git diff --check` 정상으로 실측했다.
+- pick-date 근사 재현은 50종목·실데이터 50종목을 읽고 거래 0건으로 종료했다.
+- `--ignore-pick-date` 편향 탐색은 문서의 +3.21%/MDD -2.84%, 피크노출×일봉
+  proxy와의 단순 격차 -37.64%p를 재현했다. 동일노출·초과수익으로 해석하지 않는다.
+- 원 PC의 `tmp/` PDF 렌더·텍스트 추출물은 미추적 로컬 산출물이므로 커밋하지
+  않았다. 노트북에서 없더라도 결손이 아니다.
+- pull 직후 위 테스트를 다시 실행하고 브랜치·HEAD·ahead/behind·로컬 변경을
+  오너에게 보고한 뒤 다음 지시를 기다린다. 미니PC 배포나 재기동은 하지 않는다.
