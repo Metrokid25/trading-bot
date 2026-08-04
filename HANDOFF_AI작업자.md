@@ -1,5 +1,29 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
+## 최우선 최신 갱신 — 2026-08-04
+
+- 미니PC는 `c56d496` 배포가 완료됐다. 2026-08-04 12:02 KST 최종 실측에서
+  web `5480/4396`, paper `13308/16320`, tracker `8020/11620`이 생존했고,
+  8000 포트와 `0167A0 → SOL AI반도체TOP2플러스 (etf)` 검색이 정상이다.
+- 운영 `paper.db`에는 2026-08-04 기준 `v2_portfolio`, `v2_qv`,
+  `v2_qv_portfolio`가 각각 1행 생성됐다. 현재 장중 임시값(`finalized=0`)이며
+  `--report` rc=0과 세 축 노출을 확인했다. 20:05 이후 확정값으로 평가한다.
+- 운영/백업 DB `quick_check=ok`; `universe_membership_events`는 table 1개,
+  trigger 11개, bootstrap/전체 76행이다. 웹 유니버스는 10 picks, 77 rows,
+  76 distinct codes로 보존됐다.
+- 2026-08-03 예약 배포는 Windows PowerShell 5.1의 두 함정 때문에 중간 실패했다:
+  charset 없는 JSON을 `Invoke-RestMethod`로 읽으면 UTF-8 한글이 깨질 수 있고,
+  다중행 Python을 native `python -c` 인수로 직접 넘기면 quoting이 깨질 수 있다.
+  배포 검증기는 raw bytes를 UTF-8로 디코딩하고, Python 코드는 UTF-8 Base64 후
+  짧은 ASCII launcher에서 decode/exec한다. PowerShell `ConvertFrom-Json` 배열은
+  `System.Object[]` 중첩 여부를 확인하고 DB 직접 조회로 최종 판정한다.
+- 오너가 2026-08-04 이번 1회에 한해 장중 코드 반영 재기동 예외를 승인했다.
+  예외는 소진됐으며 이후에는 다시 08~16시 재기동 금지와 WMI 기동 규칙을 지킨다.
+- 미니PC의 미추적 `AGENTS.md`는 SHA256
+  `6A87C43BA943EE165CE608C1FD683D6DC2B6B0A7C94D2EAEFEA7396C6F48A9CC`로 보존됐다.
+  배포 스크립트·백업·로그는 `db/backups/deploy-20260803-0958/`에 남아 있으며
+  Git 추적 파일이 아니다. tracker·실주문·시크릿은 변경하지 않았다.
+
 ## 최우선 최신 갱신 — 2026-08-02
 
 - 노트북은 `git pull --ff-only origin main` 후 이 문서 전체와

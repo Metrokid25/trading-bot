@@ -1763,3 +1763,36 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 노트북은 pull 후 `HANDOFF_AI작업자.md`와 `HANDOFF_노트북_작업자.md`를 읽고
   실제 Git·테스트 상태를 보고한 뒤 오너 지시를 기다린다. 이번 작업에서 미니PC
   파일·DB·서비스·프로세스·예약 작업·주문은 변경하지 않았다.
+
+---
+
+## 2026-08-04 미니PC c56d496 배포 완료 및 배포기 PowerShell 5.1 함정
+
+- 2026-08-03 16:05 일회성 예약 작업은 web을 WMI로 재기동했으나 ETF 검색
+  검증에서 실패했다. 실제 API 결함이 아니라 charset 없는 UTF-8 JSON을 Windows
+  PowerShell 5.1 `Invoke-RestMethod`가 잘못 해석한 검증기 결함이었다. 예약 작업은
+  `finally`에서 자신만 삭제했고 로그·스크립트·DB 백업은 보존했다.
+- 오너가 2026-08-04 이번 1회에 한해 장중 코드 반영 재기동 예외를 명시 승인했다.
+  검색 검증을 raw response bytes의 명시적 UTF-8 decode + `ConvertFrom-Json`으로
+  수정하고 web을 WMI 재기동했다. 이어 다중행 Python `-c`가 native argv quoting으로
+  깨지는 두 번째 결함을 발견해, UTF-8 Base64 payload와 짧은 ASCII launcher로
+  수정한 뒤 membership probe를 통과시켰다.
+- web은 재차 건드리지 않고 paper pair만 WMI로 교체했다. 전후 실측:
+  web `14612/15788 → 5480/4396`, paper `6648/8004 → 13308/16320`, tracker
+  `8020/11620` 유지. `Start-Process`와 실주문 경로는 사용하지 않았다.
+- 2026-08-04 12:02 읽기 전용 최종 감사:
+  - 포트 8000 LISTEN PID `4396`; `/api/picks` HTTP 200, 10 picks/77 stocks.
+  - `/api/search?q=0167A0` HTTP 200,
+    `SOL AI반도체TOP2플러스`, type `etf` 반환.
+  - `paper.db`, `trading.db` quick_check 모두 `ok`.
+  - membership table 1, triggers 11, bootstrap 76, rows 76.
+  - 2026-08-04 `v2_portfolio`, `v2_qv`, `v2_qv_portfolio` 각각 1행,
+    `finalized=0`; `paper_runner --report` rc=0에서 세 축 모두 노출.
+  - 배포 이후 paper 로그의 Traceback/ERROR/CRITICAL 및 조기 종료 흔적 0건.
+- continuation 대기 래퍼는 PowerShell `ConvertFrom-Json` 결과가 중첩
+  `System.Object[]`로 들어온 것을 누락으로 오판해 rc=1을 남겼으나, 별도 SQLite
+  mode=ro 조회와 report/API/process 감사가 운영 배포 성공을 확인했다. 앞으로 배포
+  판정은 래퍼 rc만 보지 말고 DB 행·프로세스·API를 함께 확인한다.
+- 미니PC Git은 `c56d496`, origin 대비 ahead/behind `0/0`; 미추적 `AGENTS.md`는
+  원래 해시로 보존됐다. 운영 패치 스크립트와 로그는
+  `db/backups/deploy-20260803-0958/`의 Git 비추적 산출물이다.
