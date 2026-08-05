@@ -164,6 +164,76 @@ class SectorStore:
             "CREATE INDEX IF NOT EXISTS idx_alerts_sector_time "
             "ON alert_history (sector_name, triggered_at)"
         )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mentor_signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id TEXT NOT NULL,
+                article_revision_hash TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL,
+                sector TEXT,
+                signal_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                evidence TEXT NOT NULL,
+                posted_at TEXT,
+                detected_at TEXT NOT NULL,
+                processed_at TEXT,
+                delivery_status TEXT NOT NULL,
+                trading_response TEXT,
+                source_url TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(article_id, article_revision_hash, stock_code, signal_type)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mentor_signal_status "
+            "ON mentor_signal_events(delivery_status, detected_at)"
+        )
+
+    async def get_mentor_signal_event(
+        self,
+        article_id: str,
+        article_revision_hash: str,
+        stock_code: str,
+        signal_type: str,
+    ) -> dict[str, Any] | None:
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        cur = await self._db.execute(
+            "SELECT id, delivery_status, trading_response FROM mentor_signal_events "
+            "WHERE article_id=? AND article_revision_hash=? AND stock_code=? AND signal_type=?",
+            (article_id, article_revision_hash, stock_code, signal_type),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "delivery_status": row[1], "trading_response": row[2]}
+
+    async def record_mentor_signal_event(self, payload: dict[str, Any]) -> int:
+        """검증된 멘토 신호 감사행을 기록한다. 호출자는 직렬화/중복검사를 담당한다."""
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        now_iso = to_db_iso(now_kst())
+        cur = await self._db.execute(
+            "INSERT INTO mentor_signal_events "
+            "(article_id,article_revision_hash,author_id,stock_code,stock_name,sector,"
+            "signal_type,confidence,evidence,posted_at,detected_at,processed_at,"
+            "delivery_status,trading_response,source_url,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                payload["article_id"], payload["article_revision_hash"], payload["author_id"],
+                payload["stock_code"], payload["stock_name"], payload.get("sector"),
+                payload["signal_type"], payload["confidence"], payload["evidence"],
+                payload.get("posted_at"), payload["detected_at"], now_iso,
+                payload["delivery_status"], payload.get("trading_response"),
+                payload.get("source_url"), now_iso, now_iso,
+            ),
+        )
+        if cur.lastrowid is None:
+            raise RuntimeError("lastrowid missing after mentor signal insert")
+        return int(cur.lastrowid)
 
     async def _create_universe_event_triggers(self) -> None:
         """active 코드 집합의 경계만 기록하는 SQLite 트리거를 설치한다."""

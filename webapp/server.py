@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -203,6 +204,38 @@ class RemoveStockIn(_SectorNameIn):
 
 class RemoveSectorIn(_SectorNameIn):
     pass
+
+
+class MentorSignalIn(BaseModel):
+    article_id: str = Field(min_length=1, max_length=100)
+    article_revision_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    author_id: str = Field(min_length=1, max_length=200)
+    posted_at: str | None = None
+    detected_at: str = Field(min_length=1)
+    stock_name: str = Field(min_length=1, max_length=200)
+    stock_code: str = Field(pattern=r"^\d{4}[0-9A-Z]\d$")
+    sector: str | None = Field(default=None, max_length=100)
+    signal_type: str = Field(min_length=1, max_length=30)
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: str = Field(min_length=1, max_length=2000)
+    source_url: str | None = Field(default=None, max_length=2000)
+    mode: str
+
+    @field_validator("posted_at", "detected_at")
+    @classmethod
+    def require_iso_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("ISO-8601 timestamp required") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("timezone offset required")
+        return value
+
+
+_mentor_ingest_lock = asyncio.Lock()
 
 
 # ----- API -----
@@ -591,6 +624,93 @@ async def register(
         "total": result.total_count,
         "skipped": [s.stock_name for s in result.skipped_stocks],
     }
+
+
+@app.post("/api/signals/mentor")
+async def ingest_mentor_signal(
+    body: MentorSignalIn,
+    store: SectorStore = Depends(get_store),
+    master: StockMaster = Depends(get_master),
+) -> dict:
+    """검증된 멘토 ADD_WATCH를 paper 관심종목으로만 등록한다.
+
+    이 경로는 주문 함수를 호출하지 않는다. 기존 Paper Runner가 trading.db의 활성
+    유니버스를 다음 주기에 읽고 자체 전략 조건을 통과한 경우에만 모의 기록한다.
+    """
+    if body.mode != "paper":
+        raise HTTPException(status_code=400, detail="Mentor signal mode must be paper")
+    if settings.KIS_ENV != "PAPER":
+        raise HTTPException(status_code=409, detail="Mentor signal ingest requires KIS_ENV=PAPER")
+    configured_author = settings.MENTOR_AUTHOR_ID.strip()
+    if not configured_author:
+        raise HTTPException(status_code=503, detail="MENTOR_AUTHOR_ID is not configured")
+    if not hmac.compare_digest(
+        body.author_id.encode("utf-8"), configured_author.encode("utf-8")
+    ):
+        raise HTTPException(status_code=403, detail="Mentor author verification failed")
+    if body.signal_type != "ADD_WATCH":
+        raise HTTPException(status_code=400, detail="Only ADD_WATCH may enter the paper watchlist")
+    if body.confidence < settings.MENTOR_SIGNAL_CONFIDENCE_THRESHOLD:
+        raise HTTPException(status_code=422, detail="Signal confidence is below threshold")
+
+    await master.ensure_loaded()
+    resolved = await master.resolve(body.stock_code)
+    if resolved is None or not resolved[1]:
+        raise HTTPException(status_code=400, detail="Unknown stock code")
+    canonical_code, canonical_name = resolved
+    def normalize_stock_name(value: str) -> str:
+        return re.sub(r"\s+", "", value).casefold()
+    if (canonical_code != body.stock_code
+            or normalize_stock_name(canonical_name) != normalize_stock_name(body.stock_name)):
+        raise HTTPException(status_code=400, detail="Stock name/code mismatch")
+
+    sector = normalize_sector_name(body.sector or "멘토 자동픽")
+    key = (
+        body.article_id, body.article_revision_hash, body.stock_code, body.signal_type
+    )
+    async with _mentor_ingest_lock:
+        existing = await store.get_mentor_signal_event(*key)
+        if existing is not None:
+            previous = json.loads(existing["trading_response"] or "{}")
+            return {**previous, "duplicate": True, "event_id": existing["id"]}
+
+        pick_template = SectorPick.create(
+            (body.posted_at or now_kst().isoformat())[:10],
+            raw_input=f"[mentor:{body.article_id}]",
+            expires_days=WEB_PICK_EXPIRES_DAYS,
+        )
+        stock = SectorStock(
+            pick_id=0,
+            sector_name=sector,
+            stock_code=canonical_code,
+            stock_name=canonical_name,
+            added_order=1,
+        )
+        result = await store.upsert_sector(
+            sector, [stock], pick_template, record_pick_event=True
+        )
+        await store.ensure_pick_expiry(result.pick_id, WEB_PICK_EXPIRES_DAYS)
+        response = {
+            "accepted": True,
+            "duplicate": False,
+            "registered": result.added_count > 0,
+            "already_watched": result.added_count == 0,
+            "pick_id": result.pick_id,
+            "stock_code": canonical_code,
+            "stock_name": canonical_name,
+            "paper_runner": "will_load_on_next_cycle",
+            "live_order": "disabled",
+        }
+        event_id = await store.record_mentor_signal_event(
+            {
+                **body.model_dump(),
+                "sector": sector,
+                "stock_name": canonical_name,
+                "delivery_status": "registered" if result.added_count else "already_watched",
+                "trading_response": json.dumps(response, ensure_ascii=False),
+            }
+        )
+        return {**response, "event_id": event_id}
 
 
 @app.post("/api/picks/remove-stock")

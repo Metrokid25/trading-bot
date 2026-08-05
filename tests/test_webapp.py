@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import httpx
 import pytest
 import pytest_asyncio
@@ -8,6 +10,7 @@ from httpx import ASGITransport
 import webapp.server as webapp_server
 from config.settings import settings
 from data.sector_store import SectorStore
+from strategy.paper_runner import load_universe
 from webapp.server import app, get_http, get_kis, get_master, get_store
 
 # 등록·삭제 라우트 공유 비밀번호 (테스트용)
@@ -198,6 +201,74 @@ async def test_search_returns_candidates(client):
     assert res.status_code == 200
     data = res.json()
     assert {"code": "005930", "name": "삼성전자", "type": "stock"} in data
+
+
+def mentor_payload(**overrides):
+    payload = {
+        "article_id": "173800",
+        "article_revision_hash": "a" * 64,
+        "author_id": "굿머닝",
+        "posted_at": "2026-08-05T10:14:00+09:00",
+        "detected_at": "2026-08-05T10:14:45+09:00",
+        "stock_name": "SK하이닉스",
+        "stock_code": "000660",
+        "sector": "반도체",
+        "signal_type": "ADD_WATCH",
+        "confidence": 0.96,
+        "evidence": "오늘은 SK하이닉스를 관심 있게 봅니다",
+        "source_url": "https://example/173800",
+        "mode": "paper",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_ingest_registers_paper_watch_and_is_idempotent(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "MENTOR_SIGNAL_CONFIDENCE_THRESHOLD", 0.95)
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    first = await client.post("/api/signals/mentor", json=mentor_payload())
+    second = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert first.status_code == 200
+    assert first.json()["registered"] is True
+    assert first.json()["live_order"] == "disabled"
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+
+    con = sqlite3.connect(client.store.db_path)
+    assert con.execute("SELECT COUNT(*) FROM mentor_signal_events").fetchone()[0] == 1
+    assert con.execute("SELECT COUNT(*) FROM sector_stocks WHERE stock_code='000660'").fetchone()[0] == 1
+    con.close()
+    assert ("000660", "SK하이닉스", "반도체") in load_universe(client.store.db_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "status"),
+    [
+        ({"mode": "shadow"}, 400),
+        ({"signal_type": "DO_NOT_BUY"}, 400),
+        ({"confidence": 0.94}, 422),
+        ({"author_id": "다른사람"}, 403),
+        ({"stock_name": "삼성전자"}, 400),
+        ({"stock_code": "999999", "stock_name": "없는종목"}, 400),
+    ],
+)
+async def test_mentor_signal_ingest_rejects_unsafe_payloads(client, monkeypatch, overrides, status):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "MENTOR_SIGNAL_CONFIDENCE_THRESHOLD", 0.95)
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    response = await client.post("/api/signals/mentor", json=mentor_payload(**overrides))
+    assert response.status_code == status
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_ingest_requires_paper_environment(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "REAL")
+    response = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert response.status_code == 409
 
 
 @pytest.mark.asyncio

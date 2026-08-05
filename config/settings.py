@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     # 등록·삭제 API 공유 비밀번호. 비어 있으면 등록·삭제 요청 전부 거부(안전 기본값).
     WEB_SHARED_KEY: str = ""
 
+    # --- Mentor Signal Reader (paper-only ingest) ---
+    # 빈 작성자 ID는 자동 등록을 전부 거부하는 fail-closed 기본값이다.
+    MENTOR_AUTHOR_ID: str = ""
+    MENTOR_SIGNAL_CONFIDENCE_THRESHOLD: float = 0.95
+
     # --- Infra ---
     LOG_LEVEL: str = "INFO"
     LOG_DIR: Path = PROJECT_ROOT / "logs"
