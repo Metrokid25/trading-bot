@@ -1,5 +1,16 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
+## 최우선 최신 갱신 — 2026-08-05 Mentor Signal Paper Ingest
+
+- 작업 브랜치 `feature/mentor-signal-ingest`에 `POST /api/signals/mentor`와
+  `mentor_signal_events` 감사/멱등 테이블을 추가했다.
+- 수신은 X-Web-Key, paper 모드, KIS_ENV=PAPER, 작성자, ADD_WATCH, 신뢰도,
+  StockMaster 이름/코드를 모두 재검증한 뒤 기존 SectorStore 관심종목 경로만 호출한다.
+- Paper Runner는 기존 `load_universe` 주기에서 자동등록 종목을 동적으로 읽는다.
+  실전 주문 코드와 `main.py`는 수정하거나 호출하지 않았다.
+- 상세 계약은 `docs/mentor_signal_ingest.md`. 미니PC 배포/웹앱 재기동/paper 전환은
+  아직 수행하지 않았다.
+
 ## 최우선 최신 갱신 — 2026-08-04
 
 - 미니PC는 `c56d496` 배포가 완료됐다. 2026-08-04 12:02 KST 최종 실측에서
