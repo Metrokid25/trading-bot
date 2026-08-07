@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -10,6 +11,8 @@ from httpx import ASGITransport
 import webapp.server as webapp_server
 from config.settings import settings
 from data.sector_store import SectorStore
+from data.sector_models import SectorPick, SectorStock
+from core.time_utils import now_kst
 from strategy.paper_runner import load_universe
 from webapp.server import app, get_http, get_kis, get_master, get_store
 
@@ -208,8 +211,8 @@ def mentor_payload(**overrides):
         "article_id": "173800",
         "article_revision_hash": "a" * 64,
         "author_id": "굿머닝",
-        "posted_at": "2026-08-05T10:14:00+09:00",
-        "detected_at": "2026-08-05T10:14:45+09:00",
+        "posted_at": now_kst().isoformat(),
+        "detected_at": now_kst().isoformat(),
         "stock_name": "SK하이닉스",
         "stock_code": "000660",
         "sector": "반도체",
@@ -241,6 +244,12 @@ async def test_mentor_signal_ingest_registers_paper_watch_and_is_idempotent(clie
     assert con.execute("SELECT COUNT(*) FROM sector_stocks WHERE stock_code='000660'").fetchone()[0] == 1
     con.close()
     assert ("000660", "SK하이닉스", "반도체") in load_universe(client.store.db_path)
+    assert ("000660", "SK하이닉스", "반도체") not in load_universe(
+        client.store.db_path, as_of_day=now_kst().date()
+    )
+    assert ("000660", "SK하이닉스", "반도체") in load_universe(
+        client.store.db_path, as_of_day=(now_kst() + timedelta(days=1)).date()
+    )
 
 
 @pytest.mark.asyncio
@@ -269,6 +278,203 @@ async def test_mentor_signal_ingest_requires_paper_environment(client, monkeypat
     monkeypatch.setattr(settings, "KIS_ENV", "REAL")
     response = await client.post("/api/signals/mentor", json=mentor_payload())
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_ingest_rejects_stale_or_missing_posted_at(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    stale = (now_kst() - timedelta(hours=25)).isoformat()
+    response = await client.post(
+        "/api/signals/mentor", json=mentor_payload(posted_at=stale)
+    )
+    assert response.status_code == 422
+    payload = mentor_payload()
+    payload.pop("posted_at")
+    missing = await client.post("/api/signals/mentor", json=payload)
+    assert missing.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_blank_sector_uses_isolated_default(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    response = await client.post(
+        "/api/signals/mentor", json=mentor_payload(sector="   ")
+    )
+    assert response.status_code == 200
+    con = sqlite3.connect(client.store.db_path)
+    assert con.execute(
+        "SELECT sector_name FROM sector_stocks WHERE stock_code='000660'"
+    ).fetchone()[0] == "멘토 자동픽 · 미분류"
+    con.close()
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_does_not_extend_same_named_manual_sector(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    manual = SectorPick.create(
+        now_kst().date().isoformat(), raw_input="[telegram:/p]", expires_days=7
+    )
+    manual_result = await client.store.upsert_sector(
+        "반도체",
+        [SectorStock(pick_id=0, sector_name="반도체", stock_code="005930",
+                     stock_name="삼성전자", added_order=1)],
+        manual,
+    )
+    assert client.store._db is not None
+    before = (await (await client.store._db.execute(
+        "SELECT expires_at FROM sector_picks WHERE id=?", (manual_result.pick_id,)
+    )).fetchone())[0]
+    response = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert response.status_code == 200
+    after = (await (await client.store._db.execute(
+        "SELECT expires_at FROM sector_picks WHERE id=?", (manual_result.pick_id,)
+    )).fetchone())[0]
+    assert after == before
+    assert response.json()["storage_sector"] == "멘토 자동픽 · 반도체"
+
+
+@pytest.mark.asyncio
+async def test_mentor_processing_reservation_recovers_after_upsert_failure(
+    client, monkeypatch
+):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    original = client.store.upsert_sector
+
+    async def fail_once(*args, **kwargs):
+        raise RuntimeError("simulated upsert failure")
+
+    payload = mentor_payload()
+    monkeypatch.setattr(client.store, "upsert_sector", fail_once)
+    with pytest.raises(RuntimeError, match="simulated"):
+        await client.post("/api/signals/mentor", json=payload)
+    assert client.store._db is not None
+    assert (await (await client.store._db.execute(
+        "SELECT delivery_status FROM mentor_signal_events"
+    )).fetchone())[0] == "processing"
+
+    monkeypatch.setattr(client.store, "upsert_sector", original)
+    recovered = await client.post("/api/signals/mentor", json=payload)
+    assert recovered.status_code == 200
+    assert (await (await client.store._db.execute(
+        "SELECT delivery_status FROM mentor_signal_events"
+    )).fetchone())[0] == "registered"
+
+
+@pytest.mark.asyncio
+async def test_mentor_followup_stock_waits_until_next_day(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    first = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert first.status_code == 200
+    yesterday = (now_kst() - timedelta(days=1)).isoformat()
+    assert client.store._db is not None
+    await client.store._db.execute(
+        "UPDATE sector_picks SET created_at=? WHERE id=?",
+        (yesterday, first.json()["pick_id"]),
+    )
+    await client.store._db.execute(
+        "UPDATE sector_stocks SET tracking_start_date=? WHERE stock_code='000660'",
+        (yesterday,),
+    )
+    second = await client.post(
+        "/api/signals/mentor",
+        json=mentor_payload(
+            article_id="173801", article_revision_hash="b" * 64,
+            stock_code="005930", stock_name="삼성전자",
+        ),
+    )
+    assert second.status_code == 200
+    today = load_universe(client.store.db_path, as_of_day=now_kst().date())
+    assert ("000660", "SK하이닉스", "반도체") in today
+    assert ("005930", "삼성전자", "반도체") not in today
+
+
+@pytest.mark.asyncio
+async def test_processing_idempotency_key_rejects_different_payload(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+
+    async def fail_once(*args, **kwargs):
+        raise RuntimeError("simulated upsert failure")
+
+    monkeypatch.setattr(client.store, "upsert_sector", fail_once)
+    with pytest.raises(RuntimeError, match="simulated"):
+        await client.post("/api/signals/mentor", json=mentor_payload())
+    conflict = await client.post(
+        "/api/signals/mentor", json=mentor_payload(sector="다른 섹터")
+    )
+    assert conflict.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_processing_recovery_preserves_registered_audit_result(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    original_complete = client.store.complete_mentor_signal_event
+
+    async def fail_complete(*args, **kwargs):
+        raise RuntimeError("simulated audit completion failure")
+
+    payload = mentor_payload()
+    monkeypatch.setattr(client.store, "complete_mentor_signal_event", fail_complete)
+    with pytest.raises(RuntimeError, match="audit completion"):
+        await client.post("/api/signals/mentor", json=payload)
+    monkeypatch.setattr(client.store, "complete_mentor_signal_event", original_complete)
+    recovered = await client.post("/api/signals/mentor", json=payload)
+    assert recovered.status_code == 200
+    assert recovered.json()["registered"] is True
+    assert recovered.json()["already_watched"] is False
+
+
+@pytest.mark.asyncio
+async def test_new_article_for_existing_watch_has_consistent_audit_status(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    first = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert first.status_code == 200
+    second = await client.post(
+        "/api/signals/mentor",
+        json=mentor_payload(article_id="173802", article_revision_hash="c" * 64),
+    )
+    assert second.status_code == 200
+    assert second.json()["registered"] is False
+    assert second.json()["already_watched"] is True
+    assert client.store._db is not None
+    status = (await (await client.store._db.execute(
+        "SELECT delivery_status FROM mentor_signal_events WHERE article_id='173802'"
+    )).fetchone())[0]
+    assert status == "already_watched"
+
+
+@pytest.mark.asyncio
+async def test_mentor_signal_ingest_requires_web_key(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    response = await client.post(
+        "/api/signals/mentor", json=mentor_payload(), headers={"X-Web-Key": "wrong-key"}
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_mentor_duplicate_survives_malformed_stored_response(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    first = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert first.status_code == 200
+    assert client.store._db is not None
+    await client.store._db.execute(
+        "UPDATE mentor_signal_events SET trading_response='not-json' WHERE id=?",
+        (first.json()["event_id"],),
+    )
+    duplicate = await client.post("/api/signals/mentor", json=mentor_payload())
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+    assert duplicate.json()["live_order"] == "disabled"
 
 
 @pytest.mark.asyncio

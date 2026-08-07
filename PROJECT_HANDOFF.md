@@ -5,6 +5,15 @@
 > 작업 영역 관련 섹션만 찾아 읽으면 된다.
 > 마지막 업데이트: 2026-07-23 (섹터명 통합 + 전략/성과 독립 진단) · 기준 커밋: 8c05367
 
+## 최근 변경 (2026-08-07) — Mentor Signal Paper 전용 연동
+
+- 작업 브랜치 `feature/mentor-signal-ingest`에 인증·작성자·신뢰도·StockMaster를
+  재검증하는 `POST /api/signals/mentor`를 추가했다.
+- 수신 감사로그는 article revision/stock/signal UNIQUE + processing 예약 + payload
+  hash로 일관성을 지키며, 전용 자동픽 섹터와 종목별 익일 편입을 사용한다.
+- Fixture E2E와 전체 483 passed, 1 skipped. `main.py`, 주문 메서드, 실전 실행 경로는
+  변경하거나 호출하지 않았다. 미니PC 배포와 paper 전환은 미수행이다.
+
 ---
 
 ## 최근 변경 (2026-07-11, 노트북) — 그림해설판 TIER 1 코드화 (R13~R16) + A/B 검증

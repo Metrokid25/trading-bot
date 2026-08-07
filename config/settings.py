@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     # 빈 작성자 ID는 자동 등록을 전부 거부하는 fail-closed 기본값이다.
     MENTOR_AUTHOR_ID: str = ""
     MENTOR_SIGNAL_CONFIDENCE_THRESHOLD: float = 0.95
+    # 오래된 Archive 백필이 현재 Paper 유니버스를 오염시키지 않게 제한한다.
+    MENTOR_SIGNAL_MAX_AGE_HOURS: float = 24.0
 
     # --- Infra ---
     LOG_LEVEL: str = "INFO"

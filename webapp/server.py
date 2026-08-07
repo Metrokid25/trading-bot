@@ -210,7 +210,7 @@ class MentorSignalIn(BaseModel):
     article_id: str = Field(min_length=1, max_length=100)
     article_revision_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     author_id: str = Field(min_length=1, max_length=200)
-    posted_at: str | None = None
+    posted_at: str
     detected_at: str = Field(min_length=1)
     stock_name: str = Field(min_length=1, max_length=200)
     stock_code: str = Field(pattern=r"^\d{4}[0-9A-Z]\d$")
@@ -236,6 +236,22 @@ class MentorSignalIn(BaseModel):
 
 
 _mentor_ingest_lock = asyncio.Lock()
+
+
+def _mentor_duplicate_response(existing: dict) -> dict:
+    try:
+        previous = json.loads(existing.get("trading_response") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+    return {
+        **previous,
+        "accepted": True,
+        "duplicate": True,
+        "event_id": existing["id"],
+        "live_order": "disabled",
+    }
 
 
 # ----- API -----
@@ -652,7 +668,6 @@ async def ingest_mentor_signal(
         raise HTTPException(status_code=400, detail="Only ADD_WATCH may enter the paper watchlist")
     if body.confidence < settings.MENTOR_SIGNAL_CONFIDENCE_THRESHOLD:
         raise HTTPException(status_code=422, detail="Signal confidence is below threshold")
-
     await master.ensure_loaded()
     resolved = await master.resolve(body.stock_code)
     if resolved is None or not resolved[1]:
@@ -664,21 +679,72 @@ async def ingest_mentor_signal(
             or normalize_stock_name(canonical_name) != normalize_stock_name(body.stock_name)):
         raise HTTPException(status_code=400, detail="Stock name/code mismatch")
 
-    sector = normalize_sector_name(body.sector or "멘토 자동픽")
+    display_sector = normalize_sector_name(body.sector or "미분류") or "미분류"
+    # 수동 섹터와 pick 자체를 분리해 기존 수동 픽의 만료를 연장하지 않는다.
+    sector = f"멘토 자동픽 · {display_sector[:70]}"
     key = (
         body.article_id, body.article_revision_hash, body.stock_code, body.signal_type
     )
+    existing_before = await store.get_mentor_signal_event(*key)
+    if existing_before is not None and existing_before["delivery_status"] != "processing":
+        return _mentor_duplicate_response(existing_before)
+    if existing_before is None:
+        posted_at = datetime.fromisoformat(body.posted_at)
+        posted_kst = posted_at.astimezone(now_kst().tzinfo)
+        age_hours = (now_kst() - posted_kst).total_seconds() / 3600
+        max_age = settings.MENTOR_SIGNAL_MAX_AGE_HOURS
+        if max_age <= 0:
+            raise HTTPException(status_code=503, detail="MENTOR_SIGNAL_MAX_AGE_HOURS is invalid")
+        if age_hours > max_age:
+            raise HTTPException(status_code=422, detail="Mentor signal article is stale")
+        if age_hours < -(5 / 60):
+            raise HTTPException(status_code=422, detail="Mentor signal article is in the future")
     async with _mentor_ingest_lock:
+        reservation, inserted = await store.reserve_mentor_signal_event(
+            {
+                **body.model_dump(),
+                "sector": sector,
+            }
+        )
+        if not inserted and reservation["delivery_status"] != "processing":
+            return _mentor_duplicate_response(reservation)
+        if not reservation["payload_matches"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key is already reserved for a different payload",
+            )
+        event_id = reservation["id"]
+
+        # processing은 이전 시도 중단 또는 다중 worker 경합 상태다. upsert 자체가
+        # 멱등이므로 그대로 재개하고 최종 감사 상태를 registered로 확정한다.
         existing = await store.get_mentor_signal_event(*key)
-        if existing is not None:
-            previous = json.loads(existing["trading_response"] or "{}")
-            return {**previous, "duplicate": True, "event_id": existing["id"]}
+        if existing is not None and existing["delivery_status"] != "processing":
+            return _mentor_duplicate_response(existing)
+
+        reserved_at = datetime.fromisoformat(reservation["created_at"])
+        recovered_pick_id = await store.find_reserved_mentor_registration(
+            sector=sector,
+            stock_code=canonical_code,
+            tracking_start_date=reservation["created_at"],
+        )
+        if recovered_pick_id is not None:
+            response = {
+                "accepted": True, "duplicate": False, "registered": True,
+                "already_watched": False, "pick_id": recovered_pick_id,
+                "stock_code": canonical_code, "stock_name": canonical_name,
+                "sector": display_sector, "storage_sector": sector,
+                "paper_runner": "will_load_on_next_cycle", "live_order": "disabled",
+            }
+            await store.complete_mentor_signal_event(event_id, response)
+            return {**response, "event_id": event_id}
 
         pick_template = SectorPick.create(
             (body.posted_at or now_kst().isoformat())[:10],
             raw_input=f"[mentor:{body.article_id}]",
             expires_days=WEB_PICK_EXPIRES_DAYS,
         )
+        pick_template.created_at = reserved_at
+        pick_template.expires_at = reserved_at + timedelta(days=WEB_PICK_EXPIRES_DAYS)
         stock = SectorStock(
             pick_id=0,
             sector_name=sector,
@@ -690,26 +756,28 @@ async def ingest_mentor_signal(
             sector, [stock], pick_template, record_pick_event=True
         )
         await store.ensure_pick_expiry(result.pick_id, WEB_PICK_EXPIRES_DAYS)
+        # 동시 worker가 같은 예약을 함께 재개했더라도, 예약 시각으로 생성된
+        # 종목 행을 다시 확인하면 마지막 완료자가 감사 결과를 false로 덮지 않는다.
+        applied_pick_id = await store.find_reserved_mentor_registration(
+            sector=sector,
+            stock_code=canonical_code,
+            tracking_start_date=reservation["created_at"],
+        )
+        registered_by_event = result.added_count > 0 or applied_pick_id is not None
         response = {
             "accepted": True,
             "duplicate": False,
-            "registered": result.added_count > 0,
-            "already_watched": result.added_count == 0,
-            "pick_id": result.pick_id,
+            "registered": registered_by_event,
+            "already_watched": not registered_by_event,
+            "pick_id": applied_pick_id or result.pick_id,
             "stock_code": canonical_code,
             "stock_name": canonical_name,
+            "sector": display_sector,
+            "storage_sector": sector,
             "paper_runner": "will_load_on_next_cycle",
             "live_order": "disabled",
         }
-        event_id = await store.record_mentor_signal_event(
-            {
-                **body.model_dump(),
-                "sector": sector,
-                "stock_name": canonical_name,
-                "delivery_status": "registered" if result.added_count else "already_watched",
-                "trading_response": json.dumps(response, ensure_ascii=False),
-            }
-        )
+        await store.complete_mentor_signal_event(event_id, response)
         return {**response, "event_id": event_id}
 
 

@@ -24,6 +24,7 @@ from typing import Any
 from loguru import logger
 
 from config import constants as C
+from config.settings import settings
 from core.kis_api import KISClient
 from core.telegram_bot import TelegramBot
 from core.time_utils import now_kst
@@ -31,6 +32,12 @@ from data.sector_models import SectorStock
 from data.sector_store import AlertResult, SectorStore
 
 _KIS_CONCURRENCY = 4  # rate limiter가 주 게이트, 세마포어는 보조 (커넥션 풀 보호)
+
+
+def filter_paper_only_picks(picks, kis_env: str):
+    if kis_env == "PAPER":
+        return list(picks)
+    return [pick for pick in picks if not pick.raw_input.startswith("[mentor:")]
 
 
 class SectorDetector:
@@ -178,6 +185,9 @@ class SectorDetector:
             return
 
         picks = await self.sector_store.get_active_picks()
+        # Mentor Signal은 paper 전용 출처다. 과거 paper 픽이 DB에 남아 있어도
+        # REAL 섹터 감지/알림 유니버스에는 절대 들어오지 않는다.
+        picks = filter_paper_only_picks(picks, settings.KIS_ENV)
         if not picks:
             logger.debug("[sector] active pick 없음 — 스캔 스킵")
             return

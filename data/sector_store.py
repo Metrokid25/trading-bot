@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -182,6 +183,7 @@ class SectorStore:
                 delivery_status TEXT NOT NULL,
                 trading_response TEXT,
                 source_url TEXT,
+                payload_hash TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(article_id, article_revision_hash, stock_code, signal_type)
@@ -191,6 +193,26 @@ class SectorStore:
             "CREATE INDEX IF NOT EXISTS idx_mentor_signal_status "
             "ON mentor_signal_events(delivery_status, detected_at)"
         )
+        mentor_columns = {
+            row[1] for row in await (
+                await self._db.execute("PRAGMA table_info(mentor_signal_events)")
+            ).fetchall()
+        }
+        if "payload_hash" not in mentor_columns:
+            try:
+                await self._db.execute(
+                    "ALTER TABLE mentor_signal_events ADD COLUMN payload_hash TEXT"
+                )
+            except sqlite3.OperationalError as exc:
+                # 여러 웹 worker가 같은 기존 DB를 동시에 최초 기동할 수 있다.
+                # 다른 worker가 먼저 마이그레이션을 끝낸 경우만 성공으로 인정한다.
+                refreshed = {
+                    row[1] for row in await (
+                        await self._db.execute("PRAGMA table_info(mentor_signal_events)")
+                    ).fetchall()
+                }
+                if "payload_hash" not in refreshed:
+                    raise exc
 
     async def get_mentor_signal_event(
         self,
@@ -202,38 +224,81 @@ class SectorStore:
         if not self._db:
             raise RuntimeError("SectorStore not open")
         cur = await self._db.execute(
-            "SELECT id, delivery_status, trading_response FROM mentor_signal_events "
+            "SELECT id, delivery_status, trading_response, payload_hash, created_at, sector "
+            "FROM mentor_signal_events "
             "WHERE article_id=? AND article_revision_hash=? AND stock_code=? AND signal_type=?",
             (article_id, article_revision_hash, stock_code, signal_type),
         )
         row = await cur.fetchone()
         if row is None:
             return None
-        return {"id": row[0], "delivery_status": row[1], "trading_response": row[2]}
+        return {
+            "id": row[0], "delivery_status": row[1], "trading_response": row[2],
+            "payload_hash": row[3], "created_at": row[4], "sector": row[5],
+        }
 
-    async def record_mentor_signal_event(self, payload: dict[str, Any]) -> int:
-        """검증된 멘토 신호 감사행을 기록한다. 호출자는 직렬화/중복검사를 담당한다."""
+    async def reserve_mentor_signal_event(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """관심종목 변경 전에 감사행을 예약한다. processing 행은 재시도 시 재개한다."""
         if not self._db:
             raise RuntimeError("SectorStore not open")
         now_iso = to_db_iso(now_kst())
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
         cur = await self._db.execute(
-            "INSERT INTO mentor_signal_events "
+            "INSERT OR IGNORE INTO mentor_signal_events "
             "(article_id,article_revision_hash,author_id,stock_code,stock_name,sector,"
             "signal_type,confidence,evidence,posted_at,detected_at,processed_at,"
-            "delivery_status,trading_response,source_url,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "delivery_status,trading_response,source_url,payload_hash,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 payload["article_id"], payload["article_revision_hash"], payload["author_id"],
                 payload["stock_code"], payload["stock_name"], payload.get("sector"),
                 payload["signal_type"], payload["confidence"], payload["evidence"],
                 payload.get("posted_at"), payload["detected_at"], now_iso,
-                payload["delivery_status"], payload.get("trading_response"),
-                payload.get("source_url"), now_iso, now_iso,
+                "processing", None,
+                payload.get("source_url"), payload_hash, now_iso, now_iso,
             ),
         )
-        if cur.lastrowid is None:
-            raise RuntimeError("lastrowid missing after mentor signal insert")
-        return int(cur.lastrowid)
+        inserted = cur.rowcount == 1
+        lookup = await self.get_mentor_signal_event(
+            payload["article_id"], payload["article_revision_hash"],
+            payload["stock_code"], payload["signal_type"],
+        )
+        if lookup is None:
+            raise RuntimeError("mentor signal event missing after insert")
+        lookup["payload_matches"] = lookup["payload_hash"] in (None, payload_hash)
+        return lookup, inserted
+
+    async def find_reserved_mentor_registration(
+        self, *, sector: str, stock_code: str, tracking_start_date: str
+    ) -> int | None:
+        """예약 시각으로 삽입된 종목을 찾아 감사 완료 실패를 정확히 복구한다."""
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        cur = await self._db.execute(
+            "SELECT ss.pick_id FROM sector_stocks ss "
+            "WHERE ss.sector_name=? AND ss.stock_code=? AND ss.tracking_start_date=? "
+            "ORDER BY ss.id DESC LIMIT 1",
+            (sector, stock_code, tracking_start_date),
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def complete_mentor_signal_event(
+        self, event_id: int, response: dict[str, Any]
+    ) -> None:
+        if not self._db:
+            raise RuntimeError("SectorStore not open")
+        now_iso = to_db_iso(now_kst())
+        delivery_status = "registered" if response.get("registered") else "already_watched"
+        await self._db.execute(
+            "UPDATE mentor_signal_events SET delivery_status=?,"
+            "trading_response=?,processed_at=?,updated_at=? WHERE id=?",
+            (delivery_status, json.dumps(response, ensure_ascii=False), now_iso, now_iso, event_id),
+        )
 
     async def _create_universe_event_triggers(self) -> None:
         """active 코드 집합의 경계만 기록하는 SQLite 트리거를 설치한다."""

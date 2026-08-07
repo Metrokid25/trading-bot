@@ -1,5 +1,18 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
+## 최우선 최신 갱신 — 2026-08-07 Mentor Signal Paper E2E 완료
+
+- `POST /api/signals/mentor`는 관심종목 변경 전에 processing 감사행을 예약하고
+  payload hash로 같은 멱등키의 다른 요청을 거부한다. 중단 시 실제 등록 결과도 복구한다.
+- 인증, `mode=paper`, `KIS_ENV=PAPER`, 작성자, 신뢰도, StockMaster 이름/코드
+  재검증은 유지된다. endpoint는 관심종목 저장 외 주문 함수를 호출하지 않는다.
+- 자동픽은 전용 섹터에 저장되고 REAL scanner에서 제외되며, 종목 등록 당일 Paper
+  replay에는 들어가지 않고 익일부터 편입된다.
+- 전체 `483 passed, 1 skipped`(기존 pandas_market_calendars warning 1건). 실제 FastAPI Fixture
+  E2E에서 감사행/관심종목 등록과 당일 제외·익일 편입을 확인했다.
+- 미니PC 배포·웹앱 재기동·paper 전환은 아직 수행하지 않았다. 배포 시 장 마감 후
+  기존 WMI 절차를 사용하고 Reader는 shadow 관찰부터 시작한다.
+
 ## 최우선 최신 갱신 — 2026-08-05 Mentor Signal Paper Ingest
 
 - 작업 브랜치 `feature/mentor-signal-ingest`에 `POST /api/signals/mentor`와

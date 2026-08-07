@@ -13,9 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from agents.sector_detector import SectorDetector
+from agents.sector_detector import SectorDetector, filter_paper_only_picks
 from config import constants as C
-from data.sector_models import SectorStock
+from data.sector_models import SectorPick, SectorStock
 from data.sector_store import AlertResult, SectorStore
 
 
@@ -45,6 +45,13 @@ def _detector():
     tg.is_configured = MagicMock(return_value=True)
     tg.notify = AsyncMock(return_value=True)
     return SectorDetector(kis, store, tg), kis, store, tg
+
+
+def test_real_environment_filters_mentor_paper_picks():
+    manual = SectorPick.create("2026-08-07", raw_input="[web:user]")
+    mentor = SectorPick.create("2026-08-07", raw_input="[mentor:173800]")
+    assert filter_paper_only_picks([manual, mentor], "REAL") == [manual]
+    assert filter_paper_only_picks([manual, mentor], "PAPER") == [manual, mentor]
 
 
 # ---------- 순수 함수: 임계값 선택 ----------

@@ -228,7 +228,9 @@ def _stamp_meta(con: sqlite3.Connection) -> None:
 
 # ---------------- 유니버스 (trading.db 라이브 — 웹앱 등록 뷰) ----------------
 
-def load_universe(db_path: str | None = None) -> list[tuple[str, str, str]]:
+def load_universe(
+    db_path: str | None = None, as_of_day: date | None = None
+) -> list[tuple[str, str, str]]:
     """[(code, name, sector), ...] — trading.db 라이브 조회 (읽기 전용).
 
     필터 = active pick(미만료) × tracking_status='active' 종목.
@@ -249,14 +251,19 @@ def load_universe(db_path: str | None = None) -> list[tuple[str, str, str]]:
             "FROM sector_stocks ss JOIN sector_picks sp ON sp.id = ss.pick_id "
             "WHERE sp.status='active' AND sp.expires_at > ? "
             "AND COALESCE(ss.tracking_status, 'active') = 'active' "
+            "AND (? IS NULL OR sp.raw_input NOT LIKE '[mentor:%' "
+            "OR substr(COALESCE(ss.tracking_start_date, sp.created_at),1,10) < ?) "
             "ORDER BY sp.created_at DESC, ss.added_order",
-            (to_db_iso(now_kst()),)).fetchall()
+            (to_db_iso(now_kst()), as_of_day.isoformat() if as_of_day else None,
+             as_of_day.isoformat() if as_of_day else None)).fetchall()
     finally:
         con.close()
 
     out: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for code, name, sector in rows:
+        if sector.startswith("멘토 자동픽 · "):
+            sector = sector.removeprefix("멘토 자동픽 · ")
         key = (sector, code)
         if key in seen:
             continue
@@ -776,7 +783,9 @@ def record_day(day: date) -> dict:
     expired = materialize_expired_picks(str(settings.DB_PATH))
     if expired:
         logger.info("[paper][universe] 시간 경과 만료 {}개 상태/이탈 이벤트 확정", expired)
-    universe = load_universe()
+    # 장중 추가된 mentor 종목으로 같은 날 오전 거래를 사후 생성하지 않는다.
+    # mentor 출처만 보수적으로 다음 거래일부터 일별 재생 유니버스에 포함한다.
+    universe = load_universe(as_of_day=day)
     membership_windows = load_membership_windows(
         str(settings.DB_PATH), paper_start, day)
     if not universe and not membership_windows:
