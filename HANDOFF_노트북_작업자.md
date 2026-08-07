@@ -1,6 +1,21 @@
 # 노트북 AI 작업자 인수인계
 
-기준일: 2026-08-02
+## 2026-08-07 Mentor Signal Paper 연동 이어하기
+
+- 원격 `main`에는 Mentor Signal Paper ingest와 최신 Trading main이 통합돼 있다.
+  기능 기준점은 `2f8ced4`이며 실제 시작점은 이 문서를 포함한 최신 `origin/main`이다.
+- 검증 기준은 Trading `486 passed, 1 skipped`, Reader `823 passed`, Fixture E2E 통과다.
+  멘토 자동픽은 `[mentor:` provenance로 수동 픽과 격리되고 등록 당일 Paper replay 및
+  REAL scanner에서 제외된다.
+- Codex 자동화 `pc-16`이 2026-08-07 16:10 KST에 미니PC 배포를 한 번 실행한다.
+  웹앱은 필요 시 WMI로만 재기동하며 tracker·주문 프로세스는 건드리지 않는다.
+- Reader는 Shadow로만 시작한다. Paper 자동등록과 실전 주문은 활성화하지 않는다.
+- 출근 후 아래 §2 절차로 clean/pull한 다음 `HANDOFF_AI작업자.md` 최상단과 이 작업의
+  예약 실행 결과를 확인한다. 배포 결과가 없거나 실패했으면 중복 재기동하지 말고 보고한다.
+- 다음 작업은 Shadow 판독/지연/감사행을 읽기 전용으로 분석하고 테스트를 보강하는 것이다.
+  미니PC 운영 DB, `.env`, 상주 프로세스는 노트북에서 변경하지 않는다.
+
+기준일: 2026-08-07
 
 작업 경로: `C:\trading-bot`
 

@@ -1,5 +1,15 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
+## 최우선 최신 갱신 — 2026-08-07 main 반영·16:10 Shadow 배포 예약
+
+- Mentor Signal 기능 기준 `2f8ced4`를 원격 `main`에 fast-forward 반영했다.
+  Archive/Reader 원격 `main` 기준은 `4d488c7`이다.
+- 최신 main 통합 후 Reader `823 passed`, Trading `486 passed, 1 skipped`, Fixture E2E를 통과했다.
+- Codex 자동화 `pc-16`이 오늘 16:10 KST 미니PC 배포를 한 번 수행한다. dirty/divergence,
+  테스트, DB 백업·quick_check가 모두 정상일 때만 pull/WMI 재기동/Shadow 기동을 진행한다.
+- Reader는 Shadow로만 시작하며 Paper 자동등록·실전 주문은 비활성이다. 노트북 작업자는
+  예약 결과를 먼저 확인하고 중복 배포하지 않는다.
+
 ## 최우선 최신 갱신 — 2026-08-07 Mentor Signal Paper E2E 완료
 
 - `POST /api/signals/mentor`는 관심종목 변경 전에 processing 감사행을 예약하고
