@@ -204,3 +204,9 @@ git diff --check
   Parquet, 임시 테이블은 운영 DB가 아니라 별도 출력 경로에 저장한다.
 - 스냅샷이나 수정 DB를 미니PC `db/`로 되돌려 보내지 않는다. 전략 수정은 브랜치,
   테스트, 보고서로 전달하며 운영 반영은 오너의 별도 승인을 받는다.
+- 현재 기준본은 미니PC
+  `C:\trading-bot\db\snapshots\20260807-225346`이며 manifest Git 커밋은
+  `2dc3bc2`, `git.reproducible=true`, `paper.db` 최신 확정일은 2026-08-07이다.
+  노트북은 Tailscale SSH `미니PC@100.100.141.24`에서 이 디렉터리를 내려받고
+  반드시 `verify` 후 `install`한다. 더 최신 `latest.json`이 있으면 그 ID와
+  manifest의 Git 커밋을 우선한다.

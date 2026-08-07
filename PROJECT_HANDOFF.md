@@ -1824,8 +1824,9 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 테스트: 신규 리포트/알림 테스트 포함 전체 `465 passed`, 기존 warning 1건,
   `git diff --check` 정상. 독립 리뷰의 연구축 동급 노출·벤치 노출 비매칭 지적을
   반영했다.
-- 작업 브랜치: `feature/total-period-account-return`. 아직 커밋·push·상주
-  `paper_runner` 재기동은 하지 않았다. 장중에는 재기동하지 않는다.
+- 2026-08-07 `dc1e876`을 main/origin에 반영하고 16:07 KST 장 마감 후
+  `paper_runner` pair만 WMI로 교체했다. tracker와 uvicorn은 유지했으며 새
+  report의 대표 총기간 NAV·동시작 시장 참고치·연구축 분리를 운영 DB에서 확인했다.
 
 ---
 
@@ -1847,7 +1848,12 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
 - 대용량 캔들 DB를 제외한 일일 경량 스냅샷은 `create --without-candles`, NAS나
   단방향 공유 폴더는 `create --output-root <path>`로 지원한다. 상세 절차는
   `docs/db_analysis_snapshots.md`를 따른다.
-- 2026-08-07 첫 전체 스냅샷을 미니PC에서 생성하고 세 DB의 해시와 quick_check를
-  재검증한다. 신규 안전성 테스트를 포함한 전체 테스트는 **497 passed**, 기존
-  `pandas_market_calendars` warning 1건이며, 정확한 최종 snapshot_id는 이 변경을
-  main에 반영한 직후 생성되는 로컬 manifest를 기준으로 한다.
+- 스냅샷 기능은 `2dc3bc2`로 main/origin에 반영했다. 신규 안전성 테스트를 포함한
+  전체 테스트는 **497 passed**, 기존 `pandas_market_calendars` warning 1건이다.
+- 2026-08-07 최신 전체 스냅샷은 `20260807-225346`이다. manifest는 main
+  `2dc3bc2`, `git.reproducible=true`, `paper.db` 확정일 2026-08-07,
+  `toss_candles.db` 79종목·6,254,185행·최신 19:38 KST를 기록하며 세 DB의
+  SHA-256과 quick_check를 재검증했다.
+- Codex 로컬 자동화 `db`는 평일 21:45 KST에 paper/trading 경량본,
+  `db-2`는 금요일 22:00 KST에 캔들 포함 전체본을 생성·verify한다. 둘 다 실패할
+  때만 알리며 보존 데이터 자동 삭제는 하지 않는다.

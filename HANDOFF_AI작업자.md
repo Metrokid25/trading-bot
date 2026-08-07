@@ -302,3 +302,17 @@ $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING='utf-8'
 읽을 문서 순서: 이 문서 → `CLAUDE.md` → `PROJECT_HANDOFF.md` 최신 3~4개 섹션
 → `.claude-memory/MEMORY.md` 인덱스(특히 minipc-paper-deploy, operating-charter)
 → (작업 영역별) `docs/gm_v3_tier1_spec.md`, `HANDOFF_웹공유.md`.
+
+## 9. 2026-08-08 DB 분석 사본 전달 규칙
+
+- 운영 DB 분석은 `scripts/db_snapshot.py`가 만든 사본으로만 한다. 미니PC 운영
+  `paper.db`, `trading.db`, `toss_candles.db`를 다른 기기에서 수정하거나
+  역동기화하지 않는다.
+- 현재 기준본은 `db/snapshots/20260807-225346`, 코드 기준은 main `2dc3bc2`다.
+  세 DB SHA-256/quick_check 정상, paper 확정일 2026-08-07,
+  toss 캔들 79종목·6,254,185행·최신 2026-08-07 19:38 KST다.
+- 다른 기기는 `docs/db_analysis_snapshots.md`에 따라 먼저 `verify`, 이후 별도
+  분석 디렉터리에 `install`한다. 파생 테이블·CSV·Parquet도 그 분석 디렉터리에만
+  저장한다.
+- 미니PC 자동화는 평일 21:45 경량본, 금요일 22:00 전체본을 만든다. 자동 삭제는
+  없으므로 용량/보존 정책은 오너 승인 전 임의 변경하지 않는다.

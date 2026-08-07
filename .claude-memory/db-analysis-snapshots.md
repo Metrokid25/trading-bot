@@ -9,3 +9,7 @@
   보존한다. `verify` 후 `install --destination`으로 읽기 전용 분석 사본을 만든다.
 - 작업자는 manifest의 Git 커밋과 코드를 맞추고 파생 데이터는 별도 DB/파일에 쓴다.
 - 상세 명령과 전달 규칙: `docs/db_analysis_snapshots.md`.
+- 2026-08-07 최신 전체본: `20260807-225346`, main `2dc3bc2`, reproducible=true,
+  paper 확정일 2026-08-07, toss 79종목/6,254,185행/최신 19:38 KST, 세 DB 검증 ok.
+- 자동화 `db`: 평일 21:45 경량본. 자동화 `db-2`: 금요일 22:00 전체본.
+  실패할 때만 알리며 자동 삭제는 하지 않는다.
