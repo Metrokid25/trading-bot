@@ -192,3 +192,15 @@ git diff --check
   않았다. 노트북에서 없더라도 결손이 아니다.
 - pull 직후 위 테스트를 다시 실행하고 브랜치·HEAD·ahead/behind·로컬 변경을
   오너에게 보고한 뒤 다음 지시를 기다린다. 미니PC 배포나 재기동은 하지 않는다.
+
+## 8. 2026-08-07 운영 DB 분석 스냅샷
+
+- 미니PC 운영 DB를 직접 수정·동기화하지 않는다. `scripts/db_snapshot.py`로 생성한
+  스냅샷만 내려받아 검증·설치하고 읽기 전용 분석한다.
+- 코드를 pull한 뒤 `docs/db_analysis_snapshots.md`를 읽는다. 받은 디렉터리에서
+  `.venv\Scripts\python.exe scripts\db_snapshot.py verify <snapshot>`을 먼저 실행하고,
+  `install <snapshot> --destination <analysis-root>`으로 별도 분석 사본을 만든다.
+- `manifest.json`의 `git.commit`과 분석 코드 커밋을 맞춘다. 분석 중 생기는 표,
+  Parquet, 임시 테이블은 운영 DB가 아니라 별도 출력 경로에 저장한다.
+- 스냅샷이나 수정 DB를 미니PC `db/`로 되돌려 보내지 않는다. 전략 수정은 브랜치,
+  테스트, 보고서로 전달하며 운영 반영은 오너의 별도 승인을 받는다.

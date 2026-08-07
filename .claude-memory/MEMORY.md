@@ -13,4 +13,5 @@
 - [Mentor archive buy timing](mentor-archive-buy-timing.md) — 스승님 매수타점 원칙(진바닥→무릎, 허리 필터, 거래량 마름/실림) + article_id, v3 구현
 - [Web colleague access](web-colleague-access.md) — 웹앱 공유키(WEB_SHARED_KEY, 영문만)+등록자 스탬프 구현, 기존섹터 추가 시 author 미기록은 오너 결정 대기
 - [Mentor signal paper ingest](mentor-signal-paper-ingest.md) — paper-only 멘토 신호 API, 이중 검증·멱등 감사·Paper Runner 동적 반영, live/주문 미연결
+- [DB analysis snapshots](db-analysis-snapshots.md) — 미니PC 운영 SQLite를 Backup API로 시점 일관 복제하고 manifest/해시 검증 후 분석 PC에 읽기 전용 설치
 - [AI worker handoff](../HANDOFF_AI작업자.md) — 신규 AI 작업자 인수인계 총정리(현황·규칙·함정·백로그), 매 마디 갱신 대상

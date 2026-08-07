@@ -1826,3 +1826,28 @@ high)에서 10건 지적 → 전건 반영. 브랜치 `feature/live-universe-ops
   반영했다.
 - 작업 브랜치: `feature/total-period-account-return`. 아직 커밋·push·상주
   `paper_runner` 재기동은 하지 않았다. 장중에는 재기동하지 않는다.
+
+---
+
+## 2026-08-07 운영 DB 분석 스냅샷 전달 체계
+
+- 미니PC의 운영 `paper.db`, `trading.db`, `toss_candles.db`를 노트북·데스크톱이
+  직접 열거나 역동기화하지 않고, SQLite Backup API로 만든 시점 일관 스냅샷만
+  읽는 체계를 추가했다.
+- `scripts/db_snapshot.py`는 `create`, `verify`, `install`을 제공한다. 생성물은
+  기본적으로 gitignore 대상인 `db/snapshots/<KST timestamp>/`에 놓이며
+  `manifest.json`에 Git 커밋/상태, DB별 테이블 행 수, 최신 확정일, SHA-256,
+  `PRAGMA quick_check`를 기록한다. 모든 검증이 끝난 뒤 디렉터리와 `latest.json`을
+  게시해 작업자가 부분 복사본을 최신본으로 오인하지 않게 한다.
+- 미추적 로컬 규칙 파일 `AGENTS.md`를 제외한 dirty Git 상태에서는 기본 생성을
+  거부한다. 외부 manifest의 snapshot ID·DB 파일명은 허용목록으로 검증하고,
+  `paper.db`와 `trading.db`가 모두 없으면 설치하지 않는다.
+- 분석 PC의 `install`은 검증된 복사본을 별도 버전 디렉터리에 설치하고 DB 파일을
+  읽기 전용으로 표시한다. 운영 DB로의 역방향 전송, `.env`/키/로그 포함은 금지다.
+- 대용량 캔들 DB를 제외한 일일 경량 스냅샷은 `create --without-candles`, NAS나
+  단방향 공유 폴더는 `create --output-root <path>`로 지원한다. 상세 절차는
+  `docs/db_analysis_snapshots.md`를 따른다.
+- 2026-08-07 첫 전체 스냅샷을 미니PC에서 생성하고 세 DB의 해시와 quick_check를
+  재검증한다. 신규 안전성 테스트를 포함한 전체 테스트는 **497 passed**, 기존
+  `pandas_market_calendars` warning 1건이며, 정확한 최종 snapshot_id는 이 변경을
+  main에 반영한 직후 생성되는 로컬 manifest를 기준으로 한다.
