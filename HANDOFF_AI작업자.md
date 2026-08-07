@@ -9,7 +9,7 @@
 - 자동픽은 `[mentor:` 원천 전용 섹터에 저장되어 같은 표시명의 수동 pick과도 격리되고,
   REAL scanner에서 제외되며 종목 등록 당일 Paper
   replay에는 들어가지 않고 익일부터 편입된다.
-- 전체 `484 passed, 1 skipped`(기존 pandas_market_calendars warning 1건). 실제 FastAPI Fixture
+- 최신 main 통합 후 전체 `486 passed, 1 skipped`(기존 pandas_market_calendars warning 1건). 실제 FastAPI Fixture
   E2E에서 감사행/관심종목 등록과 당일 제외·익일 편입을 확인했다.
 - 미니PC 배포·웹앱 재기동·paper 전환은 아직 수행하지 않았다. 배포 시 장 마감 후
   기존 WMI 절차를 사용하고 Reader는 shadow 관찰부터 시작한다.

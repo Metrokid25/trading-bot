@@ -27,7 +27,7 @@ Reader는 Archive의 레거시 작성시각을 timezone-aware ISO-8601로 변환
 관심종목은 `SectorStore.upsert_sector` 트랜잭션과 기존 membership trigger를 거쳐
 저장되며, Paper Runner는 다음 주기 `load_universe`에서 이를 동적으로 읽는다.
 
-2026-08-07 검증 기준: 전체 `484 passed, 1 skipped`(기존 warning 1건), 실제 FastAPI Fixture
+2026-08-07 검증 기준: 최신 main 통합 후 전체 `486 passed, 1 skipped`(기존 warning 1건), 실제 FastAPI Fixture
 E2E에서 감사행 `registered`, 전용 watchlist 등록, 일반 조회 즉시 노출, Paper Runner
 당일 제외·익일 편입을 확인했다. 운영 미니PC 재기동과 paper 전환은 수행하지 않았다.
 

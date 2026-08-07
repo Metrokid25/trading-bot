@@ -11,7 +11,7 @@
   재검증하는 `POST /api/signals/mentor`를 추가했다.
 - 수신 감사로그는 article revision/stock/signal UNIQUE + processing 예약 + payload
   hash로 일관성을 지키며, 원천까지 격리된 전용 자동픽 섹터와 종목별 익일 편입을 사용한다.
-- Fixture E2E와 전체 484 passed, 1 skipped. `main.py`, 주문 메서드, 실전 실행 경로는
+- Fixture E2E와 최신 main 통합 후 전체 486 passed, 1 skipped. `main.py`, 주문 메서드, 실전 실행 경로는
   변경하거나 호출하지 않았다. 미니PC 배포와 paper 전환은 미수행이다.
 
 ---

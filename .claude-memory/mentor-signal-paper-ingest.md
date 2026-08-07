@@ -8,5 +8,5 @@
 - 저장: payload hash가 붙은 processing 감사 예약 → `[mentor:` 원천으로 격리된 전용 섹터 →
   종목별 `tracking_start_date` 기준 익일 Paper 편입
 - 안전: 수동 섹터 TTL 불변, REAL scanner 제외, 주문/KIS/`main.py` 호출 없음.
-- 2026-08-07 검증: 전체 484 passed, 1 skipped, FastAPI fixture E2E로 감사행·watchlist·
+- 2026-08-07 검증: 최신 main 통합 후 전체 486 passed, 1 skipped, FastAPI fixture E2E로 감사행·watchlist·
   당일 제외·익일 Paper universe 확인. 미니PC 배포와 paper 전환은 아직 하지 않음.
