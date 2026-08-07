@@ -753,7 +753,8 @@ async def ingest_mentor_signal(
             added_order=1,
         )
         result = await store.upsert_sector(
-            sector, [stock], pick_template, record_pick_event=True
+            sector, [stock], pick_template, record_pick_event=True,
+            required_raw_prefix="[mentor:",
         )
         await store.ensure_pick_expiry(result.pick_id, WEB_PICK_EXPIRES_DAYS)
         # 동시 worker가 같은 예약을 함께 재개했더라도, 예약 시각으로 생성된

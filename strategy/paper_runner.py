@@ -247,7 +247,7 @@ def load_universe(
     con = sqlite3.connect(path, timeout=15)
     try:
         rows = con.execute(
-            "SELECT ss.stock_code, ss.stock_name, ss.sector_name "
+            "SELECT ss.stock_code, ss.stock_name, ss.sector_name, sp.raw_input "
             "FROM sector_stocks ss JOIN sector_picks sp ON sp.id = ss.pick_id "
             "WHERE sp.status='active' AND sp.expires_at > ? "
             "AND COALESCE(ss.tracking_status, 'active') = 'active' "
@@ -261,8 +261,8 @@ def load_universe(
 
     out: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for code, name, sector in rows:
-        if sector.startswith("멘토 자동픽 · "):
+    for code, name, sector, raw_input in rows:
+        if (raw_input or "").startswith("[mentor:") and sector.startswith("멘토 자동픽 · "):
             sector = sector.removeprefix("멘토 자동픽 · ")
         key = (sector, code)
         if key in seen:

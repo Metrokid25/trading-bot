@@ -337,6 +337,47 @@ async def test_mentor_signal_does_not_extend_same_named_manual_sector(client, mo
 
 
 @pytest.mark.asyncio
+async def test_reserved_name_manual_pick_cannot_capture_mentor_stock(client, monkeypatch):
+    monkeypatch.setattr(settings, "MENTOR_AUTHOR_ID", "굿머닝")
+    monkeypatch.setattr(settings, "KIS_ENV", "PAPER")
+    reserved = "멘토 자동픽 · Tech"
+    manual = SectorPick.create(
+        now_kst().date().isoformat(), raw_input="[web:user]", expires_days=7
+    )
+    manual_result = await client.store.upsert_sector(
+        reserved,
+        [SectorStock(pick_id=0, sector_name=reserved, stock_code="005930",
+                     stock_name="삼성전자", added_order=1)],
+        manual,
+    )
+    assert client.store._db is not None
+    before = (await (await client.store._db.execute(
+        "SELECT expires_at FROM sector_picks WHERE id=?", (manual_result.pick_id,)
+    )).fetchone())[0]
+
+    response = await client.post(
+        "/api/signals/mentor", json=mentor_payload(sector="tech")
+    )
+    assert response.status_code == 200
+    assert response.json()["pick_id"] != manual_result.pick_id
+    after = (await (await client.store._db.execute(
+        "SELECT expires_at FROM sector_picks WHERE id=?", (manual_result.pick_id,)
+    )).fetchone())[0]
+    assert after == before
+    mentor_raw = (await (await client.store._db.execute(
+        "SELECT sp.raw_input FROM sector_picks sp JOIN sector_stocks ss ON ss.pick_id=sp.id "
+        "WHERE ss.stock_code='000660'"
+    )).fetchone())[0]
+    assert mentor_raw.startswith("[mentor:")
+    assert await client.store.find_duplicate_sectors() == {}
+    assert await client.store.merge_duplicate_sectors() == {}
+    assert await client.store.consolidate_case_insensitive_sectors() == {}
+    today = load_universe(client.store.db_path, as_of_day=now_kst().date())
+    assert ("005930", "삼성전자", reserved) in today
+    assert ("000660", "SK하이닉스", "tech") not in today
+
+
+@pytest.mark.asyncio
 async def test_mentor_processing_reservation_recovers_after_upsert_failure(
     client, monkeypatch
 ):

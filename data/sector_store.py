@@ -824,6 +824,7 @@ class SectorStore:
         stocks: list[SectorStock],
         pick_template: SectorPick,
         record_pick_event: bool = False,
+        required_raw_prefix: str | None = None,
     ) -> UpsertResult:
         """섹터 단위 UPSERT: 대소문자를 무시한 동일 활성 섹터에 종목을 추가한다."""
         if not self._db:
@@ -838,13 +839,17 @@ class SectorStore:
         tracking_end_date_iso = add_trading_days(pick_template.created_at.date(), 20).isoformat()
         await self._db.execute("BEGIN IMMEDIATE")
         try:
-            cur = await self._db.execute(
+            select_sql = (
                 "SELECT ss.pick_id, ss.sector_name FROM sector_stocks ss "
                 "JOIN sector_picks sp ON sp.id = ss.pick_id "
                 "WHERE sector_key(ss.sector_name) = ? AND sp.status = ? AND sp.expires_at > ? "
-                "ORDER BY sp.created_at DESC LIMIT 1",
-                (normalized_key, PickStatus.ACTIVE.value, now_iso),
             )
+            select_params: list[Any] = [normalized_key, PickStatus.ACTIVE.value, now_iso]
+            if required_raw_prefix is not None:
+                select_sql += "AND sp.raw_input LIKE ? "
+                select_params.append(required_raw_prefix + "%")
+            select_sql += "ORDER BY sp.created_at DESC LIMIT 1"
+            cur = await self._db.execute(select_sql, tuple(select_params))
             row = await cur.fetchone()
 
             if row:
@@ -1021,7 +1026,7 @@ class SectorStore:
             "SELECT ss.id, ss.pick_id, ss.sector_name, ss.stock_code, sp.created_at, "
             "ss.stock_name, ss.is_repick, ss.prev_pick_id, ss.days_since_last_pick, "
             "ss.total_pick_count, ss.tracking_status, ss.tracking_start_date, "
-            "ss.tracking_end_date "
+            "ss.tracking_end_date, sp.raw_input "
             "FROM sector_stocks ss "
             "JOIN sector_picks sp ON sp.id = ss.pick_id "
             "WHERE sp.status = ? AND sp.expires_at > ? "
@@ -1030,16 +1035,18 @@ class SectorStore:
         )
         rows = await cur.fetchall()
 
-        grouped: dict[str, list[tuple]] = {}
-        keys_by_pick: dict[int, set[str]] = {}
+        grouped: dict[tuple[str, bool], list[tuple]] = {}
+        keys_by_pick: dict[int, set[tuple[str, bool]]] = {}
         for row in rows:
             stock_id, pick_id, name, code, created_at = row[:5]
             key = sector_key(name)
-            grouped.setdefault(key, []).append(row)
-            keys_by_pick.setdefault(pick_id, set()).add(key)
+            is_mentor = (row[13] or "").startswith("[mentor:")
+            group_key = (key, is_mentor)
+            grouped.setdefault(group_key, []).append(row)
+            keys_by_pick.setdefault(pick_id, set()).add(group_key)
 
         results: dict[str, dict] = {}
-        for key, group_rows in grouped.items():
+        for (key, is_mentor), group_rows in grouped.items():
             pick_ids = list(dict.fromkeys(row[1] for row in group_rows))
             spellings = {normalize_sector_name(row[2]) for row in group_rows}
             has_unclean_name = any(row[2] != normalize_sector_name(row[2]) for row in group_rows)
@@ -1068,7 +1075,7 @@ class SectorStore:
 
             # 여러 섹터가 한 Pick에 섞인 레거시 데이터는 전체 Pick archive가
             # 다른 섹터까지 숨길 수 있으므로 자동 병합하지 않는다.
-            if any(keys_by_pick[pick_id] != {key} for pick_id in duplicate_ids):
+            if any(keys_by_pick[pick_id] != {(key, is_mentor)} for pick_id in duplicate_ids):
                 logger.warning(
                     "대소문자 중복 섹터 자동 병합 보류: 다른 섹터가 섞인 pick (sector=%s, picks=%s)",
                     canonical_name,
@@ -1114,6 +1121,7 @@ class SectorStore:
                         tracking_status,
                         tracking_start_date,
                         tracking_end_date,
+                        _raw_input,
                     ) = row
                     if pick_id == target_id or code in existing_codes:
                         continue
@@ -1154,7 +1162,8 @@ class SectorStore:
                 )
                 raise
 
-            results[canonical_name] = {
+            result_key = f"{canonical_name} [mentor]" if is_mentor else canonical_name
+            results[result_key] = {
                 "target_id": target_id,
                 "merged_ids": duplicate_ids,
                 "copied_stocks": copied,
@@ -1449,23 +1458,30 @@ class SectorStore:
 
         now_iso = to_db_iso(now_kst())
         cur = await self._db.execute(
-            "SELECT ss.sector_name, sp.id, sp.created_at, COUNT(ss.id) "
+            "SELECT ss.sector_name, sp.id, sp.created_at, COUNT(ss.id), "
+            "CASE WHEN sp.raw_input LIKE '[mentor:%' THEN 1 ELSE 0 END AS is_mentor "
             "FROM sector_stocks ss "
             "JOIN sector_picks sp ON sp.id = ss.pick_id "
             "WHERE sp.status = ? AND sp.expires_at > ? "
-            "GROUP BY ss.sector_name, sp.id "
+            "GROUP BY ss.sector_name, sp.id, is_mentor "
             "ORDER BY ss.sector_name, sp.created_at ASC",
             (PickStatus.ACTIVE.value, now_iso),
         )
         rows = await cur.fetchall()
 
-        sector_data: dict[str, dict] = {}
-        for sector_name, pick_id, _, cnt in rows:
-            entry = sector_data.setdefault(sector_name, {"pick_ids": [], "stock_counts": []})
+        grouped: dict[tuple[str, bool], dict] = {}
+        for sector_name, pick_id, _, cnt, is_mentor in rows:
+            entry = grouped.setdefault(
+                (sector_name, bool(is_mentor)), {"pick_ids": [], "stock_counts": []}
+            )
             entry["pick_ids"].append(pick_id)
             entry["stock_counts"].append(cnt)
 
-        return {k: v for k, v in sector_data.items() if len(v["pick_ids"]) >= 2}
+        return {
+            (f"{name} [mentor]" if is_mentor else name): value
+            for (name, is_mentor), value in grouped.items()
+            if len(value["pick_ids"]) >= 2
+        }
 
     async def merge_duplicate_sectors(self) -> dict[str, dict]:
         """같은 sector_name을 가진 여러 active 픽을 가장 오래된 pick_id로 병합.
@@ -1479,22 +1495,23 @@ class SectorStore:
         now_iso = to_db_iso(now_kst())
 
         cur = await self._db.execute(
-            "SELECT ss.sector_name, sp.id as pick_id, sp.created_at "
+            "SELECT ss.sector_name, sp.id as pick_id, sp.created_at, "
+            "CASE WHEN sp.raw_input LIKE '[mentor:%' THEN 1 ELSE 0 END AS is_mentor "
             "FROM sector_stocks ss "
             "JOIN sector_picks sp ON sp.id = ss.pick_id "
             "WHERE sp.status = ? AND sp.expires_at > ? "
-            "GROUP BY ss.sector_name, sp.id "
+            "GROUP BY ss.sector_name, sp.id, is_mentor "
             "ORDER BY ss.sector_name, sp.created_at ASC",
             (PickStatus.ACTIVE.value, now_iso),
         )
         rows = await cur.fetchall()
 
-        sector_picks: dict[str, list[int]] = {}
-        for sector_name, pick_id, _ in rows:
-            sector_picks.setdefault(sector_name, []).append(pick_id)
+        sector_picks: dict[tuple[str, bool], list[int]] = {}
+        for sector_name, pick_id, _, is_mentor in rows:
+            sector_picks.setdefault((sector_name, bool(is_mentor)), []).append(pick_id)
 
         results: dict[str, dict] = {}
-        for sector_name, pick_ids in sector_picks.items():
+        for (sector_name, is_mentor), pick_ids in sector_picks.items():
             if len(pick_ids) < 2:
                 continue
 
@@ -1520,18 +1537,23 @@ class SectorStore:
 
                 for dup_id in dup_ids:
                     cur4 = await self._db.execute(
-                        "SELECT stock_code, stock_name FROM sector_stocks "
+                        "SELECT stock_code, stock_name, is_repick, prev_pick_id, "
+                        "days_since_last_pick, total_pick_count, tracking_status, "
+                        "tracking_start_date, tracking_end_date FROM sector_stocks "
                         "WHERE pick_id = ? AND sector_name = ?",
                         (dup_id, sector_name),
                     )
-                    for code, name in await cur4.fetchall():
+                    for row in await cur4.fetchall():
+                        code, name = row[0], row[1]
                         if code not in existing_codes:
                             next_order += 1
                             await self._db.execute(
                                 "INSERT INTO sector_stocks "
-                                "(pick_id, sector_name, stock_code, stock_name, added_order) "
-                                "VALUES (?, ?, ?, ?, ?)",
-                                (target_id, sector_name, code, name, next_order),
+                                "(pick_id, sector_name, stock_code, stock_name, added_order, "
+                                "is_repick, prev_pick_id, days_since_last_pick, total_pick_count, "
+                                "tracking_status, tracking_start_date, tracking_end_date) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (target_id, sector_name, code, name, next_order, *row[2:]),
                             )
                             existing_codes.add(code)
 
@@ -1545,7 +1567,8 @@ class SectorStore:
                 logger.exception("merge_duplicate_sectors failed for sector=%s", sector_name)
                 raise
 
-            results[sector_name] = {
+            result_key = f"{sector_name} [mentor]" if is_mentor else sector_name
+            results[result_key] = {
                 "target_id": target_id,
                 "merged_ids": dup_ids,
                 "total_stocks": len(existing_codes),
