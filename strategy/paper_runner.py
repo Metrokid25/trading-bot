@@ -71,7 +71,10 @@ from core.market_calendar import add_trading_days, is_trading_day  # noqa: E402
 from core.market_schedule import next_action  # noqa: E402
 from core.time_utils import now_kst, to_db_iso  # noqa: E402
 from data.sector_store import materialize_expired_picks, sector_key  # noqa: E402
-from strategy.paper_notify import fmt_outperf, notify_events  # noqa: E402
+from strategy.paper_notify import (  # noqa: E402
+    ACCOUNT_PORTFOLIO_LABELS, PRIMARY_ACCOUNT_PORTFOLIO,
+    fmt_account_return, fmt_outperf, notify_events,
+)
 from strategy.gm_v3.config import GmV3Config  # noqa: E402
 from strategy.gm_v3.data_source import (  # noqa: E402
     kis_backfill_daily, load_daily_from_toss,
@@ -1035,6 +1038,9 @@ def record_day(day: date) -> dict:
     if eq_joined is not None:
         for strat in ("gm_v3_joined", "v4r_joined"):
             summary[strat]["alpha_vs_bench"] = summary[strat]["equity"] - eq_joined
+    summary["account_period_start"] = con.execute(
+        "SELECT MIN(day) FROM paper_daily WHERE strategy='v2_portfolio'"
+    ).fetchone()[0]
     summary["finalized"] = finalized
 
     con.commit()
@@ -1100,32 +1106,64 @@ def report() -> None:
     con = paper_conn()
     start = _meta_get(con, "paper_start")
     print(f"paper_start={start}")
-    print(f"{'day':<12}{'strategy':<13}{'n':>3}{'day_ret':>9}{'equity':>9}")
+    last = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
+    if last:
+        latest = con.execute(
+            "SELECT strategy, equity, finalized FROM paper_daily WHERE day=?",
+            (last,),
+        ).fetchall()
+        rows = {strategy: equity for strategy, equity, _finalized in latest}
+        finalized = min((value for _strategy, _equity, value in latest), default=0)
+        matched = rows.get("bench_v2_portfolio")
+        account_start = con.execute(
+            "SELECT MIN(day) FROM paper_daily WHERE strategy='v2_portfolio'"
+        ).fetchone()[0]
+        primary_name, primary_label = PRIMARY_ACCOUNT_PORTFOLIO
+        primary_equity = rows.get(primary_name)
+        if matched is not None and account_start and primary_equity is not None:
+            status = "확정" if finalized else "장중 잠정"
+            print(
+                f"\n[{last}] 총기간 봇 수익 "
+                f"({account_start}~{last}, 공유현금 모의계좌, {status})"
+            )
+            print(
+                f"  {primary_label:<14} "
+                f"{fmt_account_return(primary_equity, matched)}"
+            )
+            print(f"  동시작 시장 참고치  총수익 {matched - 1.0:+.2%}")
+            print("  ※ 시장 참고치는 등록종목 100% 보유로 봇과 노출 비매칭")
+            print("  ※ 실주문 손익 아님 · 공유현금/동시보유 제한 반영")
+
+            research_rows = [
+                (label, rows[name])
+                for name, label in ACCOUNT_PORTFOLIO_LABELS[1:]
+                if name in rows
+            ]
+            if research_rows:
+                print("  연구용 계좌형 관찰축 (대표 봇 수익 아님):")
+                for label, equity in research_rows:
+                    print(f"    {label:<12} 총수익 {equity - 1.0:+.2%}")
+
+    print(f"\n{'day':<12}{'strategy':<13}{'n':>3}{'day_ret':>9}{'equity':>9}")
     for row in con.execute(
             "SELECT day, strategy, n_trades, day_ret, equity FROM paper_daily "
             "ORDER BY day, strategy"):
         print(f"{row[0]:<12}{row[1]:<13}{row[2]:>3}{row[3]*100:>8.2f}%{row[4]:>9.4f}")
-    # 최신일 기준 누적 초과수익 (절대수익 병기 + 손실회피 태그)
-    last = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
+
+    # 기존 직렬복리 축은 연구 연속성을 위해 보존하되 실제 계좌 총수익과 분리한다.
     if last:
-        rows = dict(con.execute(
-            "SELECT strategy, equity FROM paper_daily WHERE day=?", (last,)).fetchall())
         bench = rows.get("bench_bh")
         if bench:
-            print(f"\n[{last}] 누적 성과 (초과수익 = 손실회피 + 매매수익):")
-            matched = rows.get("bench_v2_portfolio", 1.0)
+            print(
+                f"\n[{last}] 연구용 참고지표 "
+                "(직렬복리·실제 계좌 총수익 아님):"
+            )
             for s in (
                     "v2", "v2_leader", "v2_qv",
                     *(s for s, _f in GM3_VARIANTS), "v4r",
                     ):
                 if s in rows:
                     print(f"  {s:<13} {fmt_outperf(rows[s], bench)}")
-            for s in (
-                    "v2_portfolio", "v2_leader_portfolio", "v2_qv_portfolio",
-                    ):
-                if s in rows:
-                    print(f"  {s:<20} {fmt_outperf(rows[s], matched)}"
-                          " (동시작 벤치)")
             joined_bench = rows.get("bench_joined")
             if joined_bench is not None:
                 for s in ("gm_v3_joined", "v4r_joined"):

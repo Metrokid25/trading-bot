@@ -173,10 +173,30 @@ def fmt_outperf(strat_eq: float, bench_eq: float) -> str:
             f"초과 {alpha:+.2%}p{tag}")
 
 
+# 공유현금·동시보유 제한을 반영해 실제 계좌 수익에 가장 가까운 v2 축.
+# 기존 v2/v2_qv equity 는 거래마다 전액을 순차 재투자한 직렬복리 지표이므로
+# 이 목록에 절대 넣지 않는다.
+ACCOUNT_PORTFOLIO_LABELS = (
+    ("v2_portfolio", "v2 기본(대표)"),
+    ("v2_leader_portfolio", "v2 주도섹터"),
+    ("v2_qv_portfolio", "v2 품질필터"),
+)
+PRIMARY_ACCOUNT_PORTFOLIO = ACCOUNT_PORTFOLIO_LABELS[0]
+
+
+def fmt_account_return(strat_eq: float, bench_eq: float) -> str:
+    """공유현금 모의계좌의 총기간 수익을 시작자금 100 기준으로 표시한다."""
+    total_ret = strat_eq - 1.0
+    market_gap = strat_eq - bench_eq
+    return (f"총수익 {total_ret:+.2%} · 자산 100→{strat_eq * 100:.2f} · "
+            f"시장 참고차 {market_gap:+.2%}p")
+
+
 # summary dict 에서 전략이 아닌 메타 키 — 이 외 dict 값은 전부 전략으로 간주해
 # 출력하므로, 전략 축이 늘어나도(GM3_VARIANTS 등) 자동으로 요약에 포함된다.
 _SUMMARY_META_KEYS = {
     "day", "universe", "finalized", "skipped", "bench_bh",
+    "account_period_start",
     # 신규 회계 관찰축은 paper.db/--report에서 먼저 검증한다. 기존 텔레그램의
     # 매매·누적 통계 계약과 섞지 않는다.
     "bench_v2_portfolio", "v2_portfolio", "v2_leader_portfolio",
@@ -261,6 +281,25 @@ def _fmt_summary(con, day, finalized: int, summary: dict) -> str:
         f"🌊 시장(등록 {bench.get('stocks', 0)}종목 보유 시): "
         f"오늘 {bench.get('day_ret', 0.0):+.2%} · 누적 {bench_abs:+.2%}",
     ]
+
+    # 공유현금 NAV를 총기간 실계좌형 수익으로 최우선 노출한다. 직렬복리 v2
+    # equity 는 아래 건별 통계에만 남겨 실제 계좌 수익으로 오독하지 않게 한다.
+    matched = summary.get("bench_v2_portfolio", {})
+    matched_eq = matched.get("equity", 1.0)
+    primary_name, primary_label = PRIMARY_ACCOUNT_PORTFOLIO
+    primary_account = summary.get(primary_name)
+    if isinstance(primary_account, dict):
+        period_start = str(summary.get("account_period_start") or day_s)
+        lines += [
+            "",
+            f"💰 총기간 봇 수익 {period_start[5:]}~{day_s[5:]} "
+            "(공유현금 모의계좌)",
+            f"· {primary_label}: "
+            f"{fmt_account_return(primary_account.get('equity', 1.0), matched_eq)}",
+            f"· 동시작 시장 참고치: {matched_eq - 1.0:+.2%}",
+            "※ 시장 참고치는 등록종목 100% 보유로 봇과 노출 비매칭",
+            "※ 실주문 손익 아님 · 공유현금/동시보유 제한 반영",
+        ]
 
     v2 = summary.get("v2")
     if isinstance(v2, dict):

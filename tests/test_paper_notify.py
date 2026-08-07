@@ -6,7 +6,8 @@ import pytest
 
 from strategy import paper_notify
 from strategy.paper_notify import (
-    notify_events, _fmt_trade, _fmt_summary, _reason_kr, fmt_outperf,
+    notify_events, _fmt_trade, _fmt_summary, _reason_kr,
+    fmt_account_return, fmt_outperf,
     _split_telegram_text,
 )
 
@@ -144,6 +145,13 @@ def test_fmt_outperf_real_gain_no_tag():
     assert "손실회피" not in s and "손실방어" not in s
 
 
+def test_fmt_account_return_shows_total_nav_and_market_gap():
+    s = fmt_account_return(0.9959, 1.1192)
+    assert "총수익 -0.41%" in s
+    assert "자산 100→99.59" in s
+    assert "시장 참고차 -12.33%p" in s
+
+
 def test_summary_intuitive_market_comparison(sent):
     """누적 성적을 모바일 고정폭 표로 보여준다."""
     con_ = _make_con()
@@ -270,7 +278,7 @@ def test_summary_v2_uses_per_trade_stats_not_compounding(sent):
     assert "+R13" in msg                              # 변형 축 축약 라벨
 
 
-def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
+def test_account_portfolio_axes_are_primary_total_period_return(sent):
     con_ = _make_con()
     con_.execute(
         "INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?)",
@@ -281,6 +289,7 @@ def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
         ("v2_qv", "B", "품질축종목", DAY.isoformat(), DAY.isoformat(),
          0.02, 0.015, "1TP/BE", "t"))
     summ = {
+        "account_period_start": "2026-07-04",
         "v2_portfolio": {"trades": 2, "equity": 1.01},
         "v2_leader_portfolio": {"trades": 1, "equity": 1.02},
         "v2_qv": {"trades": 1, "equity": 1.01},
@@ -293,7 +302,13 @@ def test_new_accounting_axes_stay_out_of_telegram_until_validated(sent):
     }
     notify_events(con_, DAY, 1, [], [], summ)
     msg = next(t for t in sent if "페이퍼 마감" in t)
-    assert "v2_portfolio" not in msg
+    assert "총기간 봇 수익 07-04~07-06" in msg
+    assert "v2 기본(대표): 총수익 +1.00% · 자산 100→101.00" in msg
+    assert "v2 주도섹터" not in msg
+    assert "v2 품질필터" not in msg
+    assert "동시작 시장 참고치: -2.00%" in msg
+    assert "노출 비매칭" in msg
+    assert "실주문 손익 아님" in msg
     assert "v2_qv" not in msg
     assert "gm_v3_joined" not in msg
     assert "v4r_joined" not in msg

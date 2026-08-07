@@ -34,6 +34,17 @@ metadata:
 성과는 벤치마크 대비 초과수익으로만 판단. 관련: [[trading-bot-operating-charter]],
 [[nxt-premarket-historical-data]], [[data-accumulation-machine]].
 
+**성과 표시 계약(2026-08-07)**:
+- 봇의 총기간 수익 대표값은 직렬복리 `v2`가 아니라 공유현금 NAV인
+  `v2_portfolio`다. 산출 시작일~최신일, 총수익률, 시작자금 100의 NAV 변화를
+  `--report`와 텔레그램 마감 요약에 우선 표시한다.
+- `v2_leader_portfolio`·`v2_qv_portfolio`는 연구용 관찰축이며 대표 봇 수익이
+  아니다. 기존 `v2`·GM·v4r 직렬복리는 실제 계좌 총수익이 아닌 연구용 참고다.
+- `bench_v2_portfolio`는 동시작 등록종목 100% 보유라 봇의 현금/슬롯 노출과
+  매칭되지 않는다. `알파`가 아닌 `시장 참고차(노출 비매칭)`로만 해석한다.
+- 모든 값은 모의계좌이며 실주문 손익이 아니다. `finalized=0`은 장중 잠정,
+  `finalized=1`만 확정값이다.
+
 **운영 이슈**:
 - **[원인 확정 2026-07-14] 상주 무음 사망 4회의 범인 = Claude 앱 프로세스 트리.**
   AI 세션이 Start-Process 로 띄운 상주는 Claude 앱의 Job 트리에 묶여, 앱 자동
