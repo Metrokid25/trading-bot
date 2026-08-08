@@ -1,7 +1,7 @@
 """paper_runner 라이브 유니버스 배선 + 동적 벤치마크 단위 테스트.
 
 load_universe: 임시 trading.db 에 픽을 심어 웹앱 등록 뷰와 동일하게
-active pick × active tracking 종목만, (섹터,종목) dedup 으로 나오는지.
+active pick × active tracking 종목만, 종목코드 단위 dedup 으로 나오는지.
 bench_day: 당일 등록 유니버스 동일가중 시가→종가, 종목 dedup, 무봉 제외.
 """
 import sqlite3
@@ -42,11 +42,14 @@ def live_db(tmp_path):
         (1, "반도체", "000660", "SK하이닉스", 2),
         (1, "기판", "007810", "코리아써키트", 1),
     ]
-    # pick 2: active, 미만료 — 반도체 중복 1(dedup 대상) + archived 1(제외 대상)
+    # pick 2: active, 미만료 — 같은/다른 섹터 종목코드 중복(dedup 대상)
     con.execute("INSERT INTO sector_picks (id, pick_date, created_at, expires_at,"
                 " status, raw_input) VALUES (2, '2026-07-06', ?, ?, 'active', '')",
                 (now.isoformat(), future))
-    rows2 = [(2, "반도체", "005930", "삼성전자", 1)]
+    rows2 = [
+        (2, "반도체", "005930", "삼성전자", 1),
+        (2, "AI", "000660", "SK하이닉스", 2),
+    ]
     # pick 3: 만료(expires_at 과거) — 통째로 제외 대상
     con.execute("INSERT INTO sector_picks (id, pick_date, created_at, expires_at,"
                 " status, raw_input) VALUES (3, '2026-07-01', ?, ?, 'active', '')",
@@ -70,14 +73,14 @@ def live_db(tmp_path):
 def test_load_universe_live_view(live_db):
     uni = load_universe(live_db)
     pairs = {(s, c) for c, _n, s in uni}
-    # active + 미만료 픽의 active 종목만, (섹터,종목) dedup
-    assert pairs == {("반도체", "005930"), ("반도체", "000660"),
+    # active + 미만료 픽의 active 종목만 코드 dedup; 최신 pick의 섹터가 이긴다.
+    assert pairs == {("반도체", "005930"), ("AI", "000660"),
                      ("기판", "007810")}
     # 만료 픽(조선엔진)과 archived(042700)는 제외
     codes = {c for c, _n, _s in uni}
     assert "082740" not in codes and "042700" not in codes
-    # 같은 종목이 두 pick 의 같은 섹터에 있어도 1회만
-    assert sum(1 for c, _n, s in uni if (s, c) == ("반도체", "005930")) == 1
+    # 같은 코드가 다른 섹터에 있어도 1회만
+    assert sum(1 for c, _n, _s in uni if c == "000660") == 1
 
 
 def test_load_universe_empty_db(tmp_path):
@@ -91,6 +94,31 @@ def test_load_universe_empty_db(tmp_path):
     import asyncio
     asyncio.run(_make())
     assert load_universe(db) == []
+
+
+def test_leader_sector_groups_case_and_whitespace_variants(monkeypatch):
+    end = date(2026, 7, 10)
+
+    def bars(last_close):
+        return [
+            DailyBar(
+                day=end - timedelta(days=5 - i), open=100.0,
+                high=max(100.0, last_close if i == 5 else 100.0),
+                low=min(100.0, last_close if i == 5 else 100.0),
+                close=last_close if i == 5 else 100.0, volume=1000.0)
+            for i in range(6)
+        ]
+
+    monkeypatch.setattr(paper_runner, "_daily_cache", {
+        "A": bars(90.0),   # AI -10%
+        "B": bars(120.0),  # ai +20% -> 정규화 평균 +5%
+        "C": bars(108.0),  # 반도체 +8%
+    })
+    universe = [
+        ("A", "A", "AI"), ("B", "B", " ai "), ("C", "C", "반도체")]
+
+    assert paper_runner._leader_sector(
+        universe, end + timedelta(days=1)) == "반도체"
 
 
 # ---------------- bench_day (오버나이트 포함 정의) ----------------

@@ -24,7 +24,7 @@
 
 데이터: 토스 1분봉(당일분 매일 캐시 적재) + gm_v3 워밍업은 KIS 일봉 보충.
 유니버스: trading.db 라이브 조회 — active(미만료) pick × tracking_status='active'
-  종목, (섹터,종목) dedup. 주의: 웹앱 /api/picks 는 tracking_status 를 필터하지
+  종목, 종목코드 dedup(최신 active pick 섹터 채택). 주의: 웹앱 /api/picks 는 tracking_status 를 필터하지
   않으므로(archived 표시됨) 화면과 1:1 은 아니다. 픽 등록/교체는 반드시 이 기기
   (모의투자 지정 기기)의 웹앱에서 한다 — trading.db 는 gitignore(기기 로컬)라
   다른 기기에서 등록한 픽은 여기 오지 않는다.
@@ -33,8 +33,8 @@
 결측일/부분기록 처리 (record_upto):
   - 기록 사이에 빠진 거래일은 오래된 날부터 자동 소급 기록(유니버스는 현재
     라이브 — 기기가 꺼져 있었다면 픽도 못 바꿨으므로 사실상 동일).
-  - finalized=0(장중 임시 스냅샷) 행은 다음 기록 전에 재확정한다. 20:05 이후
-    또는 과거일 기록만 finalized=1.
+  - finalized=0(장중/데이터 미완 스냅샷) 행은 다음 기록 전에 재확정한다.
+    20:05 이후 또는 과거일이면서 정규장 분봉 완결성 게이트까지 통과해야 finalized=1.
 
 사용 (반드시 -m 로 — strategy/signal.py 가 stdlib signal 을 가리므로 직접 실행 금지.
       출력 한글 깨짐 방지: $env:PYTHONIOENCODING='utf-8' 접두):
@@ -52,9 +52,10 @@ import json
 import sqlite3
 import sys
 import time as time_mod
-from dataclasses import replace as dc_replace
+from dataclasses import dataclass, replace as dc_replace
 from datetime import date, datetime, time as dtime, timedelta
 from functools import lru_cache
+from math import ceil
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -84,6 +85,7 @@ from strategy.gm_v3.paper import simulate  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PAPER_DB = PROJECT_ROOT / "db" / "paper.db"
+NXT_REGISTRY_PATH = PROJECT_ROOT / "config" / "nxt_eligibility_2026q3.json"
 
 MembershipWindow = tuple[str, str, date, date]  # code, name, active_from, active_to
 
@@ -114,6 +116,36 @@ V4R_PARAMS = dict(**V2_PARAMS, max_entries=4, use_after=False, winner_gate=True)
 V2_PORTFOLIO_MAX_POSITIONS = 5
 V2_PORTFOLIO_MAX_PER_SECTOR = 2
 V2_PORTFOLIO_SLOT_WEIGHT = 1.0 / V2_PORTFOLIO_MAX_POSITIONS
+
+# 세션 분봉 완결성 게이트. 토스 통합시세에서 09:00~15:30은 391분이며,
+# 정규장은 98% 이상·09:02 이전 시작·15:28 이후 종료·내부 최대 간격 5분을
+# 모두 요구한다. NXT 프리장 기대 종목은 90% 이상과 동일한 시작/연속성 검사도
+# 통과해야 한다. 출처가 확인되지 않은 partial/no_data 종목은 하나라도 있으면
+# 확정하지 않는다.
+REGULAR_SESSION_START = "09:00"
+REGULAR_SESSION_END = "15:30"
+REGULAR_SESSION_FIRST_MINUTE_MAX = "09:02"
+REGULAR_SESSION_TERMINAL_MINUTE = "15:28"
+REGULAR_SESSION_EXPECTED_MINUTES = 391
+REGULAR_SESSION_MIN_COVERAGE = 0.98
+REGULAR_SESSION_MAX_GAP_MINUTES = 5
+REGULAR_SESSION_MIN_COMPLETE_RATIO = 1.0
+PREMARKET_START = "08:00"
+PREMARKET_END_EXCLUSIVE = "09:00"
+PREMARKET_FIRST_MINUTE_MAX = "08:02"
+PREMARKET_TERMINAL_MINUTE = "08:50"
+PREMARKET_EXPECTED_MINUTES = 59
+PREMARKET_MIN_COVERAGE = 0.90
+PREMARKET_MAX_GAP_MINUTES = 5
+PREMARKET_HISTORY_MIN_BARS = 50
+REPAIR_MAX_ATTEMPTS = 3
+REPAIR_BASE_BACKOFF_MINUTES = 30
+
+# KRX 달력에는 거래일로 남았지만 운영 당시 Toss 직접 프로브로 전 종목 0봉을
+# 확인한 실질 휴장. 자동 추론하지 않으며 새 예외는 오너 승인+독립 근거로만 추가한다.
+CONFIRMED_EMPTY_SESSION_OVERRIDES = {
+    date(2026, 7, 17): "owner-documented market-wide zero bars",
+}
 
 REGIME = "live_universe_v1"     # 2026-07-06 운영 전환(A안). 정의 변경 시 v2 로 올릴 것.
 
@@ -154,8 +186,14 @@ ASSUMPTIONS = {
            "중도 편입 종목의 그 이전 구간은 리플레이에서 빠짐. opened_on 은 "
            "진입 봉 ISO 시각(당일 재진입 PK 유니크). 축 도입 첫 기록일 day_ret "
            "에는 paper_start 이후 소급 손익이 일괄 반영됨",
-    "finalized": "finalized=1 행만 확정치(20:05 이후 또는 과거일 기록). "
-                 "finalized=0 은 장중 임시 스냅샷 — 다음 기록 전 자동 재확정",
+    "finalized": "finalized=1 행만 확정치(20:05 이후 또는 과거일 + 정규장 분봉 "
+                 "완결성 통과). finalized=0 은 장중/데이터 미완 스냅샷 — 다음 "
+                 "기록 전 자동 재수집·재확정",
+    "empty_session": "달력상 거래일의 전 종목 0봉은 오너 승인·독립 근거가 있는 "
+                     "명시적 override만 confirmed_empty로 기록하고 daily 체인에서 제외",
+    "premarket_eligibility": "넥스트레이드 공식 effective-dated 전체 선정목록. "
+                             "목록 포함=True, 완전목록 여집합=False; 유효기간 만료 시 "
+                             "새 공식 목록 없이는 fail-fast",
 }
 
 
@@ -192,6 +230,47 @@ def paper_conn() -> sqlite3.Connection:
     # 라이브 전환 마이그레이션: 레짐 스플라이스 가드 + 임시/확정 구분
     _ensure_column(con, "paper_daily", "regime", "TEXT DEFAULT ''")
     _ensure_column(con, "paper_daily", "finalized", "INTEGER DEFAULT 0")
+    _ensure_column(con, "paper_daily", "data_complete", "INTEGER DEFAULT 0")
+    _ensure_column(con, "paper_daily", "data_quality_note", "TEXT DEFAULT ''")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_data_quality ("
+        " day TEXT NOT NULL, code TEXT NOT NULL, bar_count INTEGER NOT NULL,"
+        " valid_bar_count INTEGER NOT NULL, expected_count INTEGER NOT NULL,"
+        " premarket_bar_count INTEGER NOT NULL DEFAULT 0,"
+        " premarket_expected INTEGER NOT NULL DEFAULT 0,"
+        " premarket_known INTEGER NOT NULL DEFAULT 0,"
+        " premarket_first_minute TEXT, premarket_last_minute TEXT,"
+        " premarket_max_gap_minutes INTEGER NOT NULL DEFAULT 0,"
+        " max_gap_minutes INTEGER NOT NULL DEFAULT 0,"
+        " first_minute TEXT, last_minute TEXT, status TEXT NOT NULL,"
+        " recorded_at TEXT NOT NULL, PRIMARY KEY(day, code))"
+    )
+    _ensure_column(
+        con, "paper_data_quality", "premarket_bar_count", "INTEGER DEFAULT 0")
+    _ensure_column(
+        con, "paper_data_quality", "premarket_expected", "INTEGER DEFAULT 0")
+    _ensure_column(
+        con, "paper_data_quality", "premarket_known", "INTEGER DEFAULT 0")
+    _ensure_column(
+        con, "paper_data_quality", "premarket_first_minute", "TEXT")
+    _ensure_column(
+        con, "paper_data_quality", "premarket_last_minute", "TEXT")
+    _ensure_column(
+        con, "paper_data_quality", "premarket_max_gap_minutes",
+        "INTEGER DEFAULT 0")
+    _ensure_column(
+        con, "paper_data_quality", "max_gap_minutes", "INTEGER DEFAULT 0")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_session_status ("
+        " day TEXT PRIMARY KEY, status TEXT NOT NULL, attempts INTEGER NOT NULL,"
+        " note TEXT NOT NULL, recorded_at TEXT NOT NULL)"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_premarket_eligibility ("
+        " day TEXT NOT NULL, code TEXT NOT NULL, expected INTEGER,"
+        " source TEXT NOT NULL, detail TEXT NOT NULL, recorded_at TEXT NOT NULL,"
+        " PRIMARY KEY(day,code))"
+    )
     # 텔레그램 팩트 알림 중복 차단 (5분 재기록/재시작에도 이벤트당 1회)
     con.execute(
         "CREATE TABLE IF NOT EXISTS paper_notified ("
@@ -244,7 +323,8 @@ def load_universe(
       - 만료는 expires_at 비교로 동일하게 걸러짐 (status 플립은 알림봇/웹앱 몫)
     참고: 웹앱 /api/picks 는 tracking_status 를 필터하지 않는다(archived 도 표시)
     — 여기서는 제외하는 것이 기록 목적에 맞다.
-    (섹터, 종목) 단위 dedup — 같은 종목이 두 섹터에 있으면 둘 다 유지.
+    종목코드 단위 dedup — 같은 종목이 여러 섹터에 있으면 가장 최근 active pick의
+    섹터를 결정적으로 채택한다. 한 종목을 두 번 거래/집계하지 않는다.
     """
     path = str(db_path or settings.DB_PATH)
     con = sqlite3.connect(path, timeout=15)
@@ -256,21 +336,20 @@ def load_universe(
             "AND COALESCE(ss.tracking_status, 'active') = 'active' "
             "AND (? IS NULL OR sp.raw_input NOT LIKE '[mentor:%' "
             "OR substr(COALESCE(ss.tracking_start_date, sp.created_at),1,10) < ?) "
-            "ORDER BY sp.created_at DESC, ss.added_order",
+            "ORDER BY sp.created_at DESC, sp.id DESC, ss.added_order, ss.id DESC",
             (to_db_iso(now_kst()), as_of_day.isoformat() if as_of_day else None,
              as_of_day.isoformat() if as_of_day else None)).fetchall()
     finally:
         con.close()
 
     out: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for code, name, sector, raw_input in rows:
         if (raw_input or "").startswith("[mentor:") and sector.startswith("멘토 자동픽 · "):
             sector = sector.removeprefix("멘토 자동픽 · ")
-        key = (sector, code)
-        if key in seen:
+        if code in seen:
             continue
-        seen.add(key)
+        seen.add(code)
         out.append((code, name, sector))
     n_codes = len({c for c, _n, _s in out})
     n_sectors = len({s for _c, _n, s in out})
@@ -281,57 +360,630 @@ def load_universe(
 
 # ---------------- 데이터 준비 ----------------
 
-def ensure_day_cached(day: date, codes: list[str], *, lookback_days: int = 12) -> None:
+
+@dataclass(frozen=True, slots=True)
+class SessionCoverage:
+    code: str
+    bar_count: int
+    valid_bar_count: int
+    expected_count: int
+    premarket_bar_count: int
+    premarket_expected: bool
+    premarket_known: bool
+    premarket_first_minute: str | None
+    premarket_last_minute: str | None
+    premarket_max_gap_minutes: int
+    max_gap_minutes: int
+    first_minute: str | None
+    last_minute: str | None
+    status: str
+
+
+def _premarket_history(
+        con: sqlite3.Connection, codes: list[str],
+        ) -> dict[str, list[tuple[date, int, int]]]:
+    """종목별 세션의 (날짜, 정규장 유효봉, 프리장 유효봉)을 한 번에 읽는다."""
+    unique_codes = sorted(set(codes))
+    if not unique_codes:
+        return {}
+    placeholders = ",".join("?" for _ in unique_codes)
+    valid_ohlc = "open>0 AND high>0 AND low>0 AND close>0"
+    minimum_valid = ceil(
+        REGULAR_SESSION_EXPECTED_MINUTES * REGULAR_SESSION_MIN_COVERAGE)
+    rows = con.execute(
+        "SELECT symbol,substr(ts,1,10) AS day,"
+        f" COUNT(DISTINCT CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        " THEN substr(ts,1,16) END) AS reg_n,"
+        f" COUNT(DISTINCT CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        " THEN substr(ts,1,16) END) AS pre_n"
+        f" FROM candles WHERE symbol IN ({placeholders}) "
+        "GROUP BY symbol,day ORDER BY symbol,day",
+        (REGULAR_SESSION_START, REGULAR_SESSION_END,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE, *unique_codes),
+    ).fetchall()
+    out: dict[str, list[tuple[date, int, int]]] = {
+        code: [] for code in unique_codes}
+    for code, day_s, reg_n, pre_n in rows:
+        if int(reg_n) >= minimum_valid:
+            out[code].append((date.fromisoformat(day_s), int(reg_n), int(pre_n)))
+    return out
+
+
+def premarket_profiles(
+        con: sqlite3.Connection, codes: list[str], day: date, *,
+        history: dict[str, list[tuple[date, int, int]]] | None = None,
+        eligibility: dict[str, bool | None] | None = None,
+        ) -> dict[str, tuple[bool, bool]]:
+    """관측 봉과 독립 메타데이터로 당일 NXT 기대 여부를 판정한다.
+
+    프리장 봉의 존재는 NXT 기대를 입증하지만, 부재는 NXT 비대상과 수집 장애를
+    구분하지 못한다. 따라서 0봉 이력만으로 known=False를 True로 바꾸지 않는다.
+    """
+    unique_codes = sorted(set(codes))
+    history = history if history is not None else _premarket_history(
+        con, unique_codes)
+    eligibility = eligibility or {}
+    out: dict[str, tuple[bool, bool]] = {}
+    for code in unique_codes:
+        recent = [row for row in history.get(code, []) if row[0] <= day][-3:]
+        observed_today = any(
+            hist_day == day and pre_n >= PREMARKET_HISTORY_MIN_BARS
+            for hist_day, _reg_n, pre_n in recent)
+        observed_recent = any(
+            pre_n >= PREMARKET_HISTORY_MIN_BARS
+            for _hist_day, _reg_n, pre_n in recent)
+        metadata = eligibility.get(code)
+        expected = observed_today or metadata is True or (
+            metadata is None and observed_recent)
+        known = observed_recent or metadata is not None
+        out[code] = (expected, known)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _load_nxt_registry() -> tuple[date, date, frozenset[str], str]:
+    """공식 NXT 분기 매매대상 전체 목록을 읽는다."""
+    payload = json.loads(NXT_REGISTRY_PATH.read_text(encoding="utf-8"))
+    selected_codes = payload.get("selected_codes")
+    source_hash = payload.get("source_sha256", "")
+    if (not isinstance(selected_codes, list)
+            or len(selected_codes) != 610
+            or len(set(selected_codes)) != 610
+            or any(not isinstance(code, str) or len(code) != 6
+                   for code in selected_codes)
+            or payload.get("official_selected_count") != 610
+            or payload.get("default_expected") is not False
+            or len(source_hash) != 64):
+        raise RuntimeError("invalid NXT eligibility registry")
+    return (
+        date.fromisoformat(payload["effective_from"]),
+        date.fromisoformat(payload["effective_to"]),
+        frozenset(selected_codes),
+        f"sha256={source_hash};url={payload['source_url']}",
+    )
+
+
+def premarket_eligibility_for_days(
+        con: sqlite3.Connection, days: list[date], codes: list[str],
+        now: datetime) -> dict[date, dict[str, bool | None]]:
+    """공식 effective-dated NXT registry를 날짜별 감사행으로 물질화한다.
+
+    공식 목록의 유효기간 밖 현재일은 시세 응답으로 추정하지 않고 즉시 중단한다.
+    과거 범위 밖 날짜는 unknown으로 남아 rebuild preflight에서 차단된다.
+    """
+    unique_days = sorted(set(days))
+    unique_codes = sorted(set(codes))
+    result = {day: {} for day in unique_days}
+    if not unique_days or not unique_codes:
+        return result
+    day_placeholders = ",".join("?" for _ in unique_days)
+    code_placeholders = ",".join("?" for _ in unique_codes)
+    rows = con.execute(
+        "SELECT day,code,expected,recorded_at FROM paper_premarket_eligibility "
+        f"WHERE day IN ({day_placeholders}) AND code IN ({code_placeholders})",
+        (*[day.isoformat() for day in unique_days], *unique_codes),
+    ).fetchall()
+    naive_now = datetime.fromisoformat(to_db_iso(now))
+    for day_s, code, expected, recorded_at in rows:
+        row_day = date.fromisoformat(day_s)
+        stale_unknown = (
+            row_day == now.date() and expected is None
+            and datetime.fromisoformat(recorded_at)
+            <= naive_now - timedelta(minutes=REPAIR_BASE_BACKOFF_MINUTES))
+        if not stale_unknown:
+            result[row_day][code] = (
+                None if expected is None else bool(expected))
+
+    effective_from, effective_to, selected_codes, registry_detail = (
+        _load_nxt_registry())
+    if now.date() in result and not effective_from <= now.date() <= effective_to:
+        raise RuntimeError(
+            f"NXT registry expired for {now.date()} "
+            f"(valid {effective_from}..{effective_to})")
+    registry_rows = []
+    now_iso = to_db_iso(now)
+    for registry_day in unique_days:
+        if not effective_from <= registry_day <= effective_to:
+            continue
+        for code in unique_codes:
+            if code in result[registry_day]:
+                continue
+            expected = code in selected_codes
+            result[registry_day][code] = expected
+            registry_rows.append((
+                registry_day.isoformat(), code, int(expected),
+                "official_nxt_2026q3", registry_detail, now_iso))
+    if registry_rows:
+        con.executemany(
+            "INSERT OR REPLACE INTO paper_premarket_eligibility "
+            "(day,code,expected,source,detail,recorded_at) VALUES (?,?,?,?,?,?)",
+            registry_rows)
+        con.commit()
+
+    return result
+
+
+def session_coverages(
+        con: sqlite3.Connection, day: date, codes: list[str], *,
+        profiles: dict[str, tuple[bool, bool]] | None = None,
+        eligibility: dict[str, bool | None] | None = None,
+        ) -> list[SessionCoverage]:
+    """캐시의 종목별 정규장 분봉 완결성을 읽기 전용으로 판정한다."""
+    unique_codes = sorted(set(codes))
+    if not unique_codes:
+        return []
+    placeholders = ",".join("?" for _ in unique_codes)
+    valid_ohlc = "open>0 AND high>0 AND low>0 AND close>0"
+    minimum_valid = ceil(
+        REGULAR_SESSION_EXPECTED_MINUTES * REGULAR_SESSION_MIN_COVERAGE)
+    minimum_premarket = ceil(
+        PREMARKET_EXPECTED_MINUTES * PREMARKET_MIN_COVERAGE)
+    rows = con.execute(
+        "SELECT symbol, "
+        "COUNT(DISTINCT CASE WHEN substr(ts,12,5) BETWEEN ? AND ? "
+        "THEN substr(ts,1,16) END), "
+        f"COUNT(DISTINCT CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,1,16) END), "
+        f"MIN(CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END), "
+        f"MAX(CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END), "
+        f"COUNT(DISTINCT CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? "
+        f"AND {valid_ohlc} THEN substr(ts,1,16) END), "
+        f"MIN(CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END), "
+        f"MAX(CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END) "
+        "FROM candles WHERE substr(ts,1,10)=? "
+        f"AND symbol IN ({placeholders}) GROUP BY symbol",
+        (REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         day.isoformat(), *unique_codes),
+    ).fetchall()
+    by_code = {row[0]: row[1:] for row in rows}
+    profiles = profiles if profiles is not None else premarket_profiles(
+        con, unique_codes, day, eligibility=eligibility)
+    valid_minutes: dict[str, list[int]] = {code: [] for code in unique_codes}
+    premarket_minutes: dict[str, list[int]] = {
+        code: [] for code in unique_codes}
+    for code, hhmm in con.execute(
+            f"SELECT symbol,substr(ts,12,5) FROM candles WHERE substr(ts,1,10)=? "
+            "AND substr(ts,12,5)>=? AND substr(ts,12,5)<=? "
+            f"AND {valid_ohlc} AND symbol IN ({placeholders}) "
+            "GROUP BY symbol,substr(ts,1,16) ORDER BY symbol,substr(ts,1,16)",
+            (day.isoformat(), PREMARKET_START, REGULAR_SESSION_END,
+             *unique_codes)):
+        hour, minute = map(int, hhmm.split(":"))
+        minute_of_day = hour * 60 + minute
+        if hhmm < PREMARKET_END_EXCLUSIVE:
+            premarket_minutes[code].append(minute_of_day)
+        elif hhmm >= REGULAR_SESSION_START:
+            valid_minutes[code].append(minute_of_day)
+    out: list[SessionCoverage] = []
+    for code in unique_codes:
+        (bar_count, valid_count, first_minute, last_minute,
+         premarket_count, premarket_first, premarket_last) = by_code.get(
+            code, (0, 0, None, None, 0, None, None))
+        profile_expected, profile_known = profiles.get(code, (False, False))
+        premarket_expected = bool(profile_expected or premarket_count > 0)
+        premarket_known = bool(profile_known or premarket_expected)
+        pre_minutes = premarket_minutes[code]
+        premarket_max_gap = max(
+            (later - earlier
+             for earlier, later in zip(pre_minutes, pre_minutes[1:])),
+            default=0)
+        premarket_complete = (
+            premarket_known and (
+                not premarket_expected
+                or (premarket_count >= minimum_premarket
+                    and premarket_first is not None
+                    and premarket_first <= PREMARKET_FIRST_MINUTE_MAX
+                    and premarket_last is not None
+                    and premarket_last >= PREMARKET_TERMINAL_MINUTE
+                    and premarket_max_gap <= PREMARKET_MAX_GAP_MINUTES)))
+        minutes = valid_minutes[code]
+        max_gap = max(
+            (later - earlier for earlier, later in zip(minutes, minutes[1:])),
+            default=0)
+        if bar_count == 0:
+            status = "no_data"
+        elif (valid_count >= minimum_valid
+              and first_minute is not None
+              and first_minute <= REGULAR_SESSION_FIRST_MINUTE_MAX
+              and last_minute is not None
+              and last_minute >= REGULAR_SESSION_TERMINAL_MINUTE
+              and max_gap <= REGULAR_SESSION_MAX_GAP_MINUTES
+              and premarket_complete):
+            status = "complete"
+        else:
+            status = "partial"
+        out.append(SessionCoverage(
+            code=code,
+            bar_count=int(bar_count),
+            valid_bar_count=int(valid_count),
+            expected_count=REGULAR_SESSION_EXPECTED_MINUTES,
+            premarket_bar_count=int(premarket_count),
+            premarket_expected=premarket_expected,
+            premarket_known=premarket_known,
+            premarket_first_minute=premarket_first,
+            premarket_last_minute=premarket_last,
+            premarket_max_gap_minutes=premarket_max_gap,
+            max_gap_minutes=max_gap,
+            first_minute=first_minute,
+            last_minute=last_minute,
+            status=status,
+        ))
+    return out
+
+
+def session_coverages_many(
+        con: sqlite3.Connection, days: list[date], codes: list[str], *,
+        history: dict[str, list[tuple[date, int, int]]] | None = None,
+        eligibility_by_day: dict[date, dict[str, bool | None]] | None = None,
+        ) -> dict[date, list[SessionCoverage]]:
+    """여러 날짜×종목 완결성을 두 번의 범위 SQL로 일괄 판정한다."""
+    unique_days = sorted(set(days))
+    unique_codes = sorted(set(codes))
+    if not unique_days:
+        return {}
+    if not unique_codes:
+        return {day: [] for day in unique_days}
+    placeholders = ",".join("?" for _ in unique_codes)
+    valid_ohlc = "open>0 AND high>0 AND low>0 AND close>0"
+    rows = con.execute(
+        "SELECT substr(ts,1,10),symbol,"
+        "COUNT(DISTINCT CASE WHEN substr(ts,12,5) BETWEEN ? AND ? "
+        "THEN substr(ts,1,16) END),"
+        f"COUNT(DISTINCT CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,1,16) END),"
+        f"MIN(CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END),"
+        f"MAX(CASE WHEN substr(ts,12,5) BETWEEN ? AND ? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END),"
+        f"COUNT(DISTINCT CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        "THEN substr(ts,1,16) END),"
+        f"MIN(CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END),"
+        f"MAX(CASE WHEN substr(ts,12,5)>=? AND substr(ts,12,5)<? AND {valid_ohlc} "
+        "THEN substr(ts,12,5) END) FROM candles "
+        "WHERE substr(ts,1,10) BETWEEN ? AND ? "
+        f"AND symbol IN ({placeholders}) GROUP BY substr(ts,1,10),symbol",
+        (REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         REGULAR_SESSION_START, REGULAR_SESSION_END,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         PREMARKET_START, PREMARKET_END_EXCLUSIVE,
+         unique_days[0].isoformat(), unique_days[-1].isoformat(),
+         *unique_codes),
+    ).fetchall()
+    aggregates = {(date.fromisoformat(row[0]), row[1]): row[2:] for row in rows}
+    minute_map: dict[tuple[date, str], list[int]] = {}
+    premarket_minute_map: dict[tuple[date, str], list[int]] = {}
+    for day_s, code, hhmm in con.execute(
+            f"SELECT substr(ts,1,10),symbol,substr(ts,12,5) FROM candles "
+            "WHERE substr(ts,1,10) BETWEEN ? AND ? "
+            "AND substr(ts,12,5)>=? AND substr(ts,12,5)<=? "
+            f"AND {valid_ohlc} AND symbol IN ({placeholders}) "
+            "GROUP BY substr(ts,1,10),symbol,substr(ts,1,16) "
+            "ORDER BY substr(ts,1,10),symbol,substr(ts,1,16)",
+            (unique_days[0].isoformat(), unique_days[-1].isoformat(),
+             PREMARKET_START, REGULAR_SESSION_END, *unique_codes)):
+        hour, minute = map(int, hhmm.split(":"))
+        key = (date.fromisoformat(day_s), code)
+        minute_of_day = hour * 60 + minute
+        if hhmm < PREMARKET_END_EXCLUSIVE:
+            premarket_minute_map.setdefault(key, []).append(minute_of_day)
+        elif hhmm >= REGULAR_SESSION_START:
+            minute_map.setdefault(key, []).append(minute_of_day)
+
+    minimum_valid = ceil(
+        REGULAR_SESSION_EXPECTED_MINUTES * REGULAR_SESSION_MIN_COVERAGE)
+    minimum_premarket = ceil(
+        PREMARKET_EXPECTED_MINUTES * PREMARKET_MIN_COVERAGE)
+    history = history if history is not None else _premarket_history(
+        con, unique_codes)
+    eligibility_by_day = eligibility_by_day or {}
+    result: dict[date, list[SessionCoverage]] = {}
+    for day in unique_days:
+        profiles = premarket_profiles(
+            con, unique_codes, day, history=history,
+            eligibility=eligibility_by_day.get(day))
+        coverage: list[SessionCoverage] = []
+        for code in unique_codes:
+            (bar_count, valid_count, first_minute, last_minute,
+             premarket_count, premarket_first, premarket_last) = aggregates.get(
+                (day, code), (0, 0, None, None, 0, None, None))
+            profile_expected, profile_known = profiles.get(code, (False, False))
+            premarket_expected = bool(profile_expected or premarket_count > 0)
+            premarket_known = bool(profile_known or premarket_expected)
+            pre_minutes = premarket_minute_map.get((day, code), [])
+            premarket_max_gap = max(
+                (later - earlier
+                 for earlier, later in zip(pre_minutes, pre_minutes[1:])),
+                default=0)
+            premarket_complete = (
+                premarket_known and (
+                    not premarket_expected
+                    or (premarket_count >= minimum_premarket
+                        and premarket_first is not None
+                        and premarket_first <= PREMARKET_FIRST_MINUTE_MAX
+                        and premarket_last is not None
+                        and premarket_last >= PREMARKET_TERMINAL_MINUTE
+                        and premarket_max_gap <= PREMARKET_MAX_GAP_MINUTES)))
+            minutes = minute_map.get((day, code), [])
+            max_gap = max(
+                (later - earlier
+                 for earlier, later in zip(minutes, minutes[1:])), default=0)
+            if bar_count == 0:
+                status = "no_data"
+            elif (valid_count >= minimum_valid
+                  and first_minute is not None
+                  and first_minute <= REGULAR_SESSION_FIRST_MINUTE_MAX
+                  and last_minute is not None
+                  and last_minute >= REGULAR_SESSION_TERMINAL_MINUTE
+                  and max_gap <= REGULAR_SESSION_MAX_GAP_MINUTES
+                  and premarket_complete):
+                status = "complete"
+            else:
+                status = "partial"
+            coverage.append(SessionCoverage(
+                code=code, bar_count=int(bar_count),
+                valid_bar_count=int(valid_count),
+                expected_count=REGULAR_SESSION_EXPECTED_MINUTES,
+                premarket_bar_count=int(premarket_count),
+                premarket_expected=premarket_expected,
+                premarket_known=premarket_known,
+                premarket_first_minute=premarket_first,
+                premarket_last_minute=premarket_last,
+                premarket_max_gap_minutes=premarket_max_gap,
+                max_gap_minutes=max_gap, first_minute=first_minute,
+                last_minute=last_minute, status=status))
+        result[day] = coverage
+    return result
+
+
+def session_quality(coverage: list[SessionCoverage]) -> tuple[bool, str]:
+    """확정 허용 여부와 감사용 요약을 반환한다."""
+    total = len(coverage)
+    complete = [row for row in coverage if row.status == "complete"]
+    partial = [row for row in coverage if row.status == "partial"]
+    no_data = [row for row in coverage if row.status == "no_data"]
+    ratio = len(complete) / total if total else 0.0
+    ok = bool(total and not partial and not no_data
+              and ratio >= REGULAR_SESSION_MIN_COMPLETE_RATIO)
+    offenders = ",".join(
+        f"{row.code}:{row.valid_bar_count}/{row.expected_count}@"
+        f"{row.first_minute or '-'}-{row.last_minute or '-'}:"
+        f"gap={row.max_gap_minutes}:pre={row.premarket_bar_count}"
+        f"@{row.premarket_first_minute or '-'}-"
+        f"{row.premarket_last_minute or '-'}:"
+        f"gap={row.premarket_max_gap_minutes}"
+        f"{'*' if row.premarket_expected else ''}" for row in partial[:8])
+    missing = ",".join(row.code for row in no_data[:8])
+    note = (
+        f"complete={len(complete)}/{total},partial={len(partial)},"
+        f"no_data={len(no_data)},ratio={ratio:.3f}"
+        + (f",offenders={offenders}" if offenders else "")
+        + (f",missing={missing}" if missing else "")
+    )
+    return ok, note
+
+
+def _insert_cache_bars(con: sqlite3.Connection, code: str, bars) -> None:
+    if not bars:
+        return
+    con.executemany(
+        "INSERT OR IGNORE INTO candles VALUES (?,?,?,?,?,?,?)",
+        [(code, b.ts.isoformat(), b.open, b.high, b.low, b.close, b.volume)
+         for b in bars],
+    )
+    con.commit()
+
+
+def _ensure_repair_table(con: sqlite3.Connection) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS paper_cache_repairs ("
+        " symbol TEXT NOT NULL, day TEXT NOT NULL, attempts INTEGER NOT NULL,"
+        " last_attempt TEXT NOT NULL, next_attempt TEXT NOT NULL,"
+        " status TEXT NOT NULL, detail TEXT NOT NULL,"
+        " PRIMARY KEY(symbol,day))")
+    con.commit()
+
+
+def _repair_due(con: sqlite3.Connection, code: str, day: date,
+                now: datetime) -> bool:
+    row = con.execute(
+        "SELECT status,next_attempt FROM paper_cache_repairs "
+        "WHERE symbol=? AND day=?", (code, day.isoformat())).fetchone()
+    if row is None:
+        return True
+    status, next_attempt = row
+    if status == "quarantined":
+        return False
+    return datetime.fromisoformat(next_attempt) <= datetime.fromisoformat(to_db_iso(now))
+
+
+def _record_repair_failure(con: sqlite3.Connection, code: str, day: date,
+                           now: datetime, detail: str) -> None:
+    row = con.execute(
+        "SELECT attempts FROM paper_cache_repairs WHERE symbol=? AND day=?",
+        (code, day.isoformat())).fetchone()
+    attempts = (row[0] if row else 0) + 1
+    quarantined = attempts >= REPAIR_MAX_ATTEMPTS
+    wait_minutes = REPAIR_BASE_BACKOFF_MINUTES * (2 ** (attempts - 1))
+    next_attempt = now + timedelta(minutes=wait_minutes)
+    con.execute(
+        "DELETE FROM fetched WHERE symbol=? AND start=? AND end=?",
+        (code, day.isoformat(), day.isoformat()))
+    con.execute(
+        "INSERT OR REPLACE INTO paper_cache_repairs "
+        "(symbol,day,attempts,last_attempt,next_attempt,status,detail) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (code, day.isoformat(), attempts, to_db_iso(now),
+         to_db_iso(next_attempt),
+         "quarantined" if quarantined else "retry_wait", detail[:500]))
+    con.commit()
+    logger.warning(
+        "[paper][cache-repair] {}/{} 실패 {}회 status={} detail={}",
+        day, code, attempts,
+        "quarantined" if quarantined else "retry_wait", detail)
+
+
+def _repair_cached_day(con: sqlite3.Connection, client: TossClient,
+                       code: str, day: date, now: datetime, *,
+                       eligibility: dict[str, bool | None] | None = None) -> bool:
+    """완료 세션 하루를 원격 전체 응답으로 원자 교체하고 재검증한다."""
+    try:
+        bars = client.fetch_1m_range(code, day, day)
+    except Exception as exc:
+        _record_repair_failure(
+            con, code, day, now, f"fetch:{type(exc).__name__}:{exc}")
+        return False
+    # Toss의 종료 커서가 end+1 09:00이라 다음 거래일 프리장 봉이 섞일 수 있다.
+    # 목표 날짜만 원자 교체해야 기존 다음날 PK와 충돌하거나 타일 봉이 오염되지 않는다.
+    bars = [bar for bar in bars if bar.ts.date() == day]
+    if not bars:
+        _record_repair_failure(con, code, day, now, "fetch:zero-bars")
+        return False
+
+    con.execute("SAVEPOINT paper_day_repair")
+    try:
+        con.execute(
+            "DELETE FROM candles WHERE symbol=? AND substr(ts,1,10)=?",
+            (code, day.isoformat()))
+        con.executemany(
+            "INSERT INTO candles VALUES (?,?,?,?,?,?,?)",
+            [(code, bar.ts.isoformat(), bar.open, bar.high, bar.low,
+              bar.close, bar.volume) for bar in bars])
+        coverage = session_coverages(
+            con, day, [code], eligibility=eligibility)[0]
+        if coverage.status != "complete":
+            raise ValueError(
+                f"{coverage.status}:{coverage.valid_bar_count}/"
+                f"{coverage.expected_count}:{coverage.first_minute}-"
+                f"{coverage.last_minute}:gap={coverage.max_gap_minutes}")
+        con.execute(
+            "INSERT OR REPLACE INTO fetched VALUES (?,?,?)",
+            (code, day.isoformat(), day.isoformat()))
+        con.execute("RELEASE SAVEPOINT paper_day_repair")
+        con.execute(
+            "DELETE FROM paper_cache_repairs WHERE symbol=? AND day=?",
+            (code, day.isoformat()))
+        con.commit()
+        return True
+    except Exception as exc:
+        con.execute("ROLLBACK TO SAVEPOINT paper_day_repair")
+        con.execute("RELEASE SAVEPOINT paper_day_repair")
+        con.commit()
+        _record_repair_failure(
+            con, code, day, now, f"validate:{type(exc).__name__}:{exc}")
+        return False
+
+
+def ensure_day_cached(day: date, codes: list[str], *, lookback_days: int = 12,
+                      confirmed_empty_days: set[date] | None = None,
+                      required_codes: set[str] | None = None,
+                      eligibility_by_day: (
+                          dict[date, dict[str, bool | None]] | None) = None) -> None:
     """[day-lookback, day] 중 캐시에 없는 날짜만 토스에서 받아 적재(증분·멱등).
 
     lookback 이유: v2 전일종가 + 주도섹터 5거래일 수익률에 과거 일봉 필요.
     정착 후에는 매일 1일치만 추가 수집된다(주말/휴장일은 0봉으로 마킹).
     """
     win_start = day - timedelta(days=lookback_days)
+    empty_days = confirmed_empty_days or set()
     # 당일을 20:05(애프터 종료+버퍼) 전에 받으면 불완전할 수 있음 → 항상 재수집
     # 하고 완료 마커를 남기지 않는다 (부분 수집 영구 고착 방지, M1).
     now = now_kst()
     day_incomplete = (day == now.date() and now.time() < dtime(20, 5))
     con = _cache_conn()
+    _ensure_repair_table(con)
+    unique_codes = sorted(set(codes))
+    required = set(unique_codes) if required_codes is None else set(required_codes)
+    profile_history = _premarket_history(con, sorted(required))
+    initial_status: dict[tuple[date, str], str] = {}
+    completed_days: list[date] = []
+    d = win_start
+    while d <= day:
+        if (d not in empty_days and _is_trading_day_cached(d)
+                and (d < now.date() or now.time() >= dtime(20, 5))):
+            completed_days.append(d)
+        d += timedelta(days=1)
+    batch_coverage = session_coverages_many(
+        con, completed_days, sorted(required), history=profile_history,
+        eligibility_by_day=eligibility_by_day)
+    for coverage_day, rows in batch_coverage.items():
+        for row in rows:
+            initial_status[(coverage_day, row.code)] = row.status
     with TossClient() as client:
-        for code in codes:
-            have = {r[0][:10] for r in con.execute(
-                "SELECT DISTINCT substr(ts,1,10) FROM candles "
-                "WHERE symbol=? AND ts>=? AND ts<=?",
-                (code, win_start.isoformat(), day.isoformat() + "T99"))}
-            done = {r[0] for r in con.execute(
-                "SELECT start FROM fetched WHERE symbol=? AND start=end "
-                "AND start>=? AND start<=?",
-                (code, win_start.isoformat(), day.isoformat()))}
+        for code in unique_codes:
             d = win_start
             while d <= day:
+                if d in empty_days:
+                    d += timedelta(days=1)
+                    continue
                 ds = d.isoformat()
-                force = day_incomplete and d == day
-                if force:
-                    con.execute("DELETE FROM fetched WHERE symbol=? AND start=? AND end=?",
-                                (code, ds, ds))
-                    con.commit()
-                    # 당일 불완전분: 이미 일부 있으면 tail 만 증분 수집 (상주 루프가
-                    # 5분마다 당일 전체를 재다운로드하지 않도록 — 리뷰 F6)
-                    last = con.execute(
-                        "SELECT MAX(ts) FROM candles WHERE symbol=? AND ts LIKE ?",
-                        (code, ds + "T%")).fetchone()[0]
+                done = con.execute(
+                    "SELECT 1 FROM fetched WHERE symbol=? AND start=? AND end=?",
+                    (code, ds, ds)).fetchone() is not None
+                last = con.execute(
+                    "SELECT MAX(ts) FROM candles WHERE symbol=? AND ts LIKE ?",
+                    (code, ds + "T%"),).fetchone()[0]
+                force_live = day_incomplete and d == day
+                status = initial_status.get((d, code))
+                repair_incomplete = bool(
+                    not force_live and code in required
+                    and status is not None and status != "complete")
+
+                if force_live:
                     if last:
                         bars = client.fetch_1m_since(code, datetime.fromisoformat(last))
-                        if bars:
-                            con.executemany(
-                                "INSERT OR IGNORE INTO candles VALUES (?,?,?,?,?,?,?)",
-                                [(code, b.ts.isoformat(), b.open, b.high, b.low,
-                                  b.close, b.volume) for b in bars])
-                            con.commit()
-                        d += timedelta(days=1)
-                        continue
-                if force or (ds not in have and ds not in done):
+                        _insert_cache_bars(con, code, bars)
+                    else:
+                        _ensure_cached(con, client, code, d, d)
+                    # 장중에는 다음 주기 tail 수집을 위해 완료 마커를 남기지 않는다.
+                    con.execute(
+                        "DELETE FROM fetched WHERE symbol=? AND start=? AND end=?",
+                        (code, ds, ds))
+                    con.commit()
+                elif repair_incomplete:
+                    if _repair_due(con, code, d, now):
+                        _repair_cached_day(
+                            con, client, code, d, now,
+                            eligibility=(eligibility_by_day or {}).get(d))
+                elif status == "complete" and not done:
+                    con.execute(
+                        "INSERT OR IGNORE INTO fetched VALUES (?,?,?)", (code, ds, ds))
+                    con.commit()
+                elif not done:
                     _ensure_cached(con, client, code, d, d)
-                    if force:   # 불완전 수집 — 다음 실행에서 다시 받도록 마커 제거
-                        con.execute("DELETE FROM fetched WHERE symbol=? AND start=? AND end=?",
-                                    (code, ds, ds))
-                        con.commit()
                 d += timedelta(days=1)
     con.close()
 
@@ -366,15 +1018,20 @@ def daily_bars(code: str) -> list[DailyBar]:
 def _leader_sector(universe, day: date) -> str | None:
     """day 직전(d-1)까지 최근 5거래일 수익률 1위 섹터 (사전 정보만 사용)."""
     perf: dict[str, list[float]] = {}
+    labels: dict[str, set[str]] = {}
     for code, _name, sector in universe:
         bars = [b for b in daily_bars(code) if b.day < day]
         if len(bars) < 6:
             continue
         r = bars[-1].close / bars[-6].close - 1
-        perf.setdefault(sector, []).append(r)
+        key = sector_key(sector)
+        perf.setdefault(key, []).append(r)
+        labels.setdefault(key, set()).add(sector)
     if not perf:
         return None
-    return max(perf.items(), key=lambda kv: sum(kv[1]) / len(kv[1]))[0]
+    leader_key = max(
+        perf.items(), key=lambda kv: (sum(kv[1]) / len(kv[1]), kv[0]))[0]
+    return min(labels[leader_key], key=lambda label: (label.casefold(), label))
 
 
 def run_v2_for_day(day: date, universe) -> list[dict]:
@@ -656,13 +1313,87 @@ def _upsert_trades(con, strategy: str, rows: list[dict], now_iso: str) -> None:
 
 
 def _upsert_daily(con, day: date, strategy: str, n: int, day_ret: float,
-                  equity: float, note: str, now_iso: str, finalized: int) -> None:
+                  equity: float, note: str, now_iso: str, finalized: int, *,
+                  data_complete: int = 0, data_quality_note: str = "") -> None:
     con.execute(
         "INSERT OR REPLACE INTO paper_daily "
         "(day, strategy, n_trades, day_ret, equity, note, recorded_at,"
-        " regime, finalized) VALUES (?,?,?,?,?,?,?,?,?)",
+        " regime, finalized, data_complete, data_quality_note) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (day.isoformat(), strategy, n, day_ret, equity, note, now_iso,
-         REGIME, finalized))
+         REGIME, finalized, data_complete, data_quality_note))
+
+
+def _replace_data_quality(con: sqlite3.Connection, day: date,
+                          coverage: list[SessionCoverage], now_iso: str) -> None:
+    con.execute("DELETE FROM paper_data_quality WHERE day=?", (day.isoformat(),))
+    con.executemany(
+        "INSERT INTO paper_data_quality "
+        "(day,code,bar_count,valid_bar_count,expected_count,premarket_bar_count,"
+        "premarket_expected,premarket_known,premarket_first_minute,"
+        "premarket_last_minute,premarket_max_gap_minutes,max_gap_minutes,"
+        "first_minute,last_minute,status,recorded_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(day.isoformat(), row.code, row.bar_count, row.valid_bar_count,
+          row.expected_count, row.premarket_bar_count,
+          int(row.premarket_expected), int(row.premarket_known),
+          row.premarket_first_minute, row.premarket_last_minute,
+          row.premarket_max_gap_minutes, row.max_gap_minutes,
+          row.first_minute, row.last_minute, row.status, now_iso)
+         for row in coverage],
+    )
+
+
+def _assert_day_invariants(con: sqlite3.Connection, day: date,
+                           strategies: set[str]) -> None:
+    """커밋 전에 현재일까지의 집계·원장·equity 체인 불일치를 차단한다."""
+    day_s = day.isoformat()
+    ledger_axes = {
+        "v2", "v2_leader", "v2_qv",
+        *(name for name, _flags in GM3_VARIANTS),
+        "v4r", "gm_v3_joined", "v4r_joined",
+    }
+    portfolio_axes = {
+        "v2_portfolio", "v2_leader_portfolio", "v2_qv_portfolio",
+    }
+    for strategy in sorted(strategies):
+        daily_rows = con.execute(
+            "SELECT day,n_trades,day_ret,equity FROM paper_daily "
+            "WHERE day<=? AND strategy=? AND regime=? ORDER BY day",
+            (day_s, strategy, REGIME),
+        ).fetchall()
+        if not daily_rows or daily_rows[-1][0] != day_s:
+            raise RuntimeError(f"paper invariant: daily row missing {day_s}/{strategy}")
+        previous = 1.0
+        for hist_day, n_trades, day_ret, equity in daily_rows:
+            expected_equity = previous * (1 + day_ret)
+            if abs(equity - expected_equity) > 1e-9:
+                raise RuntimeError(
+                    f"paper invariant: equity chain mismatch {hist_day}/{strategy} "
+                    f"saved={equity} expected={expected_equity}")
+            previous = equity
+
+            if strategy in ledger_axes:
+                ledger_count = con.execute(
+                    "SELECT COUNT(*) FROM paper_trades WHERE strategy=? "
+                    "AND closed_on=? AND COALESCE(detail,'') NOT LIKE '%EOR%'",
+                    (strategy, hist_day),
+                ).fetchone()[0]
+                if ledger_count != n_trades:
+                    raise RuntimeError(
+                        f"paper invariant: trade count mismatch "
+                        f"{hist_day}/{strategy} daily={n_trades} "
+                        f"ledger={ledger_count}")
+            elif strategy in portfolio_axes:
+                allocation_count = con.execute(
+                    "SELECT COUNT(*) FROM paper_portfolio_allocations "
+                    "WHERE day=? AND strategy=?", (hist_day, strategy),
+                ).fetchone()[0]
+                if allocation_count != n_trades:
+                    raise RuntimeError(
+                        f"paper invariant: allocation count mismatch "
+                        f"{hist_day}/{strategy} daily={n_trades} "
+                        f"allocations={allocation_count}")
 
 
 def _replace_portfolio_allocations(con: sqlite3.Connection, day: date,
@@ -829,9 +1560,40 @@ def record_day(day: date) -> dict:
         *(code for code, _name, _sector in joined_universe),
         *(code for code, _name, _start, _end in (membership_windows or [])),
     })
+    quality_codes = sorted({
+        *codes,
+        *(code for code, _name, _sector in joined_universe),
+    })
+    eligibility_days = [
+        day - timedelta(days=offset) for offset in range(13)]
+    eligibility_by_day = premarket_eligibility_for_days(
+        con, eligibility_days, quality_codes, now)
 
     # 1) 당일 분봉 적재 (토스, 당일분은 tail 증분) — paper.db 트랜잭션 없음
-    ensure_day_cached(day, cache_codes)
+    confirmed_empty_days = {
+        date.fromisoformat(row[0]) for row in con.execute(
+            "SELECT day FROM paper_session_status WHERE status='confirmed_empty'")}
+    confirmed_empty_days.update(CONFIRMED_EMPTY_SESSION_OVERRIDES)
+    ensure_day_cached(
+        day, cache_codes, confirmed_empty_days=confirmed_empty_days,
+        required_codes=set(quality_codes),
+        eligibility_by_day=eligibility_by_day)
+    # 활성 관찰 종목의 분봉 완결성을 별도 감사표에 남긴다. 과거 replay용으로
+    # 캐시하는 이미 비활성 종목은 당일 확정 게이트의 분모에 넣지 않는다.
+    cache_con = _cache_conn()
+    try:
+        coverage = session_coverages(
+            cache_con, day, quality_codes,
+            eligibility=eligibility_by_day.get(day))
+    finally:
+        cache_con.close()
+    quality_ok, quality_note = session_quality(coverage)
+    time_ready = day < now.date() or now.time() >= dtime(20, 5)
+    data_complete = int(time_ready and quality_ok)
+    _replace_data_quality(con, day, coverage, now_iso)
+    con.commit()
+    if time_ready and not quality_ok:
+        logger.error("[paper][data-quality] {} 확정 차단: {}", day, quality_note)
     _daily_cache.clear()                    # 새 데이터 반영해 일봉 재합성
 
     # 1.5) 시장 데이터 0건이면 기록하지 않는다 — 새벽 사이클/수집 전면 실패가
@@ -840,9 +1602,26 @@ def record_day(day: date) -> dict:
         b.day == day for c in set(cache_codes) for b in daily_bars(c))
     if _must_skip_for_missing_market_data(
             has_market_data, universe, joined_universe):
+        override_note = CONFIRMED_EMPTY_SESSION_OVERRIDES.get(day)
+        if time_ready and override_note:
+            con.execute(
+                "INSERT OR REPLACE INTO paper_session_status "
+                "(day,status,attempts,note,recorded_at) VALUES (?,?,?,?,?)",
+                (day.isoformat(), "confirmed_empty", 0,
+                 f"{override_note};{quality_note}", now_iso))
+            con.commit()
+            con.close()
+            logger.warning(
+                "[paper][session] {} 명시적 실질 휴장 예외 — confirmed_empty", day)
+            return {
+                "day": day.isoformat(), "skipped": "confirmed_empty",
+                "finalized": 1,
+                "data_quality": {"complete": False, "note": quality_note},
+            }
         con.close()
         logger.info("[paper] {} 시장 데이터 0건 — 기록 스킵 (장 시작 전/수집 실패)", day)
         return {"day": day.isoformat(), "skipped": "no_market_data"}
+    con.execute("DELETE FROM paper_session_status WHERE day=?", (day.isoformat(),))
 
     summary: dict = {"day": day.isoformat(), "universe": len(universe)}
 
@@ -852,11 +1631,16 @@ def record_day(day: date) -> dict:
     # 별도 관찰축. 기존 v2 신호/운영축은 불변이다.
     v2_qv_rows = select_v2_qv(v2_rows)
     leader = _leader_sector(universe, day)
-    leader_rows = [r for r in v2_rows if r["sector"] == leader] if leader else []
+    leader_rows = ([r for r in v2_rows
+                    if sector_key(r["sector"]) == sector_key(leader)]
+                   if leader else [])
     # 주도섹터 필터 관찰성: 유니버스/트레이드 양쪽에서 채택·스킵을 명시 로그
     if leader:
-        n_uni_leader = sum(1 for _c, _n, s in universe if s == leader)
-        skipped_secs = sorted({s for _c, _n, s in universe if s != leader})
+        leader_key = sector_key(leader)
+        n_uni_leader = sum(
+            1 for _c, _n, s in universe if sector_key(s) == leader_key)
+        skipped_secs = sorted({
+            s for _c, _n, s in universe if sector_key(s) != leader_key})
         logger.info(
             "[paper][leader] {} 주도섹터={} — 유니버스 {}종목 중 {}종목만 거래 대상, "
             "{}종목 스킵 (비주도: {}) | 트레이드 채택 {}건 / 스킵 {}건",
@@ -896,8 +1680,13 @@ def record_day(day: date) -> dict:
         joined_bench = bench_day(
             con, day, joined_universe, prev_members=joined_prev_members)
 
-    # 확정 판정: 과거일 기록이거나 20:05(애프터 종료+버퍼) 이후만 확정치 (리뷰 F2)
-    finalized = 1 if (day < now.date() or now.time() >= dtime(20, 5)) else 0
+    # 시간뿐 아니라 활성 유니버스의 분봉 완결성까지 통과해야 확정한다.
+    finalized = data_complete
+    quality_kwargs = {
+        "data_complete": data_complete,
+        "data_quality_note": quality_note,
+    }
+    written_strategies: set[str] = set()
 
     # 3) 기록 — 단일 짧은 트랜잭션
     for strat, rows in (
@@ -919,7 +1708,8 @@ def record_day(day: date) -> dict:
         else:
             note = ""
         _upsert_daily(con, day, strat, len(rows), day_ret - 1, eq, note,
-                      now_iso, finalized)
+                      now_iso, finalized, **quality_kwargs)
+        written_strategies.add(strat)
         summary[strat] = {"trades": len(rows), "day_ret": day_ret - 1, "equity": eq}
 
     #    v2 공유현금 NAV 관찰축 — 기존 직렬복리 축은 비교/호환을 위해 그대로 둔다.
@@ -934,7 +1724,8 @@ def record_day(day: date) -> dict:
         _upsert_daily(
             con, day, strat, len(selected), p_ret, eq,
             f"selected={len(selected)},skipped={skipped},sectors={sectors}",
-            now_iso, finalized)
+            now_iso, finalized, **quality_kwargs)
+        written_strategies.add(strat)
         summary[strat] = {
             "trades": len(selected), "day_ret": p_ret, "equity": eq,
             "skipped": skipped,
@@ -955,7 +1746,8 @@ def record_day(day: date) -> dict:
         _upsert_daily(con, day, strat, len(real_closed_today),
                       eq / prev_eq - 1 if prev_eq else 0.0, eq,
                       f"open_mtm={len(open_mtm)},removed={len(removed)}",
-                      now_iso, finalized)
+                      now_iso, finalized, **quality_kwargs)
+        written_strategies.add(strat)
         summary[strat] = {"closed_today": len(real_closed_today),
                           "open_positions": len(open_mtm), "equity": eq}
 
@@ -970,7 +1762,8 @@ def record_day(day: date) -> dict:
     _upsert_daily(con, day, "v4r", len(v4r_closed_today),
                   eq_v / prev_eq_v - 1 if prev_eq_v else 0.0, eq_v,
                   f"open_mtm={len(v4r_open)},removed={len(removed)}",
-                  now_iso, finalized)
+                  now_iso, finalized, **quality_kwargs)
+    written_strategies.add("v4r")
     summary["v4r"] = {"closed_today": len(v4r_closed_today),
                       "open_positions": len(v4r_open), "equity": eq_v}
 
@@ -990,7 +1783,8 @@ def record_day(day: date) -> dict:
                 con, day, strat, len(real_closed_today),
                 eq / prev_eq - 1 if prev_eq else 0.0, eq,
                 f"open_mtm={len(open_mtm)},windows={len(membership_windows)}",
-                now_iso, finalized)
+                now_iso, finalized, **quality_kwargs)
+            written_strategies.add(strat)
             summary[strat] = {
                 "closed_today": len(real_closed_today),
                 "open_positions": len(open_mtm),
@@ -1000,14 +1794,17 @@ def record_day(day: date) -> dict:
     #    벤치마크 — 당일 유니버스 일수익을 직전 레짐 equity 에 체인
     eq_b = _prev_equity(con, "bench_bh", day) * (1 + b_ret)
     _upsert_daily(con, day, "bench_bh", n_bench, b_ret, eq_b,
-                  f"stocks={n_bench},excluded={n_excl}", now_iso, finalized)
+                  f"stocks={n_bench},excluded={n_excl}", now_iso, finalized,
+                  **quality_kwargs)
+    written_strategies.add("bench_bh")
     summary["bench_bh"] = {"equity": eq_b, "day_ret": b_ret,
                            "stocks": n_bench, "excluded": n_excl}
     # v2_portfolio는 도입일부터 시작하므로 같은 시작점의 별도 벤치를 체인한다.
     eq_bp = _prev_equity(con, "bench_v2_portfolio", day) * (1 + b_ret)
     _upsert_daily(con, day, "bench_v2_portfolio", n_bench, b_ret, eq_bp,
                   f"stocks={n_bench},excluded={n_excl},matched=v2_portfolio",
-                  now_iso, finalized)
+                  now_iso, finalized, **quality_kwargs)
+    written_strategies.add("bench_v2_portfolio")
     summary["bench_v2_portfolio"] = {
         "equity": eq_bp, "day_ret": b_ret, "stocks": n_bench,
         "excluded": n_excl,
@@ -1021,7 +1818,8 @@ def record_day(day: date) -> dict:
         _upsert_daily(
             con, day, "bench_joined", joined_n, joined_ret, eq_joined,
             f"stocks={joined_n},excluded={joined_excl},matched=joined_axes",
-            now_iso, finalized)
+            now_iso, finalized, **quality_kwargs)
+        written_strategies.add("bench_joined")
         summary["bench_joined"] = {
             "equity": eq_joined, "day_ret": joined_ret, "stocks": joined_n,
             "excluded": joined_excl,
@@ -1042,8 +1840,18 @@ def record_day(day: date) -> dict:
         "SELECT MIN(day) FROM paper_daily WHERE strategy='v2_portfolio'"
     ).fetchone()[0]
     summary["finalized"] = finalized
+    summary["data_quality"] = {
+        "complete": bool(data_complete),
+        "note": quality_note,
+    }
 
-    con.commit()
+    try:
+        _assert_day_invariants(con, day, written_strategies)
+        con.commit()
+    except Exception:
+        con.rollback()
+        con.close()
+        raise
 
     # 5) 텔레그램 팩트 알림 (확정분만). notify_events 자체가 예외를 삼키므로
     #    별도 방어 불필요 — 절대 record_day 를 깨지 않는다.
@@ -1057,8 +1865,8 @@ def record_day(day: date) -> dict:
 def record_upto(day: date) -> list[dict]:
     """빠진 거래일 소급 + 미확정 마지막 기록일 재확정 후 day 기록 (리뷰 F2·F3).
 
-    - 마지막 기록일이 finalized=0 인 채 과거가 되었으면(크래시로 부분 스냅샷
-      고착) 먼저 재기록해 확정한다 — 과거일이므로 데이터는 이미 완전하다.
+    - 마지막 기록일이 finalized=0 인 채 과거가 되었으면(크래시/분봉 불완전)
+      먼저 재수집·재기록해 완전성 게이트를 다시 통과시킨다.
     - (마지막 기록일, day) 사이 결측 거래일은 오래된 날부터 순서대로 소급 기록
       — 벤치 체인에 구멍(그날 수익 0 처리)이 나지 않게 한다. gm_v3 는 전체
       리플레이라 어차피 포함되므로, 벤치만 빠지면 알파가 구조적으로 왜곡된다.
@@ -1068,12 +1876,20 @@ def record_upto(day: date) -> list[dict]:
     con = paper_conn()
     start_s = _meta_get(con, "paper_start")
     last_s = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
-    unfinal = False
-    if last_s:
-        unfinal = con.execute(
-            "SELECT 1 FROM paper_daily WHERE day=? AND finalized=0 LIMIT 1",
-            (last_s,)).fetchone() is not None
+    unfinal_s = con.execute(
+        "SELECT MIN(day) FROM paper_daily WHERE regime=? "
+        "AND (finalized=0 OR data_complete=0)",
+        (REGIME,),
+    ).fetchone()[0]
+    confirmed_empty_s = {row[0] for row in con.execute(
+        "SELECT day FROM paper_session_status WHERE status='confirmed_empty'")}
     con.close()
+
+    if unfinal_s and last_s and unfinal_s < last_s:
+        raise SystemExit(
+            f"중간 미확정/미검증일({unfinal_s}) 뒤에 기록({last_s})이 존재함 — "
+            "분봉 복구 후 paper_start부터 equity 체인 재구축 필요")
+    unfinal = bool(last_s and unfinal_s == last_s)
 
     days: list[date] = []
     if start_s:
@@ -1083,7 +1899,8 @@ def record_upto(day: date) -> list[dict]:
             days.append(anchor)                     # 미확정 → 재확정
         d = anchor + timedelta(days=1)
         while d < day:
-            if _is_trading_day_cached(d):
+            if (_is_trading_day_cached(d)
+                    and d.isoformat() not in confirmed_empty_s):
                 days.append(d)                      # 결측 거래일 소급
             d += timedelta(days=1)
     days.append(day)
@@ -1092,7 +1909,12 @@ def record_upto(day: date) -> list[dict]:
     for d in days:
         if d != day:
             logger.info("[paper] 소급/재확정 기록: {}", d)
-        out.append(record_day(d))
+        result = record_day(d)
+        out.append(result)
+        if d != day and result.get("finalized") != 1:
+            logger.error(
+                "[paper] {} 데이터 완결성 미통과 — 이후 날짜 기록 중단", d)
+            break
     return out
 
 
@@ -1108,12 +1930,25 @@ def report() -> None:
     print(f"paper_start={start}")
     last = con.execute("SELECT MAX(day) FROM paper_daily").fetchone()[0]
     if last:
-        latest = con.execute(
-            "SELECT strategy, equity, finalized FROM paper_daily WHERE day=?",
-            (last,),
-        ).fetchall()
-        rows = {strategy: equity for strategy, equity, _finalized in latest}
-        finalized = min((value for _strategy, _equity, value in latest), default=0)
+        daily_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(paper_daily)")}
+        has_quality = {
+            "data_complete", "data_quality_note"}.issubset(daily_columns)
+        if has_quality:
+            latest = con.execute(
+                "SELECT strategy,equity,finalized,data_complete,data_quality_note "
+                "FROM paper_daily WHERE day=?", (last,),
+            ).fetchall()
+        else:  # 구버전 DB/단위 테스트 호환
+            latest = [(*row, None, "") for row in con.execute(
+                "SELECT strategy,equity,finalized FROM paper_daily WHERE day=?",
+                (last,),
+            ).fetchall()]
+        rows = {strategy: equity for strategy, equity, *_rest in latest}
+        finalized = min((row[2] for row in latest), default=0)
+        quality_complete = min(
+            (row[3] for row in latest if row[3] is not None), default=None)
+        quality_note = next((row[4] for row in latest if row[4]), "")
         matched = rows.get("bench_v2_portfolio")
         account_start = con.execute(
             "SELECT MIN(day) FROM paper_daily WHERE strategy='v2_portfolio'"
@@ -1121,7 +1956,7 @@ def report() -> None:
         primary_name, primary_label = PRIMARY_ACCOUNT_PORTFOLIO
         primary_equity = rows.get(primary_name)
         if matched is not None and account_start and primary_equity is not None:
-            status = "확정" if finalized else "장중 잠정"
+            status = "확정" if finalized else "데이터 미완/장중 잠정"
             print(
                 f"\n[{last}] 총기간 봇 수익 "
                 f"({account_start}~{last}, 공유현금 모의계좌, {status})"
@@ -1133,6 +1968,9 @@ def report() -> None:
             print(f"  동시작 시장 참고치  총수익 {matched - 1.0:+.2%}")
             print("  ※ 시장 참고치는 등록종목 100% 보유로 봇과 노출 비매칭")
             print("  ※ 실주문 손익 아님 · 공유현금/동시보유 제한 반영")
+            if quality_complete is not None:
+                quality_label = "통과" if quality_complete else "미통과"
+                print(f"  데이터 완결성 {quality_label}: {quality_note or '-'}")
 
             research_rows = [
                 (label, rows[name])
