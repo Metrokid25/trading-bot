@@ -1,5 +1,19 @@
 # HANDOFF — AI 작업자 인수인계 (기준 본문: 2026-07-20, 최신 상태는 아래 갱신 블록)
 
+## 최우선 최신 갱신 — 2026-08-09 Mentor Shadow 운영 배포 완료
+
+- 미니PC Trading main `eb0ea59`, Archive main `bf7f4c2`를 pull하고 전체 테스트
+  Trading `517 passed`, Archive/Reader `823 passed`를 통과했다.
+- `trading.db`/`paper.db`는 SQLite Backup API로
+  `db/backups/mentor-signal-deploy-20260809-003218`에 백업했고 전후 quick_check는 `ok`다.
+- 웹앱만 WMI 재기동했다(부모/자식 PID `13748/10672`). `/api/signals/mentor`가
+  OpenAPI에 존재하고 무인증 POST 401, 운영 mentor 감사행/watch 0건을 확인했다.
+- Reader는 Archive WMI Shadow 상주(PID `304/1372/3652`)이며 기준점은 174023이다.
+  Paper 자동등록·실전 주문은 비활성이고 임시 Fixture E2E의 `live_order=disabled`를 확인했다.
+- 최신 P0 데이터 무결성 패치는 DB 재구축·Paper 재기동에 별도 승인을 요구하므로
+  Paper Runner PID `6804/13620`, tracker PID `15084/14072`를 그대로 보존했다.
+  따라서 이번 배포는 Mentor Shadow 관찰까지만 완료된 상태다.
+
 ## 최우선 최신 갱신 — 2026-08-08 P0 Paper 데이터 무결성 패치
 
 - `feature/p0-paper-data-integrity`에서 운영 DB 진단의 P0 1·3·5를 구현했다.

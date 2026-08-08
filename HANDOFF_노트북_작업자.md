@@ -1,5 +1,16 @@
 # 노트북 AI 작업자 인수인계
 
+## 2026-08-09 Mentor Shadow 배포 결과
+
+- 미니PC Trading main `eb0ea59`, Archive main `bf7f4c2`가 배포됐다.
+  Trading `517 passed`, Archive/Reader `823 passed`, DB quick_check와 Fixture E2E가 통과했다.
+- 웹앱은 Mentor API를 로드했고 Reader는 Shadow로 상주한다. 운영 mentor 감사행과
+  watchlist는 0건이며 Paper 자동등록·실전 주문은 비활성이다.
+- 최신 P0 데이터 무결성 코드 때문에 Paper Runner 재기동/DB 재구축은 별도 승인 사항으로
+  보류됐다. 노트북에서 이를 실행하지 않는다.
+- 출근 후 clean pull한 다음 Shadow 로그·상태 DB를 읽기 전용으로 분석하고 오탐·누락·지연
+  회귀 테스트를 보강한다. 미니PC 배포를 반복하지 않는다.
+
 ## 2026-08-07 Mentor Signal Paper 연동 이어하기
 
 - 원격 `main`에는 Mentor Signal Paper ingest와 최신 Trading main이 통합돼 있다.
